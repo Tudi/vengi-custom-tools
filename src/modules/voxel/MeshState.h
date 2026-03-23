@@ -50,6 +50,7 @@ private:
 		bool _hidden = false;
 		bool _gray = false;
 		bool _hasSelection = false;
+		bool _marked = false;
 		// if all axes scale positive: cull the back face
 		// if one or three axes are negative, then cull the front face
 		video::Face _cullFace = video::Face::Back;
@@ -214,6 +215,8 @@ public:
 	bool grayed(int idx) const;
 	void setHasSelection(int idx, bool hasSelection);
 	bool hasSelection(int idx) const;
+	void setMarked(int idx, bool marked);
+	bool marked(int idx) const;
 
 	// for scaling on 1 or 3 axes negative we need to flip the face culling
 	video::Face cullFace(int idx) const;

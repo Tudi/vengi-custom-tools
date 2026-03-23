@@ -32,6 +32,12 @@ void main(void) {
 	if (u_gray != 0 || (u_has_selection != 0 && (a_flags & FLAGOUTLINE) == 0u)) {
 		float gray = (0.21 * materialColor.r + 0.72 * materialColor.g + 0.07 * materialColor.b) / 3.0;
 		v_color = vec4(gray, gray, gray, materialColor.a);
+	} else if (u_marked != 0) {
+		// blue tint: reduce red/green to visually distinguish marked nodes
+		const float markedTintR = 0.6;
+		const float markedTintG = 0.8;
+		const float markedTintB = 1.0;
+		v_color = vec4(materialColor.r * markedTintR, materialColor.g * markedTintG, materialColor.b * markedTintB, materialColor.a);
 	} else {
 		v_color = materialColor;
 	}

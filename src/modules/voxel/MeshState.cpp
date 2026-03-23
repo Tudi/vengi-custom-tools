@@ -532,4 +532,18 @@ void MeshState::setHasSelection(int idx, bool hasSelection) {
 	_volumeData[idx]._hasSelection = hasSelection;
 }
 
+bool MeshState::marked(int idx) const {
+	if (idx < 0 || idx >= MAX_VOLUMES) {
+		return false;
+	}
+	return _volumeData[idx]._marked;
+}
+
+void MeshState::setMarked(int idx, bool marked) {
+	if (idx < 0 || idx >= MAX_VOLUMES) {
+		return;
+	}
+	_volumeData[idx]._marked = marked;
+}
+
 } // namespace voxel

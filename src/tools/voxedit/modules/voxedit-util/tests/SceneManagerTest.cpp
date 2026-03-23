@@ -1773,4 +1773,38 @@ TEST_F(SceneManagerTest, testSelectOnlyColor) {
 	EXPECT_FALSE((v->voxel(1, 0, 0).getFlags() & voxel::FlagOutline) != 0);
 }
 
+TEST_F(SceneManagerTest, testNodeToggleMarked) {
+	const int activeNodeId = _sceneMgr->activeNode();
+	EXPECT_FALSE(_sceneMgr->isNodeMarked(activeNodeId));
+
+	_sceneMgr->nodeToggleMarked(activeNodeId);
+	EXPECT_TRUE(_sceneMgr->isNodeMarked(activeNodeId));
+
+	_sceneMgr->nodeToggleMarked(activeNodeId);
+	EXPECT_FALSE(_sceneMgr->isNodeMarked(activeNodeId));
+}
+
+TEST_F(SceneManagerTest, testNodeMarkAllAndUnmarkAll) {
+	EXPECT_NE(InvalidNodeId, _sceneMgr->addModelChild("second node", 1, 1, 1));
+	EXPECT_NE(InvalidNodeId, _sceneMgr->addModelChild("third node", 1, 1, 1));
+
+	_sceneMgr->nodeMarkAll();
+	for (auto iter = _sceneMgr->sceneGraph().beginModel(); iter != _sceneMgr->sceneGraph().end(); ++iter) {
+		EXPECT_TRUE(_sceneMgr->isNodeMarked((*iter).id()));
+	}
+
+	_sceneMgr->nodeUnmarkAll();
+	for (auto iter = _sceneMgr->sceneGraph().beginModel(); iter != _sceneMgr->sceneGraph().end(); ++iter) {
+		EXPECT_FALSE(_sceneMgr->isNodeMarked((*iter).id()));
+	}
+}
+
+TEST_F(SceneManagerTest, testNodeMarkInvalidNode) {
+	_sceneMgr->nodeToggleMarked(InvalidNodeId);
+	EXPECT_FALSE(_sceneMgr->isNodeMarked(InvalidNodeId));
+
+	_sceneMgr->nodeToggleMarked(99999);
+	EXPECT_FALSE(_sceneMgr->isNodeMarked(99999));
+}
+
 } // namespace voxedit

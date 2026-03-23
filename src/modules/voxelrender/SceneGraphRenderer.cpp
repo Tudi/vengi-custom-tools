@@ -207,6 +207,11 @@ void SceneGraphRenderer::updateNodeState(const voxel::MeshStatePtr &meshState, c
 		meshState->gray(idx, false);
 	}
 	meshState->setHasSelection(idx, node.hasSelection());
+	if (renderContext.markedNodes != nullptr) {
+		meshState->setMarked(idx, renderContext.markedNodes->has(node.id()));
+	} else {
+		meshState->setMarked(idx, false);
+	}
 }
 
 void SceneGraphRenderer::prepareReferenceNodes(const voxel::MeshStatePtr &meshState, const RenderContext &renderContext) const {

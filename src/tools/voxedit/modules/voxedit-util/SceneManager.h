@@ -18,6 +18,7 @@
 #include "modifier/IModifierRenderer.h"
 #include "modifier/Modifier.h"
 #include "modifier/SceneModifiedFlags.h"
+#include "core/collection/Set.h"
 #include "scenegraph/SceneGraph.h"
 #include "voxedit-util/network/Client.h"
 #include "voxedit-util/network/Server.h"
@@ -66,6 +67,7 @@ class SceneManager : public core::DeltaFrameSeconds {
 
 protected:
 	scenegraph::SceneGraph _sceneGraph;
+	core::Set<int> _markedNodes;
 	voxelrender::CameraMovement _camMovement;
 	memento::MementoHandler _mementoHandler;
 	voxel::ClipboardData _copy;
@@ -589,6 +591,11 @@ public:
 	bool nodeSetVisible(int nodeId, bool visible);
 	bool nodeSetLocked(int nodeId, bool locked);
 	bool nodeActivate(int nodeId);
+	void nodeToggleMarked(int nodeId);
+	void nodeMarkAll();
+	void nodeUnmarkAll();
+	bool isNodeMarked(int nodeId) const;
+	const core::Set<int> &markedNodes() const;
 	bool nodeUnreference(int nodeId);
 	void nodeGroupRemoveNormals();
 	bool nodeRemoveNormals(int nodeId);

@@ -2720,6 +2720,7 @@ void SceneManager::render(voxelrender::RenderContext &renderContext, const video
 
 	renderContext.frame = _currentFrameIdx;
 	renderContext.sceneGraph = &_sceneGraph;
+	renderContext.markedNodes = &_markedNodes;
 
 	const bool renderScene = (renderMask & RenderScene) != 0u;
 	if (renderScene) {
@@ -3057,6 +3058,83 @@ void SceneManager::construct() {
 				nodeActivate(nodeId);
 			}
 		}).setHelp(_("Switch active node to hovered from scene graph mode"));
+
+	command::Command::registerCommand("mouse_node_mark")
+		.setHandler([&] (const command::CommandArgs&) {
+			if (_camera == nullptr) {
+				return;
+			}
+			const math::Ray &ray = _camera->mouseRay(_mouseCursor);
+			const float rayLength = _camera->farPlane();
+
+			struct OBBHit {
+				int nodeId;
+				float distance;
+			};
+			core::DynamicArray<OBBHit> hits;
+			hits.reserve(_sceneGraph.size());
+
+			for (auto entry : _sceneGraph.nodes()) {
+				const scenegraph::SceneGraphNode &node = entry->second;
+				if (!node.isAnyModelNode() || !node.visible()) {
+					continue;
+				}
+				float distance = 0.0f;
+				const voxel::Region &region = _sceneGraph.resolveRegion(node);
+				const glm::vec3 pivot = node.pivot();
+				const scenegraph::FrameTransform &transform = _sceneGraph.transformForFrame(node, _currentFrameIdx);
+				const math::OBBF &obb = scenegraph::toOBB(true, region, pivot, transform);
+				if (obb.intersect(ray.origin, ray.direction, distance)) {
+					hits.push_back({node.id(), distance});
+				}
+			}
+
+			hits.sort([] (const OBBHit &a, const OBBHit &b) {
+				return a.distance > b.distance;
+			});
+
+			for (const OBBHit &hit : hits) {
+				const scenegraph::SceneGraphNode &node = _sceneGraph.node(hit.nodeId);
+				const voxel::RawVolume *v = _sceneRenderer->volumeForNode(node);
+				if (v == nullptr) {
+					continue;
+				}
+				const glm::mat4 model = _sceneGraph.worldMatrix(node, _currentFrameIdx, true);
+				const glm::mat4 invModel = glm::inverse(model);
+				const glm::vec3 localOrigin = glm::vec3(invModel * glm::vec4(ray.origin, 1.0f));
+				const glm::vec3 localDir = glm::normalize(glm::vec3(invModel * glm::vec4(ray.direction, 0.0f)));
+				static constexpr voxel::Voxel air;
+				bool didHit = false;
+				voxelutil::raycastWithEndpoints(v, localOrigin - voxelutil::RaycastOffset, localOrigin + localDir * rayLength - voxelutil::RaycastOffset, [&] (voxel::RawVolume::Sampler &sampler) {
+					if (!sampler.voxel().isSameType(air)) {
+						didHit = true;
+						return false;
+					}
+					return true;
+				});
+				if (didHit) {
+					nodeToggleMarked(hit.nodeId);
+					return;
+				}
+			}
+		}).setHelp(_("Toggle mark on the hovered node"));
+
+	command::Command::registerCommand("nodeaddselected")
+		.addArg({"nodeid", command::ArgType::String, true, "", "Node ID or UUID"})
+		.setHandler([&] (const command::CommandArgs& args) {
+			const int nodeId = toNodeId(args, activeNode());
+			nodeToggleMarked(nodeId);
+		}).setHelp(_("Toggle mark on a node")).setArgumentCompleter(nodeCompleter(_sceneGraph));
+
+	command::Command::registerCommand("nodeselectall")
+		.setHandler([&] (const command::CommandArgs&) {
+			nodeMarkAll();
+		}).setHelp(_("Mark all model nodes"));
+
+	command::Command::registerCommand("nodeunselectall")
+		.setHandler([&] (const command::CommandArgs&) {
+			nodeUnmarkAll();
+		}).setHelp(_("Unmark all nodes"));
 
 	command::Command::registerCommand("select")
 		.addArg({"type", command::ArgType::String, false, "", "Selection type: all|none|invert"})
@@ -5602,6 +5680,37 @@ bool SceneManager::nodeActivate(int nodeId) {
 		resetLastTrace();
 	}
 	return true;
+}
+
+void SceneManager::nodeToggleMarked(int nodeId) {
+	if (nodeId == InvalidNodeId || !_sceneGraph.hasNode(nodeId)) {
+		return;
+	}
+	if (_markedNodes.has(nodeId)) {
+		_markedNodes.remove(nodeId);
+		Log::debug("Unmarked node %i", nodeId);
+	} else {
+		_markedNodes.insert(nodeId);
+		Log::debug("Marked node %i", nodeId);
+	}
+}
+
+void SceneManager::nodeMarkAll() {
+	for (auto iter = _sceneGraph.beginModel(); iter != _sceneGraph.end(); ++iter) {
+		_markedNodes.insert((*iter).id());
+	}
+}
+
+void SceneManager::nodeUnmarkAll() {
+	_markedNodes.clear();
+}
+
+bool SceneManager::isNodeMarked(int nodeId) const {
+	return _markedNodes.has(nodeId);
+}
+
+const core::Set<int> &SceneManager::markedNodes() const {
+	return _markedNodes;
 }
 
 bool SceneManager::empty() const {
