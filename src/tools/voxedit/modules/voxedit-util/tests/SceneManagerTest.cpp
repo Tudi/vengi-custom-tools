@@ -1774,7 +1774,7 @@ TEST_F(SceneManagerTest, testSelectOnlyColor) {
 }
 
 TEST_F(SceneManagerTest, testNodeToggleMarked) {
-	const int activeNodeId = _sceneMgr->activeNode();
+	const int activeNodeId = _sceneMgr->sceneGraph().activeNode();
 	EXPECT_FALSE(_sceneMgr->isNodeMarked(activeNodeId));
 
 	_sceneMgr->nodeToggleMarked(activeNodeId);
