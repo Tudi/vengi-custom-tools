@@ -313,6 +313,7 @@ void SceneGraphRenderer::prepareModelNodes(const voxel::MeshStatePtr &meshState,
 	};
 	core::Buffer<VisibleNode> visibleNodes;
 	visibleNodes.reserve(sceneGraph.size());
+	int skippedNodes = 0;
 	for (auto entry : sceneGraph.nodes()) {
 		const scenegraph::SceneGraphNode &node = entry->value;
 		if (!node.isModelNode()) {
@@ -320,6 +321,10 @@ void SceneGraphRenderer::prepareModelNodes(const voxel::MeshStatePtr &meshState,
 		}
 		const int nodeId = entry->key;
 		const int idx = getVolumeIdx(nodeId);
+		if (idx >= voxel::MAX_VOLUMES) {
+			++skippedNodes;
+			continue;
+		}
 		updateNodeState(meshState, renderContext, activeNode, node, idx);
 
 		if (meshState->hidden(idx)) {
@@ -329,6 +334,11 @@ void SceneGraphRenderer::prepareModelNodes(const voxel::MeshStatePtr &meshState,
 			continue;
 		}
 		visibleNodes.push_back({nodeId, idx});
+	}
+
+	if (skippedNodes > 0) {
+		Log::warn("Skipped %i nodes for rendering - node IDs exceed MAX_VOLUMES (%i). "
+				  "Consider increasing MAX_VOLUMES.", skippedNodes, voxel::MAX_VOLUMES);
 	}
 
 	// Phase 2: compute transforms in parallel (expensive, only for visible nodes)
