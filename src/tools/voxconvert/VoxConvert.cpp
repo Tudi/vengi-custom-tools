@@ -50,7 +50,6 @@
 #include "voxelutil/VolumeResizer.h"
 #include "voxelutil/VolumeRotator.h"
 #include "voxelutil/VolumeSplitter.h"
-#include "voxelutil/VolumeVisitor.h"
 
 #ifndef GLM_ENABLE_EXPERIMENTAL
 #define GLM_ENABLE_EXPERIMENTAL
@@ -580,11 +579,7 @@ app::AppState VoxConvert::onInit() {
 				emptyNodes.push_back(node.id());
 				continue;
 			}
-			bool hasSolid = false;
-			voxelutil::visitVolume(*v, [&hasSolid](int, int, int, const voxel::Voxel &) {
-				hasSolid = true;
-			});
-			if (!hasSolid) {
+			if (v->isEmpty(v->region())) {
 				Log::debug("Removing empty model node '%s' with region %s",
 						   node.name().c_str(), v->region().toString().c_str());
 				emptyNodes.push_back(node.id());
