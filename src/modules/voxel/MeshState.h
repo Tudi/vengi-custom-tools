@@ -190,9 +190,7 @@ public:
 	 */
 	bool scheduleRegionExtraction(int idx, const voxel::Region &region);
 
-	const core::Buffer<int> &activeIndices() const {
-		return _activeIndices;
-	}
+	const core::Buffer<int> &activeIndices() const;
 
 	bool sameNormalPalette(int idx, const palette::NormalPalette *palette) const;
 
@@ -239,6 +237,10 @@ public:
 };
 
 using MeshStatePtr = core::SharedPtr<MeshState>;
+
+inline const core::Buffer<int> &MeshState::activeIndices() const {
+	return _activeIndices;
+}
 
 inline int MeshState::pendingExtractions() const {
 	return (int)_extractRegions.size();
