@@ -1277,7 +1277,7 @@ SceneGraph::MergeResult SceneGraph::merge(bool skipHidden) const {
 	}
 	voxel::RawVolume *mergedVolume = new voxel::RawVolume(mergedRegion);
 	if (mergedVolume->voxels() == nullptr) {
-		Log::error("Failed to allocate merged volume (%zu bytes)", voxel::RawVolume::size(mergedRegion));
+		Log::error("Failed to allocate merged volume (%llu bytes)", (unsigned long long)voxel::RawVolume::size(mergedRegion));
 		delete mergedVolume;
 		return MergeResult{};
 	}

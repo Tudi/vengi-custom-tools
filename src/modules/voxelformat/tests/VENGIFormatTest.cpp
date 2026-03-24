@@ -76,7 +76,7 @@ TEST_F(VENGIFormatTest, testMeshCubeGreedyTexture) {
 	ASSERT_EQ(expectedFaces * 6u, indices.size());
 
 	// clang-format off
-	const int expectedIndices[] = {
+	const uint32_t expectedIndices[] = {
 		0, 1, 2, 0, 2, 3,
 		4, 5, 6, 4, 6, 7,
 		8, 9, 10, 8, 10, 11,
