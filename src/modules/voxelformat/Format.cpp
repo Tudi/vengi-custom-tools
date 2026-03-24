@@ -26,9 +26,21 @@
 #include "voxel/Voxel.h"
 #include "voxelutil/ImageUtils.h"
 #include "voxelutil/VolumeVisitor.h"
+#include "voxelutil/VolumeCropper.h"
 #include "voxelutil/VoxelUtil.h"
 
 namespace voxelformat {
+
+void Format::cropOnLoad(voxel::RawVolume *&v) {
+	if (!core::getVar(cfg::VoxelCropOnLoad)->boolVal()) {
+		return;
+	}
+	voxel::RawVolume *cropped = voxelutil::cropVolume(v);
+	if (cropped != nullptr) {
+		delete v;
+		v = cropped;
+	}
+}
 
 bool Format::checkValidRegion(const voxel::Region &region) const {
 	const size_t bytes = voxel::RawVolume::size(region);
@@ -194,6 +206,10 @@ bool Format::save(const scenegraph::SceneGraph &sceneGraph, const core::String &
 	if (singleVolume() && sceneGraph.size(scenegraph::SceneGraphNodeType::AllModels) > 1) {
 		Log::debug("Merge volumes before saving as the target format only supports one volume");
 		scenegraph::SceneGraph::MergeResult merged = sceneGraph.merge(saveVisibleOnly);
+		if (!merged.hasVolume()) {
+			Log::error("Failed to merge volumes for saving");
+			return false;
+		}
 		scenegraph::SceneGraph mergedSceneGraph;
 		scenegraph::SceneGraphNode mergedNode(scenegraph::SceneGraphNodeType::Model);
 		mergedNode.setVolume(merged.volume(), true);
