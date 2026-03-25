@@ -74,6 +74,18 @@ public:
 		nodeGroupSelectOnlyColor(colorIndex);
 	}
 
+	void testSelectOnlyEdges() {
+		nodeGroupSelectOnlyEdges();
+	}
+
+	void testSelectOnlyCorners() {
+		nodeGroupSelectOnlyCorners();
+	}
+
+	void testSelectionGrow() {
+		nodeGroupSelectionGrow();
+	}
+
 	void testFlip(math::Axis axis) {
 		nodeGroupFlip(axis);
 	}

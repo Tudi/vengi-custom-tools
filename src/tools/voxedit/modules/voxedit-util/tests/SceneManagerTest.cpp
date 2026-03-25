@@ -1081,6 +1081,170 @@ TEST_F(SceneManagerTest, testDeleteSelectedNoSelection) {
 	EXPECT_EQ(voxelsBefore, voxelutil::countVoxels(*v));
 }
 
+TEST_F(SceneManagerTest, testSelectOnlyEdges) {
+	// Create a 6x6x6 solid cube, select all, then filter to edges only.
+	// Edge voxels have air neighbors along 2+ different axes.
+	const voxel::Region region{0, 5};
+	ASSERT_TRUE(_sceneMgr->newScene(true, "selectonlyedges_test", region));
+	const int nodeId = _sceneMgr->sceneGraph().activeNode();
+	voxel::RawVolume *v = _sceneMgr->volume(nodeId);
+	ASSERT_NE(nullptr, v);
+
+	// Fill the entire volume
+	for (int x = 0; x <= 5; ++x) {
+		for (int y = 0; y <= 5; ++y) {
+			for (int z = 0; z <= 5; ++z) {
+				v->setVoxel(x, y, z, voxel::createVoxel(voxel::VoxelType::Generic, 1));
+			}
+		}
+	}
+
+	// Select all
+	scenegraph::SceneGraphNode *node = _sceneMgr->sceneGraphModelNode(nodeId);
+	ASSERT_NE(nullptr, node);
+	node->select(region);
+	ASSERT_TRUE(node->hasSelection());
+
+	sceneMgr()->testSelectOnlyEdges();
+
+	// After filtering, only edge voxels should remain selected.
+	// Face-center voxels (interior of a face, e.g. (0,2,2)) have air on only 1 axis -> deselected.
+	// Edge voxels (e.g. (0,0,2)) have air on 2 axes -> remain selected.
+	// Corner voxels (e.g. (0,0,0)) have air on 3 axes -> remain selected.
+	ASSERT_TRUE(node->hasSelection());
+
+	// A corner voxel should still be selected
+	const voxel::Voxel &corner = v->voxel(0, 0, 0);
+	EXPECT_NE(0, corner.getFlags() & voxel::FlagOutline) << "Corner voxel should remain selected";
+
+	// An edge voxel (not corner) should still be selected
+	const voxel::Voxel &edge = v->voxel(0, 0, 2);
+	EXPECT_NE(0, edge.getFlags() & voxel::FlagOutline) << "Edge voxel should remain selected";
+
+	// A face-center voxel should be deselected
+	const voxel::Voxel &faceCenter = v->voxel(0, 2, 2);
+	EXPECT_EQ(0, faceCenter.getFlags() & voxel::FlagOutline) << "Face-center voxel should be deselected";
+
+	// An interior voxel should be deselected (was selected, has no air neighbors at all)
+	const voxel::Voxel &interior = v->voxel(2, 2, 2);
+	EXPECT_EQ(0, interior.getFlags() & voxel::FlagOutline) << "Interior voxel should be deselected";
+}
+
+TEST_F(SceneManagerTest, testSelectOnlyEdgesNoSelection) {
+	const int nodeId = _sceneMgr->sceneGraph().activeNode();
+	ASSERT_TRUE(testSetVoxel(testMins(), 1));
+	voxel::RawVolume *v = _sceneMgr->volume(nodeId);
+	ASSERT_NE(nullptr, v);
+
+	// No selection - should be a no-op
+	sceneMgr()->testSelectOnlyEdges();
+	// Just verify it doesn't crash - no selection means nothing happens
+}
+
+TEST_F(SceneManagerTest, testSelectOnlyCorners) {
+	// Create a 6x6x6 solid cube, select all, then filter to corners only.
+	// Corner voxels have air neighbors along all 3 axes.
+	const voxel::Region region{0, 5};
+	ASSERT_TRUE(_sceneMgr->newScene(true, "selectonlycorners_test", region));
+	const int nodeId = _sceneMgr->sceneGraph().activeNode();
+	voxel::RawVolume *v = _sceneMgr->volume(nodeId);
+	ASSERT_NE(nullptr, v);
+
+	for (int x = 0; x <= 5; ++x) {
+		for (int y = 0; y <= 5; ++y) {
+			for (int z = 0; z <= 5; ++z) {
+				v->setVoxel(x, y, z, voxel::createVoxel(voxel::VoxelType::Generic, 1));
+			}
+		}
+	}
+
+	scenegraph::SceneGraphNode *node = _sceneMgr->sceneGraphModelNode(nodeId);
+	ASSERT_NE(nullptr, node);
+	node->select(region);
+
+	sceneMgr()->testSelectOnlyCorners();
+
+	// Corner voxel (3 axes with air) should remain selected
+	const voxel::Voxel &corner = v->voxel(0, 0, 0);
+	EXPECT_NE(0, corner.getFlags() & voxel::FlagOutline) << "Corner voxel should remain selected";
+
+	// Edge voxel (2 axes with air) should be deselected
+	const voxel::Voxel &edge = v->voxel(0, 0, 2);
+	EXPECT_EQ(0, edge.getFlags() & voxel::FlagOutline) << "Edge voxel should be deselected";
+
+	// Face-center voxel (1 axis with air) should be deselected
+	const voxel::Voxel &faceCenter = v->voxel(0, 2, 2);
+	EXPECT_EQ(0, faceCenter.getFlags() & voxel::FlagOutline) << "Face-center voxel should be deselected";
+
+	// For a 6x6x6 cube, only the 8 corner voxels should remain
+	// (each corner has air on all 3 axes)
+}
+
+TEST_F(SceneManagerTest, testSelectOnlyCornersNoSelection) {
+	const int nodeId = _sceneMgr->sceneGraph().activeNode();
+	ASSERT_TRUE(testSetVoxel(testMins(), 1));
+	voxel::RawVolume *v = _sceneMgr->volume(nodeId);
+	ASSERT_NE(nullptr, v);
+
+	sceneMgr()->testSelectOnlyCorners();
+	// No-op when no selection exists
+}
+
+TEST_F(SceneManagerTest, testSelectionGrow) {
+	// Create a 6x6x6 solid cube, select only the center voxel, then grow.
+	// After grow, the center + all 26 solid neighbors should be selected.
+	const voxel::Region region{0, 5};
+	ASSERT_TRUE(_sceneMgr->newScene(true, "selectiongrow_test", region));
+	const int nodeId = _sceneMgr->sceneGraph().activeNode();
+	voxel::RawVolume *v = _sceneMgr->volume(nodeId);
+	ASSERT_NE(nullptr, v);
+
+	for (int x = 0; x <= 5; ++x) {
+		for (int y = 0; y <= 5; ++y) {
+			for (int z = 0; z <= 5; ++z) {
+				v->setVoxel(x, y, z, voxel::createVoxel(voxel::VoxelType::Generic, 1));
+			}
+		}
+	}
+
+	// Select only the center voxel (2,2,2)
+	scenegraph::SceneGraphNode *node = _sceneMgr->sceneGraphModelNode(nodeId);
+	ASSERT_NE(nullptr, node);
+	const voxel::Region centerRegion(glm::ivec3(2), glm::ivec3(2));
+	node->select(centerRegion);
+
+	// Verify only center is selected
+	EXPECT_NE(0, v->voxel(2, 2, 2).getFlags() & voxel::FlagOutline);
+	EXPECT_EQ(0, v->voxel(1, 2, 2).getFlags() & voxel::FlagOutline);
+
+	sceneMgr()->testSelectionGrow();
+
+	// All 26 neighbors of (2,2,2) should now be selected
+	for (int dx = -1; dx <= 1; ++dx) {
+		for (int dy = -1; dy <= 1; ++dy) {
+			for (int dz = -1; dz <= 1; ++dz) {
+				const voxel::Voxel &vox = v->voxel(2 + dx, 2 + dy, 2 + dz);
+				EXPECT_NE(0, vox.getFlags() & voxel::FlagOutline)
+					<< "Voxel at (" << 2 + dx << "," << 2 + dy << "," << 2 + dz << ") should be selected";
+			}
+		}
+	}
+
+	// A voxel 2 steps away should NOT be selected (no chain growth)
+	EXPECT_EQ(0, v->voxel(0, 2, 2).getFlags() & voxel::FlagOutline)
+		<< "Voxel 2 steps away should not be selected";
+}
+
+TEST_F(SceneManagerTest, testSelectionGrowNoSelection) {
+	const int nodeId = _sceneMgr->sceneGraph().activeNode();
+	ASSERT_TRUE(testSetVoxel(testMins(), 1));
+	voxel::RawVolume *v = _sceneMgr->volume(nodeId);
+	ASSERT_NE(nullptr, v);
+
+	sceneMgr()->testSelectionGrow();
+	// No-op when no selection exists
+}
+
 TEST_F(SceneManagerTest, testHollow) {
 	const voxel::Region region{0, 5};
 	ASSERT_TRUE(_sceneMgr->newScene(true, "hollow_test", region));

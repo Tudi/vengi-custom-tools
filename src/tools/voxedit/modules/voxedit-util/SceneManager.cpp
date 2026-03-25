@@ -49,6 +49,7 @@
 #include "voxedit-util/modifier/SceneModifiedFlags.h"
 #include "voxedit-util/network/protocol/SceneStateMessage.h"
 #include "voxedit-util/network/ServerNetwork.h"
+#include "voxel/Connectivity.h"
 #include "voxel/Face.h"
 #include "voxel/MaterialColor.h"
 #include "voxel/RawVolume.h"
@@ -393,6 +394,133 @@ void SceneManager::nodeGroupDeselectColor(uint8_t colorIndex) {
 
 void SceneManager::nodeGroupSelectOnlyColor(uint8_t colorIndex) {
 	nodeGroupFilterSelection(colorIndex, false);
+}
+
+void SceneManager::nodeGroupSelectByAirAxes(int minAxes) {
+	nodeForeachGroup([&](int groupNodeId) {
+		scenegraph::SceneGraphNode *node = sceneGraphModelNode(groupNodeId);
+		if (node == nullptr) {
+			return;
+		}
+		if (!node->hasSelection()) {
+			return;
+		}
+		voxel::RawVolume *v = node->volume();
+		if (v == nullptr) {
+			return;
+		}
+		const voxel::Region selRegion = selectionCalculateRegion(groupNodeId);
+		if (!selRegion.isValid()) {
+			return;
+		}
+		const voxel::Region &volRegion = v->region();
+		voxelutil::visitVolume(*v, selRegion, [&](int x, int y, int z, const voxel::Voxel &voxel) {
+			if ((voxel.getFlags() & voxel::FlagOutline) == 0) {
+				return;
+			}
+			int axesWithAir = 0;
+			for (const glm::ivec3 &offset : voxel::arrayPathfinderFaces) {
+				const glm::ivec3 neighbor(x + offset.x, y + offset.y, z + offset.z);
+				if (!volRegion.containsPoint(neighbor) || !voxel::isBlocked(v->voxel(neighbor).getMaterial())) {
+					if (offset.x != 0) {
+						axesWithAir |= 1;
+					} else if (offset.y != 0) {
+						axesWithAir |= 2;
+					} else {
+						axesWithAir |= 4;
+					}
+				}
+			}
+			const int axisCount = (axesWithAir & 1) + ((axesWithAir >> 1) & 1) + ((axesWithAir >> 2) & 1);
+			if (axisCount < minAxes) {
+				voxel::Voxel updated = voxel;
+				updated.setFlags(voxel.getFlags() & ~voxel::FlagOutline);
+				v->setVoxel(x, y, z, updated);
+			}
+		}, voxelutil::VisitSolid(), voxelutil::VisitorOrder::ZYX);
+		_selectionCacheNodeId = -1;
+		modified(groupNodeId, selRegion, SceneModifiedFlags::NoUndo);
+		_sceneRenderer->updateSelectionGizmo(selectionCalculateRegion(groupNodeId));
+	});
+}
+
+void SceneManager::nodeGroupSelectOnlyEdges() {
+	nodeGroupSelectByAirAxes(2);
+}
+
+void SceneManager::nodeGroupSelectOnlyCorners() {
+	nodeGroupSelectByAirAxes(3);
+}
+
+void SceneManager::nodeGroupSelectionGrow() {
+	nodeForeachGroup([&](int groupNodeId) {
+		scenegraph::SceneGraphNode *node = sceneGraphModelNode(groupNodeId);
+		if (node == nullptr) {
+			return;
+		}
+		if (!node->hasSelection()) {
+			return;
+		}
+		voxel::RawVolume *v = node->volume();
+		if (v == nullptr) {
+			return;
+		}
+		const voxel::Region selRegion = selectionCalculateRegion(groupNodeId);
+		if (!selRegion.isValid()) {
+			return;
+		}
+		const voxel::Region &volRegion = v->region();
+
+		// expand selection region by 1 voxel in each direction, clamped to volume
+		const glm::ivec3 expandedMins = glm::max(selRegion.getLowerCorner() - 1, volRegion.getLowerCorner());
+		const glm::ivec3 expandedMaxs = glm::min(selRegion.getUpperCorner() + 1, volRegion.getUpperCorner());
+		const voxel::Region expandedRegion(expandedMins, expandedMaxs);
+
+		// iterate the expanded shell: for each unselected solid voxel, check if
+		// any of its 26 neighbors (within original selRegion) is selected.
+		// This avoids collecting source positions and produces no duplicates.
+		core::DynamicArray<glm::ivec3> toSelect;
+		voxelutil::visitVolume(*v, expandedRegion, [&](int x, int y, int z, const voxel::Voxel &voxel) {
+			if ((voxel.getFlags() & voxel::FlagOutline) != 0) {
+				return;
+			}
+			auto hasSelectedNeighbor = [&](const glm::ivec3 *offsets, int count) {
+				for (int idx = 0; idx < count; ++idx) {
+					const glm::ivec3 neighbor(x + offsets[idx].x, y + offsets[idx].y, z + offsets[idx].z);
+					if (!selRegion.containsPoint(neighbor)) {
+						continue;
+					}
+					const voxel::Voxel &nv = v->voxel(neighbor);
+					if ((nv.getFlags() & voxel::FlagOutline) != 0) {
+						return true;
+					}
+				}
+				return false;
+			};
+			if (hasSelectedNeighbor(voxel::arrayPathfinderFaces, 6) ||
+				hasSelectedNeighbor(voxel::arrayPathfinderEdges, 12) ||
+				hasSelectedNeighbor(voxel::arrayPathfinderCorners, 8)) {
+				toSelect.push_back(glm::ivec3(x, y, z));
+			}
+		}, voxelutil::VisitSolid(), voxelutil::VisitorOrder::ZYX);
+
+		if (toSelect.empty()) {
+			return;
+		}
+
+		// apply selection flags from the destination list
+		voxel::Region dirtyRegion = selRegion;
+		for (const glm::ivec3 &pos : toSelect) {
+			voxel::Voxel updated = v->voxel(pos);
+			updated.setFlags(updated.getFlags() | voxel::FlagOutline);
+			v->setVoxel(pos, updated);
+			dirtyRegion.accumulate(pos);
+		}
+
+		_selectionCacheNodeId = -1;
+		modified(groupNodeId, dirtyRegion);
+		_sceneRenderer->updateSelectionGizmo(selectionCalculateRegion(groupNodeId));
+	});
 }
 
 void SceneManager::nodeGroupHollow() {
@@ -3438,6 +3566,21 @@ void SceneManager::construct() {
 		.setHandler([&] (const command::CommandArgs& args) {
 			nodeGroupSelectOnlyColor(_modifierFacade.cursorVoxel().getColor());
 		}).setHelp(_("Deselect all voxels not matching the active palette color"));
+
+	command::Command::registerCommand("selectonlyedges")
+		.setHandler([&] (const command::CommandArgs& args) {
+			nodeGroupSelectOnlyEdges();
+		}).setHelp(_("Filter selection to only keep edge voxels where two or more faces meet"));
+
+	command::Command::registerCommand("selectonlycorners")
+		.setHandler([&] (const command::CommandArgs& args) {
+			nodeGroupSelectOnlyCorners();
+		}).setHelp(_("Filter selection to only keep corner voxels where three faces meet"));
+
+	command::Command::registerCommand("selectiongrow")
+		.setHandler([&] (const command::CommandArgs& args) {
+			nodeGroupSelectionGrow();
+		}).setHelp(_("Expand the selection by one voxel in all directions"));
 
 	command::Command::registerCommand("setreferenceposition")
 		.addArg({"x", command::ArgType::Int, false, "", "X coordinate"})
