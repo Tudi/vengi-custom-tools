@@ -35,6 +35,7 @@
 #include "voxelformat/VolumeFormat.h"
 #include "voxedit-util/modifier/brush/ExtrudeBrush.h"
 #include "voxedit-util/modifier/brush/TransformBrush.h"
+#include "voxedit-util/modifier/brush/RulerBrush.h"
 #include "voxedit-util/modifier/brush/SculptBrush.h"
 #include "voxedit-util/modifier/brush/StampBrush.h"
 #include "voxedit-util/modifier/brush/TextureBrush.h"
@@ -53,7 +54,7 @@ static constexpr const char *BrushTypeIcons[] = {
 	ICON_LC_PIPETTE,	ICON_LC_BOXES,	   ICON_LC_GROUP,
 	ICON_LC_STAMP,		ICON_LC_PEN_LINE,  ICON_LC_FOOTPRINTS,
 	ICON_LC_PAINTBRUSH, ICON_LC_TEXT_WRAP, ICON_LC_SQUARE_DASHED_MOUSE_POINTER,
-	ICON_LC_IMAGE,		ICON_LC_MOVE_UP_RIGHT, ICON_LC_EXPAND, ICON_LC_MOVE_3D, ICON_LC_BLEND};
+	ICON_LC_IMAGE,		ICON_LC_MOVE_UP_RIGHT, ICON_LC_EXPAND, ICON_LC_MOVE_3D, ICON_LC_BLEND, ICON_LC_RULER};
 static_assert(lengthof(BrushTypeIcons) == (int)BrushType::Max, "BrushTypeIcons size mismatch");
 
 static constexpr const char *TransformModeStr[] = {NC_("Transform Modes", "Move"), NC_("Transform Modes", "Shear"),
@@ -369,6 +370,27 @@ void BrushPanel::updateLineBrushPanel(command::CommandExecutionListener &listene
 		ImGui::SameLine();
 	}
 	ImGui::TooltipTextUnformatted(_("Length of the stipple pattern <= 1 to disable"));
+}
+
+void BrushPanel::updateRulerBrushPanel(command::CommandExecutionListener &listener) {
+	ImGui::TextWrappedUnformatted(_("Click two points to measure the distance between them"));
+	Modifier &modifier = _sceneMgr->modifier();
+	RulerBrush &brush = modifier.rulerBrush();
+	if (brush.hasMeasurement()) {
+		const glm::ivec3 &start = brush.startPos();
+		const glm::ivec3 &end = brush.endPos();
+		const glm::ivec3 d = brush.delta();
+		ImGui::SeparatorText(_("Measurement"));
+		ImGui::Text(_("Start: (%i, %i, %i)"), start.x, start.y, start.z);
+		ImGui::Text(_("End: (%i, %i, %i)"), end.x, end.y, end.z);
+		ImGui::Separator();
+		ImGui::Text(_("Delta X: %i"), d.x);
+		ImGui::Text(_("Delta Y: %i"), d.y);
+		ImGui::Text(_("Delta Z: %i"), d.z);
+		ImGui::Separator();
+		ImGui::Text(_("Length: %.2f"), brush.euclideanDistance());
+		ImGui::Text(_("Manhattan: %i"), brush.manhattanDistance());
+	}
 }
 
 void BrushPanel::updateSelectBrushPanel(command::CommandExecutionListener &listener) {
@@ -1232,17 +1254,63 @@ void BrushPanel::updateTransformBrushPanel(command::CommandExecutionListener &li
 
 	case TransformMode::Scale: {
 		_transformScale = brush.scale();
-		ImGui::Checkbox(_("Uniform"), &_transformUniformScale);
+		if (_transformScale == glm::vec3(1.0f)) {
+			_transformTargetSize = glm::ivec3(0);
+		}
+		ImGui::Checkbox(_("Voxel size"), &_transformUseVoxelSize);
+		ImGui::SameLine();
+		if (_transformUseVoxelSize) {
+			ImGui::Checkbox(_("Maintain aspect ratio"), &_transformMaintainAspectRatio);
+		} else {
+			ImGui::Checkbox(_("Uniform"), &_transformUniformScale);
+		}
 		bool scaleChanged = false;
-		if (_transformUniformScale) {
-			float uniform = _transformScale.x;
-			ImGui::SetNextItemWidth(-1);
-			if (ImGui::SliderFloat("##uniform_scale", &uniform, 0.01f, 4.0f, "%.2f")) {
-				_transformScale = glm::vec3(uniform);
+		if (_transformUseVoxelSize) {
+			const voxel::Region &snapshotRegion = brush.snapshotRegion();
+			const glm::ivec3 originalSize = snapshotRegion.isValid()
+				? snapshotRegion.getDimensionsInVoxels()
+				: glm::ivec3(1);
+			if (_transformTargetSize.x <= 0 || _transformTargetSize.y <= 0 || _transformTargetSize.z <= 0) {
+				_transformTargetSize = originalSize;
+			}
+			static constexpr int MinTargetSize = 1;
+			static constexpr int MaxTargetSize = 4096;
+			const glm::ivec3 prevTargetSize = _transformTargetSize;
+			if (ImGui::AxisSliders(_transformTargetSize, MinTargetSize, MaxTargetSize)) {
+				if (_transformMaintainAspectRatio && originalSize.x > 0 && originalSize.y > 0 && originalSize.z > 0) {
+					const glm::ivec3 changed = _transformTargetSize - prevTargetSize;
+					int changedAxis = -1;
+					for (int i = 0; i < 3; ++i) {
+						if (changed[i] != 0) {
+							changedAxis = i;
+							break;
+						}
+					}
+					if (changedAxis >= 0) {
+						const float ratio = (float)_transformTargetSize[changedAxis] / (float)originalSize[changedAxis];
+						for (int i = 0; i < 3; ++i) {
+							if (i != changedAxis) {
+								_transformTargetSize[i] = glm::max((int)glm::round((float)originalSize[i] * ratio), MinTargetSize);
+							}
+						}
+					}
+				}
+				_transformScale = glm::vec3(_transformTargetSize) / glm::vec3(originalSize);
+				_transformScale = glm::max(_transformScale, glm::vec3(0.01f));
 				scaleChanged = true;
 			}
+			ImGui::TextDisabled(_("Original: %i x %i x %i"), originalSize.x, originalSize.y, originalSize.z);
 		} else {
-			scaleChanged = ImGui::AxisSliders(_transformScale, 0.01f, 4.0f, "%.2f");
+			if (_transformUniformScale) {
+				float uniform = _transformScale.x;
+				ImGui::SetNextItemWidth(-1);
+				if (ImGui::SliderFloat("##uniform_scale", &uniform, 0.01f, 4.0f, "%.2f")) {
+					_transformScale = glm::vec3(uniform);
+					scaleChanged = true;
+				}
+			} else {
+				scaleChanged = ImGui::AxisSliders(_transformScale, 0.01f, 4.0f, "%.2f");
+			}
 		}
 		if (scaleChanged) {
 			brush.setScale(_transformScale);
@@ -1729,6 +1797,8 @@ void BrushPanel::brushSettings(command::CommandExecutionListener &listener) {
 			updateTransformBrushPanel(listener);
 		} else if (brushType == BrushType::Sculpt) {
 			updateSculptBrushPanel(listener);
+		} else if (brushType == BrushType::Ruler) {
+			updateRulerBrushPanel(listener);
 		}
 	}
 

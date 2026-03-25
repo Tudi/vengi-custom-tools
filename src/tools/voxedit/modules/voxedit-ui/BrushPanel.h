@@ -39,8 +39,11 @@ private:
 	glm::ivec3 _transformShearOffset{0};
 	glm::vec3 _transformScale{1.0f};
 	glm::vec3 _transformRotation{0.0f};
+	glm::ivec3 _transformTargetSize{0};
 	bool _transformDirty = false;
 	bool _transformUniformScale = true;
+	bool _transformUseVoxelSize = false;
+	bool _transformMaintainAspectRatio = true;
 
 	void createPopups(command::CommandExecutionListener &listener);
 
@@ -65,6 +68,7 @@ private:
 	void executeExtrudeBrush();
 	void updateTransformBrushPanel(command::CommandExecutionListener &listener);
 	void executeTransformBrush();
+	void updateRulerBrushPanel(command::CommandExecutionListener &listener);
 	void updateSculptBrushPanel(command::CommandExecutionListener &listener);
 	void executeSculptBrush();
 	void loadSkinFromFile(const core::String &filename);
