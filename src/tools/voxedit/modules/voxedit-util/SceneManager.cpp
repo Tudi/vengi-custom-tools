@@ -1861,6 +1861,82 @@ int SceneManager::mergeVisibleToTemp() {
 	return newNodeId;
 }
 
+int SceneManager::mergeLockedToTemp() {
+	core::Buffer<int> lockedNodeIds;
+	lockedNodeIds.reserve(_sceneGraph.size());
+	for (auto iter = _sceneGraph.beginModel(); iter != _sceneGraph.end(); ++iter) {
+		const scenegraph::SceneGraphNode &node = *iter;
+		if (node.locked() && node.isModelNode()) {
+			lockedNodeIds.push_back(node.id());
+		}
+	}
+
+	if (lockedNodeIds.size() <= 1) {
+		Log::warn("mergelockedtotemp: need at least 2 locked model nodes");
+		return InvalidNodeId;
+	}
+
+	// Bake all locked nodes into world space and merge
+	scenegraph::SceneGraph tempSceneGraph;
+	for (int nodeId : lockedNodeIds) {
+		const scenegraph::SceneGraphNode *node = sceneGraphNode(nodeId);
+		if (node == nullptr) {
+			continue;
+		}
+		const scenegraph::FrameTransform &transform =
+			_sceneGraph.transformForFrame(*node, _currentFrameIdx);
+		const voxel::RawVolume *srcVolume = _sceneGraph.resolveVolume(*node);
+		voxel::RawVolume *bakedVolume =
+			voxelutil::applyTransformToVolume(*srcVolume, transform.worldMatrix(), node->pivot());
+		if (bakedVolume == nullptr) {
+			continue;
+		}
+		scenegraph::SceneGraphNode copiedNode(scenegraph::SceneGraphNodeType::Model);
+		scenegraph::copyNode(*node, copiedNode, false, false);
+		copiedNode.setVolume(bakedVolume, true);
+		tempSceneGraph.emplace(core::move(copiedNode));
+	}
+	const scenegraph::SceneGraph::MergeResult &merged = tempSceneGraph.merge();
+	if (!merged.hasVolume()) {
+		Log::warn("mergelockedtotemp: merge produced no volume");
+		return InvalidNodeId;
+	}
+
+	memento::ScopedMementoGroup mementoGroup(_mementoHandler, "mergelockedtotemp");
+
+	// Unlock source nodes and hide all nodes
+	for (int nodeId : lockedNodeIds) {
+		nodeSetLocked(nodeId, false);
+	}
+	for (auto iter = _sceneGraph.beginModel(); iter != _sceneGraph.end(); ++iter) {
+		nodeSetVisible((*iter).id(), false);
+	}
+
+	// Create the merged temporary node
+	scenegraph::SceneGraphNode newNode(scenegraph::SceneGraphNodeType::Model);
+	newNode.setVolume(merged.volume(), true);
+	newNode.setPalette(merged.palette);
+	newNode.setNormalPalette(merged.normalPalette);
+	newNode.setName(_("merged_temp"));
+	newNode.setVisible(true);
+
+	const int newNodeId = moveNodeToSceneGraph(newNode);
+	if (newNodeId == InvalidNodeId) {
+		// Restore locked and visible state on failure
+		for (int nodeId : lockedNodeIds) {
+			nodeSetLocked(nodeId, true);
+		}
+		for (auto iter = _sceneGraph.beginModel(); iter != _sceneGraph.end(); ++iter) {
+			nodeSetVisible((*iter).id(), true);
+		}
+		Log::warn("mergelockedtotemp: failed to create merged node");
+		return InvalidNodeId;
+	}
+
+	nodeActivate(newNodeId);
+	return newNodeId;
+}
+
 void SceneManager::selectionInvert(int nodeId) {
 	scenegraph::SceneGraphNode *node = sceneGraphModelNode(nodeId);
 	if (node == nullptr) {
@@ -3578,6 +3654,11 @@ void SceneManager::construct() {
 		.setHandler([&] (const command::CommandArgs&) {
 			mergeVisibleToTemp();
 		}).setHelp(_("Merge all visible nodes into a temporary editable node, hiding the originals"));
+
+	command::Command::registerCommand("mergelockedtotemp")
+		.setHandler([&] (const command::CommandArgs&) {
+			mergeLockedToTemp();
+		}).setHelp(_("Merge all locked nodes into a temporary editable node, unlocking and hiding the originals"));
 
 	command::Command::registerCommand("undo")
 		.setHandler([&] (const command::CommandArgs& args) {

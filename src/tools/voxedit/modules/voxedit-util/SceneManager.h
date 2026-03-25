@@ -399,6 +399,7 @@ public:
 	bool splatMerge(int sourceNodeId);
 	bool mergeActiveToBackground();
 	int mergeVisibleToTemp();
+	int mergeLockedToTemp();
 
 	void selectionInvert(int nodeId);
 	void selectionUnselect(int nodeId);
