@@ -13,6 +13,7 @@
 #include "core/Trace.h"
 #include "scenegraph/SceneGraphNode.h"
 #include "ui/IMGUIEx.h"
+#include "ui/Style.h"
 #include "ui/IconsLucide.h"
 #include "ui/ScopedStyle.h"
 #include "ui/Toolbar.h"
@@ -185,9 +186,8 @@ void SceneGraphPanel::renderNode(video::Camera &camera, const scenegraph::SceneG
 		const bool marked = _sceneMgr->isNodeMarked(nodeId);
 		if (referenceHighlight) {
 			refStyle.darker(ImGuiCol_Text);
-		} else if (marked) {
-			static constexpr ImVec4 markedNodeTextColor(0.4f, 0.7f, 1.0f, 1.0f);
-			refStyle.setColor(ImGuiCol_Text, markedNodeTextColor);
+		} else if (node.locked()) {
+			refStyle.setColor(ImGuiCol_Text, ImVec4(style::color(style::ColorLockedNode)));
 		}
 
 		ImGui::TableNextColumn();

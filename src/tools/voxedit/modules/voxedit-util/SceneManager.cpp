@@ -3088,7 +3088,7 @@ void SceneManager::construct() {
 			}
 		}).setHelp(_("Switch active node to hovered from scene graph mode"));
 
-	command::Command::registerCommand("mouse_node_mark")
+	command::Command::registerCommand("mouse_node_lock")
 		.setHandler([&] (const command::CommandArgs&) {
 			if (_camera == nullptr) {
 				return;
@@ -3142,28 +3142,12 @@ void SceneManager::construct() {
 					return true;
 				});
 				if (didHit) {
-					nodeToggleMarked(hit.nodeId);
+					scenegraph::SceneGraphNode &hitNode = _sceneGraph.node(hit.nodeId);
+					hitNode.setLocked(!hitNode.locked());
 					return;
 				}
 			}
-		}).setHelp(_("Toggle mark on the hovered node"));
-
-	command::Command::registerCommand("nodeaddselected")
-		.addArg({"nodeid", command::ArgType::String, true, "", "Node ID or UUID"})
-		.setHandler([&] (const command::CommandArgs& args) {
-			const int nodeId = toNodeId(args, activeNode());
-			nodeToggleMarked(nodeId);
-		}).setHelp(_("Toggle mark on a node")).setArgumentCompleter(nodeCompleter(_sceneGraph));
-
-	command::Command::registerCommand("nodeselectall")
-		.setHandler([&] (const command::CommandArgs&) {
-			nodeMarkAll();
-		}).setHelp(_("Mark all model nodes"));
-
-	command::Command::registerCommand("nodeunselectall")
-		.setHandler([&] (const command::CommandArgs&) {
-			nodeUnmarkAll();
-		}).setHelp(_("Unmark all nodes"));
+		}).setHelp(_("Toggle lock on the hovered node"));
 
 	command::Command::registerCommand("select")
 		.addArg({"type", command::ArgType::String, false, "", "Selection type: all|none|invert"})
