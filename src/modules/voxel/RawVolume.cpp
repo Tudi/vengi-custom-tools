@@ -9,6 +9,7 @@
 #include "core/Log.h"
 #include "core/StandardLib.h"
 #include "core/Trace.h"
+#include <SDL_stdinc.h>
 #include <glm/common.hpp>
 
 namespace voxel {
@@ -34,7 +35,7 @@ RawVolume::RawVolume(const RawVolume *copy) : _region(copy->region()) {
 	const size_t asize = RawVolume::allocSize(_region);
 	_data = (Voxel *)core_malloc(asize);
 	if (_data == nullptr) {
-		Log::error("Failed to allocate %llu bytes for volume copy", (unsigned long long)asize);
+		Log::error("Failed to allocate %" SDL_PRIu64 " bytes for volume copy", (uint64_t)asize);
 		return;
 	}
 	_borderVoxel = copy->_borderVoxel;
@@ -46,7 +47,7 @@ RawVolume::RawVolume(const RawVolume &copy) : _region(copy.region()) {
 	const size_t asize = RawVolume::allocSize(_region);
 	_data = (Voxel *)core_malloc(asize);
 	if (_data == nullptr) {
-		Log::error("Failed to allocate %llu bytes for volume copy", (unsigned long long)asize);
+		Log::error("Failed to allocate %" SDL_PRIu64 " bytes for volume copy", (uint64_t)asize);
 		return;
 	}
 	_borderVoxel = copy._borderVoxel;
@@ -87,7 +88,7 @@ RawVolume::RawVolume(const RawVolume& src, const Region& region, bool *onlyAir) 
 		const size_t asize = RawVolume::allocSize(_region);
 		_data = (Voxel *)core_malloc(asize);
 		if (_data == nullptr) {
-			Log::error("Failed to allocate %llu bytes for volume copy", (unsigned long long)asize);
+			Log::error("Failed to allocate %" SDL_PRIu64 " bytes for volume copy", (uint64_t)asize);
 			return;
 		}
 		core_memset((void *)_data, 0, asize);
@@ -95,7 +96,7 @@ RawVolume::RawVolume(const RawVolume& src, const Region& region, bool *onlyAir) 
 		const size_t asize = RawVolume::allocSize(_region);
 		_data = (Voxel *)core_malloc(asize);
 		if (_data == nullptr) {
-			Log::error("Failed to allocate %llu bytes for volume copy", (unsigned long long)asize);
+			Log::error("Failed to allocate %" SDL_PRIu64 " bytes for volume copy", (uint64_t)asize);
 			return;
 		}
 		core_memcpy((void *)_data, (const void *)src._data, asize);
@@ -112,7 +113,7 @@ RawVolume::RawVolume(const RawVolume& src, const Region& region, bool *onlyAir) 
 		const size_t asize = RawVolume::allocSize(_region);
 		_data = (Voxel *)core_malloc(asize);
 		if (_data == nullptr) {
-			Log::error("Failed to allocate %llu bytes for volume copy", (unsigned long long)asize);
+			Log::error("Failed to allocate %" SDL_PRIu64 " bytes for volume copy", (uint64_t)asize);
 			return;
 		}
 		const glm::ivec3 &tgtMins = _region.getLowerCorner();
@@ -715,8 +716,8 @@ void RawVolume::initialise(const Region &regValidRegion) {
 	const size_t size = RawVolume::allocSize(_region);
 	_data = (Voxel *)core_malloc(size);
 	if (_data == nullptr) {
-		Log::error("Failed to allocate %llu bytes for a volume with the dimensions %i:%i:%i",
-				   (unsigned long long)size, width(), height(), depth());
+		Log::error("Failed to allocate %" SDL_PRIu64 " bytes for a volume with the dimensions %i:%i:%i",
+				   (uint64_t)size, width(), height(), depth());
 		return;
 	}
 
