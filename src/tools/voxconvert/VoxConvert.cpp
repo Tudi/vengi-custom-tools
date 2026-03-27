@@ -50,6 +50,7 @@
 #include "voxelutil/VolumeResizer.h"
 #include "voxelutil/VolumeRotator.h"
 #include "voxelutil/VolumeSplitter.h"
+#include "voxelutil/VolumeVisitor.h"
 
 #ifndef GLM_ENABLE_EXPERIMENTAL
 #define GLM_ENABLE_EXPERIMENTAL
@@ -572,16 +573,12 @@ app::AppState VoxConvert::onInit() {
 	// STEP 12: remove empty model nodes (volumes with no solid voxels)
 	{
 		core::Buffer<int> emptyNodes;
-		for (auto iter = sceneGraph.beginModel(); iter != sceneGraph.end(); ++iter) {
-			scenegraph::SceneGraphNode &node = *iter;
-			const voxel::RawVolume *v = node.volume();
-			if (v == nullptr) {
-				emptyNodes.push_back(node.id());
+		for (const auto &e : sceneGraph.nodes()) {
+			const scenegraph::SceneGraphNode &node = e->value;
+			if (!node.isModelNode()) {
 				continue;
 			}
-			if (v->isEmpty(v->region())) {
-				Log::debug("Removing empty model node '%s' with region %s",
-						   node.name().c_str(), v->region().toString().c_str());
+			if (!node.hasVoxels()) {
 				emptyNodes.push_back(node.id());
 			}
 		}
