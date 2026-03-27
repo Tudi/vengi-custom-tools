@@ -208,9 +208,8 @@ app::AppState VoxEdit::onConstruct() {
 		.setHandler([this](const command::CommandArgs &args) {
 			const core::String &file = args.str("file");
 			if (file.empty()) {
-				auto baseOptions = voxelui::FileDialogOptions::build(_paletteCache, false);
-				auto importOptions = [baseOptions](video::OpenFileMode mode, const io::FormatDescription *desc, const io::FilesystemEntry &entry) mutable {
-					bool hasOptions = baseOptions(mode, desc, entry);
+				auto importOptions = [this](video::OpenFileMode mode, const io::FormatDescription *desc, const io::FilesystemEntry &entry) {
+					voxelui::FileDialogOptions::build(_paletteCache, false)(mode, desc, entry);
 					ImGui::CheckboxVar(cfg::VoxEditImportSingleNode);
 					return true;
 				};

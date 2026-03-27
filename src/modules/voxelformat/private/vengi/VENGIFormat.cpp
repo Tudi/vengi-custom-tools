@@ -332,7 +332,7 @@ bool VENGIFormat::loadNodeData(scenegraph::SceneGraph &sceneGraph, scenegraph::S
 					Data data;
 					data.normal = NO_NORMAL;
 					stream.readUInt16(data.data);
-					node.volume()->setVoxel(x, y, z, voxel::createVoxel(palette, data.color, data.normal));
+					v->setVoxel(x, y, z, voxel::createVoxel(palette, data.color, data.normal));
 				}
 			}
 		}
@@ -346,7 +346,7 @@ bool VENGIFormat::loadNodeData(scenegraph::SceneGraph &sceneGraph, scenegraph::S
 					}
 					uint8_t color;
 					stream.readUInt8(color);
-					node.volume()->setVoxel(x, y, z, voxel::createVoxel(palette, color));
+					v->setVoxel(x, y, z, voxel::createVoxel(palette, color));
 				}
 			}
 		}
