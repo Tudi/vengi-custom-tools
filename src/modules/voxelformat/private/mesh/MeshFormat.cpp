@@ -426,7 +426,7 @@ int MeshFormat::voxelizeNodeChunked(const core::String &name, scenegraph::SceneG
 			chunkNode.setTransform(keyFrameIdx, transform);
 			volume->translate(-chunkRegion.getLowerCorner());
 		}
-		chunkNode.setVolume(volume, true);
+		chunkNode.setVolume(volume);
 		chunkNode.setPalette(palette);
 		chunkNode.setNormalPalette(normalPalette);
 		sceneGraph.emplace(core::move(chunkNode), groupId);

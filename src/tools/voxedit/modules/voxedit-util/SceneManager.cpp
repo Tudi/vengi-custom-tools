@@ -1978,7 +1978,7 @@ int SceneManager::mergeLockedToTemp() {
 		}
 		scenegraph::SceneGraphNode copiedNode(scenegraph::SceneGraphNodeType::Model);
 		scenegraph::copyNode(*node, copiedNode, false, false);
-		copiedNode.setVolume(bakedVolume, true);
+		copiedNode.setVolume(bakedVolume);
 		tempSceneGraph.emplace(core::move(copiedNode));
 	}
 	const scenegraph::SceneGraph::MergeResult &merged = tempSceneGraph.merge();
@@ -1999,7 +1999,7 @@ int SceneManager::mergeLockedToTemp() {
 
 	// Create the merged temporary node
 	scenegraph::SceneGraphNode newNode(scenegraph::SceneGraphNodeType::Model);
-	newNode.setVolume(merged.volume(), true);
+	newNode.setVolume(merged.volume());
 	newNode.setPalette(merged.palette);
 	newNode.setNormalPalette(merged.normalPalette);
 	newNode.setName(_("merged_temp"));

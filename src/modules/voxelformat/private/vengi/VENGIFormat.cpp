@@ -353,17 +353,17 @@ bool VENGIFormat::loadNodeData(scenegraph::SceneGraph &sceneGraph, scenegraph::S
 	}
 	if (v->isEmpty(region)) {
 		delete v;
-		node.setVolume(new voxel::RawVolume(voxel::Region(mins, mins)), true);
+		node.setVolume(new voxel::RawVolume(voxel::Region(mins, mins)));
 	} else if (core::getVar(cfg::VoxelCropOnLoad)->boolVal()) {
 		voxel::RawVolume *cropped = voxelutil::cropVolume(v);
 		if (cropped != nullptr) {
 			delete v;
-			node.setVolume(cropped, true);
+			node.setVolume(cropped);
 		} else {
-			node.setVolume(v, true);
+			node.setVolume(v);
 		}
 	} else {
-		node.setVolume(v, true);
+		node.setVolume(v);
 	}
 	return true;
 }
