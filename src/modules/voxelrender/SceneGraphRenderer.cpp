@@ -6,6 +6,7 @@
 #include "app/ForParallel.h"
 #include "core/Log.h"
 #include "core/Trace.h"
+#include "math/Math.h"
 #include "render/CameraRenderer.h"
 #include "scenegraph/SceneGraph.h"
 #include "scenegraph/SceneGraphAnimation.h"
@@ -20,6 +21,45 @@
 namespace voxelrender {
 
 SceneGraphRenderer::SceneGraphRenderer() {
+}
+
+int SceneGraphRenderer::allocateVolumeIdx(int nodeId) {
+	if (nodeId >= (int)_nodeIdToVolumeIdx.size()) {
+		const int oldSize = (int)_nodeIdToVolumeIdx.size();
+		// TODO: reserve not just 1 slot but a few more to avoid too many resizes
+		_nodeIdToVolumeIdx.resize(nodeId + 1);
+		for (int i = oldSize; i <= nodeId; ++i) {
+			_nodeIdToVolumeIdx[i] = -1;
+		}
+	}
+	int idx;
+	if (!_freeVolumeIndices.empty()) {
+		idx = _freeVolumeIndices.pop();
+	} else {
+		idx = _nextVolumeIdx++;
+	}
+	_nodeIdToVolumeIdx[nodeId] = idx;
+	return idx;
+}
+
+void SceneGraphRenderer::freeVolumeIdx(int nodeId) {
+	if (nodeId < 0 || nodeId >= (int)_nodeIdToVolumeIdx.size()) {
+		return;
+	}
+	const int idx = _nodeIdToVolumeIdx[nodeId];
+	if (idx < 0) {
+		return;
+	}
+	_nodeIdToVolumeIdx[nodeId] = -1;
+	_freeVolumeIndices.push(idx);
+}
+
+int SceneGraphRenderer::getOrAssignVolumeIdx(int nodeId) {
+	const int existing = getVolumeIdx(nodeId);
+	if (existing >= 0) {
+		return existing;
+	}
+	return allocateVolumeIdx(nodeId);
 }
 
 void SceneGraphRenderer::construct() {
@@ -39,7 +79,7 @@ void SceneGraphRenderer::update(const voxel::MeshStatePtr &meshState) {
 }
 
 void SceneGraphRenderer::scheduleRegionExtraction(const voxel::MeshStatePtr &meshState, int nodeId, const voxel::Region &region) {
-	const int idx = getVolumeIdx(nodeId);
+	const int idx = getOrAssignVolumeIdx(nodeId);
 	if (sliceViewActiveForNode(nodeId)) {
 		_sliceVolumeDirty = true;
 		return;
@@ -67,6 +107,11 @@ void SceneGraphRenderer::shutdown() {
 void SceneGraphRenderer::clear(const voxel::MeshStatePtr &meshState) {
 	_volumeRenderer.clear(meshState);
 	_sliceRegion = voxel::Region::InvalidRegion;
+	for (int i = 0; i < (int)_nodeIdToVolumeIdx.size(); ++i) {
+		_nodeIdToVolumeIdx[i] = -1;
+	}
+	_freeVolumeIndices.clear();
+	_nextVolumeIdx = 0;
 }
 
 const voxel::Region &SceneGraphRenderer::sliceRegion() const {
@@ -86,16 +131,17 @@ bool SceneGraphRenderer::isSliceModeActive() const {
 
 void SceneGraphRenderer::nodeRemove(const voxel::MeshStatePtr &meshState, int nodeId) {
 	const int idx = getVolumeIdx(nodeId);
-	if (idx < 0 || idx >= voxel::MAX_VOLUMES) {
+	if (idx < 0) {
 		return;
 	}
 	// ignore the return value because the volume is owned by the node
 	(void)_volumeRenderer.resetVolume(meshState, idx);
+	freeVolumeIdx(nodeId);
 }
 
 bool SceneGraphRenderer::isVisible(const voxel::MeshStatePtr &meshState, int nodeId, bool hideEmpty) const {
 	const int idx = getVolumeIdx(nodeId);
-	if (idx < 0 || idx >= voxel::MAX_VOLUMES) {
+	if (idx < 0) {
 		return false;
 	}
 	return _volumeRenderer.isVisible(meshState, idx, hideEmpty);
@@ -110,36 +156,29 @@ void SceneGraphRenderer::prepareMeshStateTransform(const voxel::MeshStatePtr &me
 												   const scenegraph::SceneGraphNode &node, int idx) const {
 	core_trace_scoped(PrepareMeshStateTransform);
 	const voxel::Region &region = sceneGraph.resolveRegion(node);
-	const scenegraph::FrameTransform &transform = sceneGraph.transformForFrame(node, frame);
-	const glm::vec3 &scale = transform.worldScale();
-	const int negative = (int)std::signbit(scale.x) + (int)std::signbit(scale.y) + (int)std::signbit(scale.z);
-	if (negative == 1 || negative == 3) {
-		meshState->setCullFace(idx, video::Face::Front);
+
+	// Fast path for single-keyframe nodes (common case): use the pre-computed world
+	// matrix directly from SceneGraphTransform, avoiding the transformForFrame() mutex
+	// lock + hash map lookup.
+	const scenegraph::SceneGraphKeyFrames &keyFrames = node.keyFrames();
+	const glm::mat4 *wmPtr;
+	scenegraph::FrameTransform frameTransform;
+	if (keyFrames.size() == 1) {
+		wmPtr = &keyFrames[0].transform().worldMatrix();
 	} else {
-		meshState->setCullFace(idx, video::Face::Back);
+		frameTransform = sceneGraph.transformForFrame(node, frame);
+		wmPtr = &frameTransform.worldMatrix();
 	}
+	const glm::mat4 &wm = *wmPtr;
+	meshState->setCullFace(idx, math::det3x3(wm) < 0.0f ? video::Face::Front : video::Face::Back);
+
 	const glm::vec3 &pivot = node.pivot();
-	const glm::mat4 &worldMatrix = transform.calculateWorldMatrix(pivot, region.getDimensionsInVoxels());
-	const glm::vec3 &mins = region.getLowerCornerf();
-	const glm::vec3 &maxs = region.getUpperCornerf();
-	const glm::vec3 corners[] = {mins,
-								 glm::vec3(maxs.x, mins.y, mins.z),
-								 glm::vec3(mins.x, maxs.y, mins.z),
-								 glm::vec3(maxs.x, maxs.y, mins.z),
-								 glm::vec3(mins.x, mins.y, maxs.z),
-								 glm::vec3(maxs.x, mins.y, maxs.z),
-								 glm::vec3(mins.x, maxs.y, maxs.z),
-								 maxs};
-
-	glm::vec3 transformedMins(std::numeric_limits<float>::max());
-	glm::vec3 transformedMaxs(std::numeric_limits<float>::lowest());
-
-	for (int i = 0; i < lengthof(corners); ++i) {
-		const glm::vec3 transformed(worldMatrix * glm::vec4(corners[i], 1.0f));
-		transformedMins = glm::min(transformedMins, transformed);
-		transformedMaxs = glm::max(transformedMaxs, transformed);
-	}
-	meshState->setModelMatrix(idx, worldMatrix, transformedMins, transformedMaxs);
+	const glm::vec3 dimensions(region.getDimensionsInVoxels());
+	const glm::mat4 worldMatrix = glm::translate(wm, -pivot * dimensions);
+	glm::vec3 mins;
+	glm::vec3 maxs;
+	region.transformArvo(worldMatrix, mins, maxs);
+	meshState->setModelMatrix(idx, worldMatrix, mins, maxs);
 }
 
 bool SceneGraphRenderer::sliceViewActiveForNode(int nodeId) const {
@@ -159,8 +198,8 @@ void SceneGraphRenderer::handleSliceView(const voxel::MeshStatePtr &meshState, s
 	// * a new activated node
 	// * the region changed
 	// * we don't yet have a sliced volume view but requested one
-	const int idx = getVolumeIdx(node);
-	if (idx >= voxel::MAX_VOLUMES) {
+	const int idx = getOrAssignVolumeIdx(node.id());
+	if (idx < 0) {
 		return;
 	}
 
@@ -225,8 +264,8 @@ void SceneGraphRenderer::prepareReferenceNodes(const voxel::MeshStatePtr &meshSt
 			continue;
 		}
 
-		const int idx = getVolumeIdx(node);
-		if (idx >= voxel::MAX_VOLUMES) {
+		const int idx = getVolumeIdx(node.id());
+		if (idx < 0) {
 			continue;
 		}
 		updateNodeState(meshState, renderContext, activeNode, node, idx);
@@ -258,21 +297,6 @@ void SceneGraphRenderer::prepareCameraNodes(const RenderContext &renderContext) 
 		}
 		const glm::ivec2 size(cameraNode.width(), cameraNode.height());
 		_cameras.emplace_back(cameraNode.id(), toCamera(size, sceneGraph, cameraNode, renderContext.frame), cameraNode.color());
-	}
-}
-
-void SceneGraphRenderer::resetVolumes(const voxel::MeshStatePtr &meshState, const scenegraph::SceneGraph &sceneGraph) {
-	core_trace_scoped(ResetVolumes);
-	// Copy active indices to avoid modifying the list while iterating
-	// (resetVolume calls setVolume(nullptr) which removes from active list)
-	const core::Buffer<int> activeSnapshot = meshState->activeIndices();
-	for (int idx : activeSnapshot) {
-		const int nodeId = getNodeId(idx);
-		if (sceneGraph.hasNode(nodeId)) {
-			continue;
-		}
-		// ignore the return value because the volume is owned by the node
-		(void)_volumeRenderer.resetVolume(meshState, nodeId);
 	}
 }
 
@@ -309,16 +333,14 @@ void SceneGraphRenderer::prepareModelNodes(const voxel::MeshStatePtr &meshState,
 	};
 	core::Buffer<VisibleNode> visibleNodes;
 	visibleNodes.reserve(sceneGraph.size());
-	int skippedNodes = 0;
 	for (auto entry : sceneGraph.nodes()) {
 		const scenegraph::SceneGraphNode &node = entry->value;
 		if (!node.isModelNode()) {
 			continue;
 		}
 		const int nodeId = entry->key;
-		const int idx = getVolumeIdx(nodeId);
-		if (idx >= voxel::MAX_VOLUMES) {
-			++skippedNodes;
+		const int idx = getOrAssignVolumeIdx(nodeId);
+		if (idx < 0) {
 			continue;
 		}
 		updateNodeState(meshState, renderContext, activeNode, node, idx);
@@ -330,11 +352,6 @@ void SceneGraphRenderer::prepareModelNodes(const voxel::MeshStatePtr &meshState,
 			continue;
 		}
 		visibleNodes.push_back({nodeId, idx});
-	}
-
-	if (skippedNodes > 0) {
-		Log::warn("Skipped %i nodes for rendering - node IDs exceed MAX_VOLUMES (%i). "
-				  "Consider increasing MAX_VOLUMES.", skippedNodes, voxel::MAX_VOLUMES);
 	}
 
 	// Phase 2: compute transforms in parallel (expensive, only for visible nodes)
@@ -354,8 +371,8 @@ void SceneGraphRenderer::prepareModelNodes(const voxel::MeshStatePtr &meshState,
 			continue;
 		}
 
-		const int idx = getVolumeIdx(node);
-		if (meshState->hidden(idx)) {
+		const int idx = getOrAssignVolumeIdx(node.id());
+		if (idx < 0 || meshState->hidden(idx)) {
 			continue;
 		}
 
@@ -379,8 +396,6 @@ void SceneGraphRenderer::prepareModelNodes(const voxel::MeshStatePtr &meshState,
 void SceneGraphRenderer::prepare(const voxel::MeshStatePtr &meshState, const RenderContext &renderContext) {
 	core_trace_scoped(Prepare);
 	core_assert_always(renderContext.sceneGraph != nullptr);
-	const scenegraph::SceneGraph &sceneGraph = *renderContext.sceneGraph;
-	resetVolumes(meshState, sceneGraph);
 	prepareCameraNodes(renderContext);
 	prepareModelNodes(meshState, renderContext);
 	prepareReferenceNodes(meshState, renderContext);

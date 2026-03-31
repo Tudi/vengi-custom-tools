@@ -202,15 +202,20 @@ public:
 	const voxel::Region &region() const;
 	/**
 	 * @param volume voxel::RawVolume instance. Might be @c nullptr.
-	 * @param transferOwnership this is @c true if the volume should get deleted by this class, @c false if
-	 * you are going to manage the instance on your own.
+	 * @note Takes ownership of the volume - the node will delete it when done.
 	 */
-	void setVolume(voxel::RawVolume *volume, bool transferOwnership);
+	void setVolume(voxel::RawVolume *volume);
 	/**
-	 * @param volume voxel::RawVolume instance. Might be @c nullptr.
-	 * @note This will not take ownership of the volume instance
+	 * @brief Creates a new empty volume for this node with the given region.
+	 * @param region The region for the new volume.
 	 */
-	void setVolume(const voxel::RawVolume *volume);
+	void createVolume(const voxel::Region &region);
+	/**
+	 * @brief Set the volume without taking ownership.
+	 * @param volume voxel::RawVolume instance. Might be @c nullptr.
+	 * @note The caller must ensure the volume outlives this node. The node will not delete the volume.
+	 */
+	void setUnownedVolume(const voxel::RawVolume *volume);
 
 	// meta data
 

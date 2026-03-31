@@ -3,6 +3,7 @@
  */
 
 #include "app/benchmark/AbstractBenchmark.h"
+#include "palette/NormalPalette.h"
 #include "palette/Palette.h"
 #include "palette/PaletteLookup.h"
 
@@ -40,7 +41,31 @@ BENCHMARK_DEFINE_F(PaletteBenchmark, paletteLookup)(benchmark::State &state) {
 	}
 }
 
+BENCHMARK_DEFINE_F(PaletteBenchmark, toVec4fPalette)(benchmark::State &state) {
+	palette::Palette palette;
+	palette.nippon();
+	for (auto _ : state) {
+		glm::highp_vec4 materialColors[256];
+		glm::highp_vec4 emitColors[256];
+		palette.toVec4f(materialColors, emitColors);
+		benchmark::DoNotOptimize(materialColors);
+		benchmark::DoNotOptimize(emitColors);
+	}
+}
+
+BENCHMARK_DEFINE_F(PaletteBenchmark, toVec4fNormalPalette)(benchmark::State &state) {
+	palette::NormalPalette normalPalette;
+	normalPalette.redAlert2();
+	glm::highp_vec4 vec4f[palette::NormalPaletteMaxNormals];
+	for (auto _ : state) {
+		normalPalette.toVec4f(vec4f);
+		benchmark::DoNotOptimize(vec4f);
+	}
+}
+
 BENCHMARK_REGISTER_F(PaletteBenchmark, findReplacement);
 BENCHMARK_REGISTER_F(PaletteBenchmark, paletteLookup);
 BENCHMARK_REGISTER_F(PaletteBenchmark, getClosestMatch);
+BENCHMARK_REGISTER_F(PaletteBenchmark, toVec4fPalette);
+BENCHMARK_REGISTER_F(PaletteBenchmark, toVec4fNormalPalette);
 BENCHMARK_MAIN();

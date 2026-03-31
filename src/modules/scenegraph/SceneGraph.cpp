@@ -450,7 +450,7 @@ void SceneGraph::getCollisionNodes(CollisionNodes &out, FrameIndex frameIdx, con
 	}
 
 	core::DynamicArray<const scenegraph::SceneGraphNode *> cnodes;
-	cnodes.reserve(2048);
+	cnodes.reserve(nodes().size());
 	for (const auto &e : nodes()) {
 		const scenegraph::SceneGraphNode &node = e->second;
 		if (!node.visible() || !node.isAnyModelNode()) {
@@ -463,18 +463,25 @@ void SceneGraph::getCollisionNodes(CollisionNodes &out, FrameIndex frameIdx, con
 		cnodes.push_back(&node);
 	}
 
+	const glm::vec3 &queryMins = aabb.mins();
+	const glm::vec3 &queryMaxs = aabb.maxs();
+
 	out.resize(cnodes.size());
 	app::for_parallel(0, (int)cnodes.size(), [&](int begin, int end) {
 		for (int i = begin; i < end; ++i) {
 			const scenegraph::SceneGraphNode &node = *cnodes[i];
 			const voxel::RawVolume *volume = resolveVolume(node);
 			const glm::mat4 &worldMat = worldMatrix(node, frameIdx, true);
-			const glm::mat4 &worldToModel = glm::inverse(worldMat);
-			const voxel::Region &region = volume->region().transform(worldToModel);
-			if (!voxel::intersects(region, regionAABB)) {
+			glm::vec3 transformedMins;
+			glm::vec3 transformedMaxs;
+			volume->region().transformArvo(worldMat, transformedMins, transformedMaxs);
+			if (transformedMaxs.x < queryMins.x || transformedMins.x > queryMaxs.x ||
+				transformedMaxs.y < queryMins.y || transformedMins.y > queryMaxs.y ||
+				transformedMaxs.z < queryMins.z || transformedMins.z > queryMaxs.z) {
 				continue;
 			}
 
+			const glm::mat4 &worldToModel = glm::inverse(worldMat);
 			out[i] = CollisionNode(volume, worldToModel);
 		}
 	});

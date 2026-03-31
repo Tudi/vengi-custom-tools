@@ -36,6 +36,7 @@
 #include "voxedit-util/modifier/ModifierType.h"
 #include "voxedit-util/modifier/brush/Brush.h"
 #include "voxedit-util/modifier/brush/BrushGizmo.h"
+#include "ui/Style.h"
 #include "voxel/RawVolume.h"
 #include "voxel/Region.h"
 #include "voxel/Voxel.h"
@@ -925,7 +926,7 @@ bool Viewport::runGizmo(const video::Camera &camera) {
 	return true;
 }
 
-bool Viewport::runBrushGizmo(const video::Camera &camera) {
+bool Viewport::runBrushGizmo(const video::Camera &camera, float headerSize) {
 	if (isSceneMode()) {
 		return false;
 	}
@@ -972,6 +973,25 @@ bool Viewport::runBrushGizmo(const video::Camera &camera) {
 	}
 	if (state.operations & BrushGizmo_Bounds) {
 		imguizmoOp |= ImGuizmo::BOUNDS;
+	}
+	if (state.operations & BrushGizmo_Line) {
+		if (state.numPositions >= 2) {
+			ImVec2 windowPos = ImGui::GetWindowPos();
+			windowPos.y += headerSize;
+			const glm::vec2 scale = dpiScale();
+			ImDrawList *drawList = ImGui::GetWindowDrawList();
+			const ImU32 lineColor = ImGui::GetColorU32(ImVec4(style::color(style::ColorBrushGizmoLine)));
+			const float lineThickness = 2.0f;
+			for (int i = 0; i < state.numPositions - 1; ++i) {
+				const glm::ivec2 screenA = camera.worldToScreen(state.positions[i]);
+				const glm::ivec2 screenB = camera.worldToScreen(state.positions[i + 1]);
+				const ImVec2 a(windowPos.x + (float)screenA.x / scale.x,
+							   windowPos.y + (float)screenA.y / scale.y);
+				const ImVec2 b(windowPos.x + (float)screenB.x / scale.x,
+							   windowPos.y + (float)screenB.y / scale.y);
+				drawList->AddLine(a, b, lineColor, lineThickness);
+			}
+		}
 	}
 
 	if (imguizmoOp == 0) {
@@ -1069,7 +1089,7 @@ bool Viewport::renderGizmo(video::Camera &camera, float headerSize, const ImVec2
 	if (!isSceneMode() && _brushGizmo->boolVal()) {
 		ImGuizmo::PushID("brushgizmo");
 		ImGuizmo::Enable(true);
-		brushGizmoModified = runBrushGizmo(camera);
+		brushGizmoModified = runBrushGizmo(camera, headerSize);
 		ImGuizmo::PopID();
 	} else {
 		_sceneMgr->modifier().setBrushGizmoActive(false);

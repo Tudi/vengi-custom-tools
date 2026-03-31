@@ -98,9 +98,9 @@ int createNodeReference(SceneGraph &sceneGraph, const SceneGraphNode &node, int 
 void copyNode(const SceneGraphNode &src, SceneGraphNode &target, bool copyVolume, bool copyKeyFrames) {
 	if (copyVolume) {
 		core_assert_msg(src.volume() != nullptr, "Source node has no volume - and is of type %d", (int)src.type());
-		target.setVolume(new voxel::RawVolume(src.volume()), true);
+		target.setVolume(new voxel::RawVolume(src.volume()));
 	} else if (src.isModelNode()) {
-		target.setVolume(src.volume());
+		target.setUnownedVolume(src.volume());
 	}
 	copy(src, target, copyKeyFrames);
 }
@@ -109,7 +109,7 @@ int copyNodeToSceneGraph(SceneGraph &sceneGraph, const SceneGraphNode &node, int
 	SceneGraphNode newNode(node.type());
 	copy(node, newNode);
 	if (newNode.type() == SceneGraphNodeType::Model) {
-		newNode.setVolume(new voxel::RawVolume(node.volume()), true);
+		newNode.setVolume(new voxel::RawVolume(node.volume()));
 	}
 	const int nodeId = addToGraph(sceneGraph, core::move(newNode), parent);
 	if (recursive) {
@@ -126,9 +126,9 @@ int moveNodeToSceneGraph(SceneGraph &sceneGraph, SceneGraphNode &node, int paren
 	copy(node, newNode);
 	if (newNode.type() == SceneGraphNodeType::Model) {
 		core_assert(node.owns());
-		newNode.setVolume(node.volume(), true);
+		newNode.setVolume(node.volume());
 		node.releaseOwnership();
-		node.setVolume(nullptr, false);
+		node.setUnownedVolume(nullptr);
 	}
 	int newNodeId = addToGraph(sceneGraph, core::move(newNode), parent);
 	if (onNodeAdded && newNodeId != InvalidNodeId) {
@@ -172,11 +172,15 @@ int addSceneGraphNodes(SceneGraph &target, SceneGraph &source, int parent, const
 /**
  * @return the main node id that was added
  */
-static int copySceneGraphNode_r(SceneGraph &target, const SceneGraph &source, const SceneGraphNode &sourceNode, int parent, core::DynamicMap<int, int> &nodeMap) {
+static int copySceneGraphNode_r(SceneGraph &target, const SceneGraph &source, const SceneGraphNode &sourceNode, int parent, core::DynamicMap<int, int> &nodeMap, bool copyVolumes) {
 	SceneGraphNode newNode(sourceNode.type());
 	copy(sourceNode, newNode);
 	if (newNode.type() == SceneGraphNodeType::Model) {
-		newNode.setVolume(new voxel::RawVolume(sourceNode.volume()), true);
+		if (copyVolumes) {
+			newNode.setVolume(new voxel::RawVolume(sourceNode.volume()));
+		} else {
+			newNode.setUnownedVolume(sourceNode.volume());
+		}
 	}
 	const int newNodeId = addToGraph(target, core::move(newNode), parent);
 	if (newNodeId == InvalidNodeId) {
@@ -188,13 +192,13 @@ static int copySceneGraphNode_r(SceneGraph &target, const SceneGraph &source, co
 	for (int sourceNodeIdx : sourceNode.children()) {
 		core_assert(source.hasNode(sourceNodeIdx));
 		SceneGraphNode &sourceChildNode = source.node(sourceNodeIdx);
-		copySceneGraphNode_r(target, source, sourceChildNode, newNodeId, nodeMap);
+		copySceneGraphNode_r(target, source, sourceChildNode, newNodeId, nodeMap, copyVolumes);
 	}
 
 	return newNodeId;
 }
 
-core::Buffer<int> copySceneGraph(SceneGraph &target, const SceneGraph &source, int parent) {
+core::Buffer<int> copySceneGraph(SceneGraph &target, const SceneGraph &source, int parent, bool copyVolumes) {
 	const SceneGraphNode &sourceRoot = source.root();
 	core::Buffer<int> nodesAdded;
 	core::DynamicMap<int, int> nodeMap;
@@ -205,7 +209,7 @@ core::Buffer<int> copySceneGraph(SceneGraph &target, const SceneGraph &source, i
 
 	target.node(parent).addProperties(sourceRoot.properties());
 	for (int sourceNodeId : sourceRoot.children()) {
-		nodesAdded.push_back(copySceneGraphNode_r(target, source, source.node(sourceNodeId), parent, nodeMap));
+		nodesAdded.push_back(copySceneGraphNode_r(target, source, source.node(sourceNodeId), parent, nodeMap, copyVolumes));
 	}
 
 	for (auto entry : nodeMap) {
@@ -229,7 +233,7 @@ core::Buffer<int> copySceneGraph(SceneGraph &target, const SceneGraph &source, i
 }
 
 static int copySceneGraphNodeResolveRef_r(SceneGraph &target, const SceneGraph &source,
-										  const SceneGraphNode &sourceNode, int parent) {
+										  const SceneGraphNode &sourceNode, int parent, bool copyVolumes) {
 	SceneGraphNodeType type = sourceNode.type();
 	if (type == SceneGraphNodeType::ModelReference) {
 		type = SceneGraphNodeType::Model;
@@ -239,7 +243,11 @@ static int copySceneGraphNodeResolveRef_r(SceneGraph &target, const SceneGraph &
 	if (type == SceneGraphNodeType::Model) {
 		const voxel::RawVolume *srcVol = source.resolveVolume(sourceNode);
 		if (srcVol) {
-			newNode.setVolume(new voxel::RawVolume(*srcVol), true);
+			if (copyVolumes) {
+				newNode.setVolume(new voxel::RawVolume(*srcVol));
+			} else {
+				newNode.setUnownedVolume(srcVol);
+			}
 		}
 	}
 	const int newNodeId = addToGraph(target, core::move(newNode), parent);
@@ -251,13 +259,13 @@ static int copySceneGraphNodeResolveRef_r(SceneGraph &target, const SceneGraph &
 	for (int sourceNodeIdx : sourceNode.children()) {
 		core_assert(source.hasNode(sourceNodeIdx));
 		const SceneGraphNode &sourceChildNode = source.node(sourceNodeIdx);
-		copySceneGraphNodeResolveRef_r(target, source, sourceChildNode, newNodeId);
+		copySceneGraphNodeResolveRef_r(target, source, sourceChildNode, newNodeId, copyVolumes);
 	}
 
 	return newNodeId;
 }
 
-void copySceneGraphResolveReferences(SceneGraph &target, const SceneGraph &source, int parent) {
+void copySceneGraphResolveReferences(SceneGraph &target, const SceneGraph &source, int parent, bool copyVolumes) {
 	const SceneGraphNode &sourceRoot = source.root();
 
 	for (const core::String &animation : source.animations()) {
@@ -266,7 +274,7 @@ void copySceneGraphResolveReferences(SceneGraph &target, const SceneGraph &sourc
 
 	target.node(parent).addProperties(sourceRoot.properties());
 	for (int sourceNodeId : sourceRoot.children()) {
-		copySceneGraphNodeResolveRef_r(target, source, source.node(sourceNodeId), parent);
+		copySceneGraphNodeResolveRef_r(target, source, source.node(sourceNodeId), parent, copyVolumes);
 	}
 }
 
@@ -322,7 +330,7 @@ static void splitVolumes_r(const SceneGraph &src, SceneGraph &dest, int srcNodeI
 					}
 				}
 				copyNode(node, newNode, false);
-				newNode.setVolume(v, true);
+				newNode.setVolume(v);
 				int newNodeId = addToGraph(dest, core::move(newNode), destParentId);
 				if (newNodeId != InvalidNodeId) {
 					auto iter = splitMap.find(node.id());

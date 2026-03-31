@@ -245,7 +245,7 @@ bool SceneManager::nodeSave(int nodeId, const core::String& file) {
 	scenegraph::SceneGraphNode newNode(scenegraph::SceneGraphNodeType::Model);
 	scenegraph::copyNode(*node, newNode, false);
 	if (node->isReferenceNode()) {
-		newNode.setVolume(_sceneGraph.resolveVolume(*node));
+		newNode.setUnownedVolume(_sceneGraph.resolveVolume(*node));
 	}
 	newSceneGraph.emplace(core::move(newNode));
 	voxelformat::SaveContext saveCtx;
@@ -618,33 +618,6 @@ bool SceneManager::save(const io::FileDescription &file, bool autosave) {
 	return false;
 }
 
-static void mergeIfNeeded(scenegraph::SceneGraph &newSceneGraph) {
-	if (newSceneGraph.size() > voxel::MAX_VOLUMES) {
-		const int splitSize = core::getVar(cfg::VoxelSplitOnLoad)->intVal();
-		if (splitSize > 0) {
-			Log::debug("Skipping merge of %i volumes (split on load = %i)", (int)newSceneGraph.size(), splitSize);
-			return;
-		}
-		// TODO: don't merge everything blindly. Check if it's enough to merge single nodes here.
-		// TODO: PERF: merging will take a lot of time for large scenes
-		Log::warn("Scene has %i nodes which exceeds the limit of %i - merging all nodes into one volume. "
-				  "This may use a lot of memory. Consider increasing MAX_VOLUMES.",
-				  (int)newSceneGraph.size(), voxel::MAX_VOLUMES);
-		const scenegraph::SceneGraph::MergeResult &merged = newSceneGraph.merge();
-		if (!merged.hasVolume()) {
-			Log::error("Failed to merge the scenegraph nodes");
-			return;
-		}
-		newSceneGraph.clear();
-		scenegraph::SceneGraphNode newNode(scenegraph::SceneGraphNodeType::Model);
-		newNode.setVolume(merged.volume(), true);
-		newNode.setPalette(merged.palette);
-		newNode.setNormalPalette(merged.normalPalette);
-		newSceneGraph.emplace(core::move(newNode));
-		Log::debug("Merging successful");
-	}
-}
-
 bool SceneManager::import(const core::String& file) {
 	if (file.empty()) {
 		Log::error("Can't import model: No file given");
@@ -658,19 +631,6 @@ bool SceneManager::import(const core::String& file) {
 	if (!voxelformat::loadFormat(fileDesc, archive, newSceneGraph, loadCtx)) {
 		Log::error("Failed to load %s", file.c_str());
 		return false;
-	}
-	if (core::getVar(cfg::VoxEditImportSingleNode)->boolVal()) {
-		const scenegraph::SceneGraph::MergeResult &merged = newSceneGraph.merge();
-		if (merged.hasVolume()) {
-			newSceneGraph.clear();
-			scenegraph::SceneGraphNode newNode(scenegraph::SceneGraphNodeType::Model);
-			newNode.setVolume(merged.volume(), true);
-			newNode.setPalette(merged.palette);
-			newNode.setNormalPalette(merged.normalPalette);
-			newSceneGraph.emplace(core::move(newNode));
-		}
-	} else {
-		mergeIfNeeded(newSceneGraph);
 	}
 
 	scenegraph::SceneGraphNode groupNode(scenegraph::SceneGraphNodeType::Group);
@@ -712,7 +672,6 @@ bool SceneManager::importDirectory(const core::String& directory, const io::Form
 		if (!voxelformat::loadFormat(fileDesc, archive, newSceneGraph, loadCtx)) {
 			Log::error("Failed to load %s", e.fullPath.c_str());
 		} else {
-			mergeIfNeeded(newSceneGraph);
 			state |= scenegraph::addSceneGraphNodes(_sceneGraph, newSceneGraph, importGroupNodeId, [this] (int nodeId) {
 				onNewNodeAdded(nodeId, false);
 			}) > 0;
@@ -734,7 +693,6 @@ bool SceneManager::load(const io::FileDescription& file) {
 		scenegraph::SceneGraph newSceneGraph;
 		voxelformat::LoadContext loadCtx;
 		voxelformat::loadFormat(file, archive, newSceneGraph, loadCtx);
-		mergeIfNeeded(newSceneGraph);
 		return core::move(newSceneGraph);
 	});
 	_lastFilename.set(file.name, &file.desc);
@@ -748,7 +706,6 @@ bool SceneManager::load(const io::FileDescription& file, const uint8_t *data, si
 	archive->add(file.name, data, size);
 	voxelformat::LoadContext loadCtx;
 	voxelformat::loadFormat(file, archive, newSceneGraph, loadCtx);
-	mergeIfNeeded(newSceneGraph);
 	if (loadSceneGraph(core::move(newSceneGraph))) {
 		_needAutoSave = false;
 		_dirty = false;
@@ -864,7 +821,7 @@ int SceneManager::nodeColorToNewNode(int nodeId, const voxel::Voxel voxelColor) 
 	modified(nodeId, wrapper.dirtyRegion());
 	scenegraph::SceneGraphNode newNode(scenegraph::SceneGraphNodeType::Model);
 	copyNode(node, newNode, false, true);
-	newNode.setVolume(newVolume, true);
+	newNode.setVolume(newVolume);
 	newNode.setName(core::String::format("color: %i", (int)voxelColor.getColor()));
 	return moveNodeToSceneGraph(newNode, node.parent());
 }
@@ -918,7 +875,7 @@ void SceneManager::nodeSplitObjects(int nodeId) {
 
 	for (voxel::RawVolume *newVolume : volumes) {
 		scenegraph::SceneGraphNode newNode(scenegraph::SceneGraphNodeType::Model);
-		newNode.setVolume(newVolume, true);
+		newNode.setVolume(newVolume);
 		newNode.setName(node->name());
 		newNode.setPalette(node->palette());
 		moveNodeToSceneGraph(newNode, nodeId);
@@ -1250,7 +1207,7 @@ bool SceneManager::mementoStateToNode(const memento::MementoState &s) {
 	core_assert(s.nodeType != scenegraph::SceneGraphNodeType::Max);
 	scenegraph::SceneGraphNode newNode(s.nodeType, s.nodeUUID);
 	if (newNode.isModelNode()) {
-		newNode.setVolume(new voxel::RawVolume(s.volumeRegion()), true);
+		newNode.createVolume(s.volumeRegion());
 		if (s.hasVolumeData()) {
 			memento::MementoData::toVolume(newNode.volume(), s.data, s.data.dataRegion());
 		}
@@ -1463,7 +1420,7 @@ bool SceneManager::saveSelection(const io::FileDescription& file) {
 	scenegraph::SceneGraph newSceneGraph;
 	scenegraph::SceneGraphNode newNode(scenegraph::SceneGraphNodeType::Model);
 	scenegraph::copyNode(*node, newNode, false);
-	newNode.setVolume(new voxel::RawVolume(*clipboardData.volume), true);
+	newNode.setVolume(new voxel::RawVolume(*clipboardData.volume));
 	newSceneGraph.emplace(core::move(newNode));
 	if (!voxelformat::saveFormat(newSceneGraph, file.name, &file.desc, archive, saveCtx)) {
 		Log::warn("Failed to save node %i to %s", nodeId, file.name.c_str());
@@ -1497,7 +1454,7 @@ bool SceneManager::nodePasteAsNewNode(int nodeId) {
 	}
 	scenegraph::SceneGraphNode newNode(scenegraph::SceneGraphNodeType::Model);
 	scenegraph::copyNode(*node, newNode, false);
-	newNode.setVolume(new voxel::RawVolume(*_copy.volume), true);
+	newNode.setVolume(new voxel::RawVolume(*_copy.volume));
 	newNode.setPalette(*_copy.palette);
 	return moveNodeToSceneGraph(newNode, node->parent()) != InvalidNodeId;
 }
@@ -1613,7 +1570,7 @@ bool SceneManager::globalCopy() {
 	}
 	scenegraph::SceneGraph newSceneGraph;
 	scenegraph::SceneGraphNode newNode(scenegraph::SceneGraphNodeType::Model);
-	newNode.setVolume(new voxel::RawVolume(*_copy.volume), true);
+	newNode.setVolume(new voxel::RawVolume(*_copy.volume));
 	newNode.setPalette(*_copy.palette);
 	newSceneGraph.emplace(core::move(newNode));
 	const core::String clipboardFile = _filesystem->homeWritePath("globalclipboard.vengi");
@@ -1635,7 +1592,7 @@ bool SceneManager::globalCopyVisible() {
 	}
 	scenegraph::SceneGraph newSceneGraph;
 	scenegraph::SceneGraphNode newNode(scenegraph::SceneGraphNodeType::Model);
-	newNode.setVolume(merged.volume(), true);
+	newNode.setVolume(merged.volume());
 	newNode.setPalette(merged.palette);
 	newSceneGraph.emplace(core::move(newNode));
 	const core::String clipboardFile = _filesystem->homeWritePath("globalclipboard.vengi");
@@ -1673,7 +1630,7 @@ bool SceneManager::globalPaste(const glm::ivec3 &pos) {
 			  vol->region().toString().c_str());
 	scenegraph::SceneGraphNode newNode(scenegraph::SceneGraphNodeType::Model);
 	newNode.setName("clipboard");
-	newNode.setVolume(vol, true);
+	newNode.setVolume(vol);
 	newNode.setPalette(*_copy.palette);
 	const int newNodeId = moveNodeToSceneGraph(newNode);
 	if (newNodeId == InvalidNodeId) {
@@ -1697,7 +1654,7 @@ bool SceneManager::globalPasteNode(const glm::ivec3 &pos) {
 			  vol->region().toString().c_str());
 	scenegraph::SceneGraphNode newNode(scenegraph::SceneGraphNodeType::Model);
 	newNode.setName("clipboard");
-	newNode.setVolume(vol, true);
+	newNode.setVolume(vol);
 	newNode.setPalette(*clipData.palette);
 	const int newNodeId = moveNodeToSceneGraph(newNode);
 	if (newNodeId == InvalidNodeId) {
@@ -1951,7 +1908,7 @@ int SceneManager::mergeVisibleToTemp() {
 		}
 		scenegraph::SceneGraphNode copiedNode(scenegraph::SceneGraphNodeType::Model);
 		scenegraph::copyNode(*node, copiedNode, false, false);
-		copiedNode.setVolume(bakedVolume, true);
+		copiedNode.setVolume(bakedVolume);
 		tempSceneGraph.emplace(core::move(copiedNode));
 	}
 	const scenegraph::SceneGraph::MergeResult &merged = tempSceneGraph.merge();
@@ -1969,7 +1926,7 @@ int SceneManager::mergeVisibleToTemp() {
 
 	// Create the merged temporary node
 	scenegraph::SceneGraphNode newNode(scenegraph::SceneGraphNodeType::Model);
-	newNode.setVolume(merged.volume(), true);
+	newNode.setVolume(merged.volume());
 	newNode.setPalette(merged.palette);
 	newNode.setNormalPalette(merged.normalPalette);
 	newNode.setName(_("merged_temp"));
@@ -2451,7 +2408,7 @@ int SceneManager::mergeNodes(const core::Buffer<int>& nodeIds) {
 		}
 		scenegraph::SceneGraphNode copiedNode(scenegraph::SceneGraphNodeType::Model);
 		scenegraph::copyNode(*node, copiedNode, false, false);
-		copiedNode.setVolume(bakedVolume, true);
+		copiedNode.setVolume(bakedVolume);
 		newSceneGraph.emplace(core::move(copiedNode));
 	}
 	const scenegraph::SceneGraph::MergeResult &merged = newSceneGraph.merge();
@@ -2461,7 +2418,7 @@ int SceneManager::mergeNodes(const core::Buffer<int>& nodeIds) {
 
 	memento::ScopedMementoGroup mementoGroup(_mementoHandler, "merge");
 	scenegraph::SceneGraphNode newNode(scenegraph::SceneGraphNodeType::Model);
-	newNode.setVolume(merged.volume(), true);
+	newNode.setVolume(merged.volume());
 	newNode.setPalette(merged.palette);
 	newNode.setNormalPalette(merged.normalPalette);
 	int parent = 0;
@@ -2731,7 +2688,7 @@ bool SceneManager::setSceneGraphNodeVolume(scenegraph::SceneGraphNode &node, vox
 		return true;
 	}
 
-	node.setVolume(volume, true);
+	node.setVolume(volume);
 	// the old volume pointer might no longer be used
 	_sceneRenderer->removeNode(node.id());
 
@@ -2751,7 +2708,7 @@ bool SceneManager::newScene(bool force, const core::String &name, voxel::RawVolu
 	_sceneRenderer->clear();
 
 	scenegraph::SceneGraphNode newNode(scenegraph::SceneGraphNodeType::Model);
-	newNode.setVolume(v, true);
+	newNode.setVolume(v);
 	if (name.empty()) {
 		newNode.setName("unnamed");
 	} else {
@@ -4334,7 +4291,7 @@ int SceneManager::addModelChild(const core::String& name, int width, int height,
 		return InvalidNodeId;
 	}
 	scenegraph::SceneGraphNode newNode(scenegraph::SceneGraphNodeType::Model, uuid);
-	newNode.setVolume(new voxel::RawVolume(region), true);
+	newNode.createVolume(region);
 	newNode.setName(name);
 	const int parentId = activeNode();
 	const int nodeId = moveNodeToSceneGraph(newNode, parentId);
@@ -5574,7 +5531,7 @@ bool SceneManager::nodeRemove(scenegraph::SceneGraphNode &node, bool recursive) 
 	if (_sceneGraph.empty()) {
 		const voxel::Region &region = voxel::Region::fromSize(32);
 		scenegraph::SceneGraphNode newNode(scenegraph::SceneGraphNodeType::Model);
-		newNode.setVolume(new voxel::RawVolume(region), true);
+		newNode.createVolume(region);
 		if (name.empty()) {
 			newNode.setName("unnamed");
 		} else {

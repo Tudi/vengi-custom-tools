@@ -7,6 +7,7 @@
 #include "RawVolumeRenderer.h"
 #include "core/SharedPtr.h"
 #include "core/collection/Buffer.h"
+#include "core/collection/DynamicStack.h"
 #include "render/CameraRenderer.h"
 #include "scenegraph/SceneGraphNode.h"
 #include "video/Camera.h"
@@ -39,14 +40,22 @@ protected:
 	void prepareReferenceNodes(const voxel::MeshStatePtr &meshState, const RenderContext &renderContext) const;
 	void prepareCameraNodes(const RenderContext &renderContext);
 
-	/** @brief remove those volumes that are no longer part of the scene graph */
-	void resetVolumes(const voxel::MeshStatePtr &meshState, const scenegraph::SceneGraph &sceneGraph);
 	void prepare(const voxel::MeshStatePtr &meshState, const RenderContext &renderContext);
 
 	core::SharedPtr<voxel::RawVolume> _sliceVolume;
 	voxel::Region _sliceRegion = voxel::Region::InvalidRegion;
 	bool _sliceVolumeDirty = false;
 	int _sliceVolumeNodeId = -1;
+
+	/** @brief Sparse table indexed by nodeId, value is the compact volume index (-1 = unmapped) */
+	core::Buffer<int> _nodeIdToVolumeIdx;
+	/** @brief Free-list of recycled compact volume indices */
+	core::DynamicStack<int> _freeVolumeIndices;
+	/** @brief High-water mark for next new volume index allocation */
+	int _nextVolumeIdx = 0;
+
+	int allocateVolumeIdx(int nodeId);
+	void freeVolumeIdx(int nodeId);
 
 public:
 	SceneGraphRenderer();
@@ -85,21 +94,30 @@ public:
 		return _volumeRenderer.culledVolumeCount();
 	}
 
-	static inline int getVolumeIdx(int nodeId) {
-		// TODO: using the node id here is not good as they are increasing when you modify the scene graph - and there
-		// is a max limit that could get reached here even though you only have one node active
-		return nodeId;
+	int freeVolumeIndexCount() const {
+		return (int)_freeVolumeIndices.size();
 	}
 
-	static inline int getNodeId(int volumeIdx) {
-		// TODO: using the node id here is not good as they are increasing when you modify the scene graph - and there
-		// is a max limit that could get reached here even though you only have one node active
-		return volumeIdx;
+	int nextVolumeIdx() const {
+		return _nextVolumeIdx;
 	}
 
-	static inline int getVolumeIdx(const scenegraph::SceneGraphNode &node) {
+	int mappedNodeCount() const {
+		return _nextVolumeIdx - (int)_freeVolumeIndices.size();
+	}
+
+	inline int getVolumeIdx(int nodeId) const {
+		if (nodeId < 0 || nodeId >= (int)_nodeIdToVolumeIdx.size()) {
+			return -1;
+		}
+		return _nodeIdToVolumeIdx[nodeId];
+	}
+
+	inline int getVolumeIdx(const scenegraph::SceneGraphNode &node) const {
 		return getVolumeIdx(node.id());
 	}
+
+	int getOrAssignVolumeIdx(int nodeId);
 };
 
 } // namespace voxelrender
