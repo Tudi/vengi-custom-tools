@@ -2085,6 +2085,14 @@ int SceneManager::mergeLockedToTemp() {
 	}
 
 	nodeActivate(newNodeId);
+
+	const scenegraph::SceneGraphNode &createdNode = _sceneGraph.node(newNodeId);
+	if (createdNode.isModelNode()) {
+		const voxel::Region &region = createdNode.region();
+		setReferencePosition(region.getCenter());
+		command::Command::execute("camera_target_reference");
+	}
+
 	return newNodeId;
 }
 
