@@ -20,6 +20,7 @@
 #include "voxedit-util/modifier/ModifierVolumeWrapper.h"
 #include "voxedit-util/modifier/brush/AABBBrush.h"
 #include "voxedit-util/modifier/brush/BrushType.h"
+#include "voxedit-util/modifier/brush/SculptBrush.h"
 #include "voxedit-util/modifier/SceneModifiedFlags.h"
 #include "voxel/Face.h"
 #include "voxel/RawVolume.h"
@@ -173,6 +174,13 @@ void Modifier::update(double nowSeconds, const video::Camera *camera) {
 		}
 	} else if (_brushType == BrushType::Stamp) {
 		if (_stampBrush.continuousMode()) {
+			if (_actionExecuteButton.pressed() && nowSeconds >= _nextSingleExecution) {
+				_actionExecuteButton.execute(true);
+				_nextSingleExecution = nowSeconds + 0.1;
+			}
+		}
+	} else if (Brush *b = currentBrush()) {
+		if (b->wantsContinuousExecution()) {
 			if (_actionExecuteButton.pressed() && nowSeconds >= _nextSingleExecution) {
 				_actionExecuteButton.execute(true);
 				_nextSingleExecution = nowSeconds + 0.1;
@@ -644,6 +652,12 @@ bool Modifier::isSimplePreview(const Brush *brush, const voxel::Region &region) 
 		const SelectMode mode = selectBrush->selectMode();
 		if (mode == SelectMode::All || mode == SelectMode::Surface || mode == SelectMode::Box3D ||
 			mode == SelectMode::SameColor || mode == SelectMode::FuzzyColor) {
+			return true;
+		}
+	}
+	if (brush->type() == BrushType::Sculpt) {
+		const SculptBrush *sculptBrush = (const SculptBrush *)brush;
+		if (sculptBrush->sculptMode() == SculptMode::ExtendPlane && sculptBrush->planeFitted()) {
 			return true;
 		}
 	}

@@ -97,14 +97,11 @@ bool FormatConfig::init() {
 											 N_("Voxelize mode"), N_("0 = high quality, 1 = faster and less memory"),
 											 core::CV_NOPERSIST);
 	core::registerVar(voxformatVoxelizeMode);
-	const core::VarDef voxformatVoxelizeChunked(cfg::VoxformatVoxelizeChunked, false,
-												N_("Chunked voxelization"),
-												N_("Import meshes as chunked volumes. Allows very large models that would not fit in memory as a single volume."),
-												core::CV_NOPERSIST);
+	const core::VarDef voxformatVoxelizeChunked(cfg::VoxformatVoxelizeChunked, false, N_("Chunked voxelization"),
+												N_("Enable chunked voxelization for large meshes"), core::CV_NOPERSIST);
 	core::registerVar(voxformatVoxelizeChunked);
-	const core::VarDef voxformatVoxelizeChunkSize(cfg::VoxformatVoxelizeChunkSize, 64, 16, 512,
-												  N_("Chunk size"),
-												  N_("The size of each chunk volume for chunked voxelization (default 64). Larger values create fewer nodes but use more memory per chunk."),
+	const core::VarDef voxformatVoxelizeChunkSize(cfg::VoxformatVoxelizeChunkSize, 128, 16, 512,
+												  N_("Chunk size"), N_("Chunk size for chunked voxelization"),
 												  core::CV_NOPERSIST);
 	core::registerVar(voxformatVoxelizeChunkSize);
 	const core::VarDef voxformatVoxelSize(cfg::VoxformatVoxelSize, 0, 0, 1024,
@@ -133,11 +130,6 @@ bool FormatConfig::init() {
 		cfg::VoxelCropOnLoad, false, N_("Crop on load"),
 		N_("Crop volumes to tight bounds on load to save memory"), core::CV_NOPERSIST);
 	core::registerVar(voxelCropOnLoad);
-	const core::VarDef voxelSplitOnLoad(
-		cfg::VoxelSplitOnLoad, 0, 0, 512,
-		N_("Split on load"),
-		N_("Split volumes on load to this max dimension per axis (0 = disabled)"), core::CV_NOPERSIST);
-	core::registerVar(voxelSplitOnLoad);
 	const core::VarDef voxformatVOXCreateGroups(
 		cfg::VoxformatVOXCreateGroups, true, N_("Create groups"),
 		NC_("Create groups when saving MagicaVoxel vox files", "Create groups for vox file"), core::CV_NOPERSIST);
@@ -236,10 +228,6 @@ bool FormatConfig::init() {
 	const core::VarDef voxformatMeshSimplify(cfg::VoxformatMeshSimplify, false, N_("Simplify"),
 											 N_("Simplify the mesh when voxelizing a mesh format"), core::CV_NOPERSIST);
 	core::registerVar(voxformatMeshSimplify);
-	const core::VarDef voxformatStreamProcessOBJ(cfg::VoxformatStreamProcessOBJ, false,
-												 N_("Stream process OBJ"),
-												 N_("Process nodes one at a time during OBJ export to reduce peak memory usage"));
-	core::registerVar(voxformatStreamProcessOBJ);
 	const core::VarDef voxformatGMLRegion(
 		cfg::VoxformatGMLRegion, "", N_("Region filter"),
 		N_("World coordinate region filter for GML/CityGML import. Format: 'minX minY minZ maxX maxY maxZ' "
