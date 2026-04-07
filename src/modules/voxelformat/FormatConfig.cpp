@@ -228,6 +228,9 @@ bool FormatConfig::init() {
 	const core::VarDef voxformatMeshSimplify(cfg::VoxformatMeshSimplify, false, N_("Simplify"),
 											 N_("Simplify the mesh when voxelizing a mesh format"), core::CV_NOPERSIST);
 	core::registerVar(voxformatMeshSimplify);
+	const core::VarDef voxelSplitOnLoad(cfg::VoxelSplitOnLoad, 0, N_("Split on load"),
+										N_("Split volumes larger than this size on load (0 = disabled)"));
+	core::registerVar(voxelSplitOnLoad);
 	const core::VarDef voxformatGMLRegion(
 		cfg::VoxformatGMLRegion, "", N_("Region filter"),
 		N_("World coordinate region filter for GML/CityGML import. Format: 'minX minY minZ maxX maxY maxZ' "
