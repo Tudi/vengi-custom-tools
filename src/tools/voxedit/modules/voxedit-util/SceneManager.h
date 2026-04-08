@@ -4,7 +4,6 @@
 
 #pragma once
 
-#include "Clipboard.h"
 #include "ISceneRenderer.h"
 #include "LUAApiListener.h"
 #include "command/ActionButton.h"
@@ -19,12 +18,14 @@
 #include "modifier/Modifier.h"
 #include "modifier/SceneModifiedFlags.h"
 #include "core/collection/Set.h"
+#include "scenegraph/SceneGraphNodeValueCache.h"
 #include "scenegraph/SceneGraph.h"
 #include "voxedit-util/network/Client.h"
 #include "voxedit-util/network/Server.h"
 #include "voxedit-util/network/SessionRecorder.h"
 #include "voxedit-util/network/SessionPlayer.h"
 #include "sound/SoundManager.h"
+#include "voxel/ClipboardData.h"
 #include "voxel/Voxel.h"
 #include "voxelgenerator/LSystem.h"
 #include "voxelgenerator/LUAApi.h"
@@ -102,10 +103,6 @@ protected:
 	// auto-saving once we saved a dirty state
 	bool _needAutoSave = false;
 
-	mutable voxel::Region _selectionRegionCache = voxel::Region::InvalidRegion;
-	mutable int _selectionCacheNodeId = -1;
-	BrushType _lastBrushType = BrushType::Max;
-	SelectMode _lastSelectMode = SelectMode::Max;
 	bool _traceViaMouse = true;
 
 	voxelgenerator::lsystem::LSystemConfig _lsystemConfig;
@@ -147,6 +144,8 @@ protected:
 	command::ActionButton _zoomOut;
 
 	voxelutil::PickResult _result;
+
+	mutable SceneGraphNodeValueCache<voxel::Region> _selectionRegionCache;
 
 	void autoSelectSolidVoxels(scenegraph::SceneGraphNode *node, const voxel::Region &region);
 	bool loadGlobalClipboard(voxel::ClipboardData &clipData);
@@ -297,6 +296,8 @@ protected:
 	bool nodeSetColor(scenegraph::SceneGraphNode &node, uint8_t palIdx, const color::RGBA &color);
 	bool nodeShiftAllKeyframes(scenegraph::SceneGraphNode &node, const glm::vec3 &shift);
 	void nodeKeyFramesChanged(scenegraph::SceneGraphNode &node);
+	voxel::Region selectionCalculateRegion(const scenegraph::SceneGraphNode &node) const;
+	voxel::ClipboardData nodeClipboardCopy(scenegraph::SceneGraphNode &node);
 
 public:
 	SceneManager(const core::TimeProviderPtr &timeProvider, const io::FilesystemPtr &filesystem,
@@ -395,12 +396,17 @@ public:
 	 */
 	bool splitVolumes();
 
-	bool copy(int nodeId);
+	bool nodeCopy(int nodeId);
+	bool nodePaste(int nodeId, const glm::ivec3& pos);
+	bool nodeGlobalCopy(int nodeId);
+	bool nodeGlobalPaste(int nodeId, const glm::ivec3 &pos);
+
 	bool paste(const glm::ivec3 &pos);
+	bool globalPaste(const glm::ivec3 &pos);
 	bool globalCopy();
 	bool globalCopyVisible();
-	bool globalPaste(const glm::ivec3 &pos);
 	bool globalPasteNode(const glm::ivec3 &pos);
+
 	bool splatMerge(int sourceNodeId);
 	bool mergeActiveToBackground();
 	int mergeVisibleToTemp();
@@ -411,10 +417,10 @@ public:
 	void selectionSelectAll(int nodeId);
 	void selectionSetBounds(int nodeId, const voxel::Region &region);
 	void selectionSetEllipse(int nodeId);
-	void selectionSetSlope(int nodeId);
 	void selectionFinalizeLasso(int nodeId);
 	void selectionCancelLasso(int nodeId);
 	void selectionLassoUndoVertex(int nodeId);
+	bool hasSelection(int nodeId) const;
 	bool isSelected(int nodeId, const glm::ivec3 &pos) const;
 	voxel::Region selectionCalculateRegion(int nodeId) const;
 
@@ -528,6 +534,7 @@ public:
 	scenegraph::SceneGraphNode *sceneGraphNode(int nodeId);
 	const scenegraph::SceneGraphNode *sceneGraphNode(int nodeId) const;
 	scenegraph::SceneGraphNode *sceneGraphModelNode(int nodeId);
+	const scenegraph::SceneGraphNode *sceneGraphModelNode(int nodeId) const;
 	scenegraph::SceneGraphNode *sceneGraphNodeByUUID(const core::UUID &uuid);
 
 	const voxel::ClipboardData &clipboardData() const;

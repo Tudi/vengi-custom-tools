@@ -10,16 +10,18 @@
 #include "core/collection/DynamicArray.h"
 #include "core/collection/DynamicStringMap.h"
 #include "core/collection/Set.h"
+#include "engine-config.h"
+#include "io/BufferedReadWriteStream.h"
 #include "io/FormatDescription.h"
 #include "io/MemoryReadStream.h"
-#include "io/BufferedReadWriteStream.h"
 #include "palette/FormatConfig.h"
 #include "palette/PaletteFormatDescription.h"
+#include "voxedit-util/modifier/brush/LUABrush.h"
+#include "voxedit-util/modifier/brush/LUASelectionMode.h"
 #include "voxelformat/FormatConfig.h"
 #include "voxelformat/VolumeFormat.h"
 #include "voxelgenerator/LUAApi.h"
 #include "json/JSON.h"
-#include "engine-config.h"
 #include <ctype.h>
 
 FormatPrinter::FormatPrinter(const io::FilesystemPtr &filesystem, const core::TimeProviderPtr &timeProvider)
@@ -849,6 +851,10 @@ static core::String getDocPageName(const core::String &name) {
 		return "shape";
 	} else if (name == "g_sculpt") {
 		return "sculpt";
+	} else if (name == "g_brushcontext") {
+		return "brushcontext";
+	} else if (name == "g_selectioncontext") {
+		return "selectioncontext";
 	} else if (name == "g_import") {
 		return "import";
 	} else if (name == "g_lsystem") {
@@ -880,6 +886,8 @@ static core::String getDocPageName(const core::String &name) {
 		return "keyframe";
 	} else if (name == "volume") {
 		return "volume";
+	} else if (name == "g_sparsevolume" || name == "sparsevolume") {
+		return "sparsevolume";
 	} else if (name == "stream") {
 		return "stream";
 	} else if (name == "image") {
@@ -927,12 +935,18 @@ static core::String getDocTitle(const core::String &pageName) {
 		return "Quaternion";
 	} else if (pageName == "volume") {
 		return "Volume";
+	} else if (pageName == "sparsevolume") {
+		return "SparseVolume";
 	} else if (pageName == "keyframe") {
 		return "Keyframe";
 	} else if (pageName == "stream") {
 		return "Stream";
 	} else if (pageName == "image") {
 		return "Image";
+	} else if (pageName == "brushcontext") {
+		return "BrushContext";
+	} else if (pageName == "selectioncontext") {
+		return "SelectionContext";
 	}
 	return pageName;
 }
@@ -952,6 +966,10 @@ static core::String getGlobalName(const core::String &pageName) {
 		return "g_shape";
 	} else if (pageName == "sculpt") {
 		return "g_sculpt";
+	} else if (pageName == "brushcontext") {
+		return "g_brushcontext";
+	} else if (pageName == "selectioncontext") {
+		return "g_selectioncontext";
 	} else if (pageName == "font") {
 		return "g_font";
 	} else if (pageName == "import") {
@@ -976,6 +994,8 @@ static core::String getGlobalName(const core::String &pageName) {
 		return "g_vec3, g_ivec3, ...";
 	} else if (pageName == "quat") {
 		return "g_quat";
+	} else if (pageName == "sparsevolume") {
+		return "g_sparsevolume";
 	}
 	return "";
 }
@@ -996,6 +1016,20 @@ void FormatPrinter::printLuaApiMarkdown() {
 	}
 	scriptApi.shutdown();
 
+	// Get JSON from LUABrush
+	io::BufferedReadWriteStream brushStream;
+	voxedit::LUABrush brush(_filesystem);
+	if (!brush.apiJsonToStream(brushStream)) {
+		Log::warn("Failed to generate LUABrush API JSON");
+	}
+
+	// Get JSON from LUASelectionMode
+	io::BufferedReadWriteStream selectionStream;
+	voxedit::LUASelectionMode selectionMode(_filesystem);
+	if (!selectionMode.apiJsonToStream(selectionStream)) {
+		Log::warn("Failed to generate LUASelectionMode API JSON");
+	}
+
 	stream.seek(0);
 	core::String jsonStr;
 	stream.readString((int)stream.size(), jsonStr);
@@ -1006,12 +1040,42 @@ void FormatPrinter::printLuaApiMarkdown() {
 		return;
 	}
 
+	// Merge brush API JSON into the main API JSON
+	if (brushStream.size() > 0) {
+		brushStream.seek(0);
+		core::String brushJsonStr;
+		brushStream.readString((int)brushStream.size(), brushJsonStr);
+		json::Json brushJson = json::Json::parse(brushJsonStr.c_str());
+		if (brushJson.isValid()) {
+			for (auto it = brushJson.begin(); it != brushJson.end(); ++it) {
+				apiJson.set(it.key().c_str(), *it);
+			}
+		} else {
+			Log::warn("Failed to parse LUABrush API JSON");
+		}
+	}
+
+	// Merge selection mode API JSON into the main API JSON
+	if (selectionStream.size() > 0) {
+		selectionStream.seek(0);
+		core::String selectionJsonStr;
+		selectionStream.readString((int)selectionStream.size(), selectionJsonStr);
+		json::Json selectionJson = json::Json::parse(selectionJsonStr.c_str());
+		if (selectionJson.isValid()) {
+			for (auto it = selectionJson.begin(); it != selectionJson.end(); ++it) {
+				apiJson.set(it.key().c_str(), *it);
+			}
+		} else {
+			Log::warn("Failed to parse LUASelectionMode API JSON");
+		}
+	}
+
 	// Group by documentation page
 	core::DynamicStringMap<json::Json> pageContent;
 
 	for (auto it = apiJson.begin(); it != apiJson.end(); ++it) {
-		const core::String name = it.key().c_str();
-		const core::String pageName = getDocPageName(name);
+		const core::String &name = it.key();
+		const core::String &pageName = getDocPageName(name);
 
 		auto found = pageContent.find(pageName);
 		if (found == pageContent.end()) {
@@ -1019,7 +1083,7 @@ void FormatPrinter::printLuaApiMarkdown() {
 		}
 
 		json::Json entry = json::Json::object();
-		entry.set("name", name.c_str());
+		entry.set("name", name);
 		entry.set("type", (*it).strVal("type", ""));
 		entry.set("methods", (*it).get("methods"));
 		auto iter = pageContent.find(pageName);
@@ -1036,7 +1100,7 @@ void FormatPrinter::printLuaApiMarkdown() {
 		Log::printf("--- BEGIN FILE: lua/%s.md ---\n", pageName.c_str());
 		Log::printf("# %s\n\n", getDocTitle(pageName).c_str());
 
-		const core::String globalName = getGlobalName(pageName);
+		const core::String &globalName = getGlobalName(pageName);
 		if (!globalName.empty()) {
 			Log::printf("Global: `%s`\n\n", globalName.c_str());
 		}
@@ -1047,7 +1111,7 @@ void FormatPrinter::printLuaApiMarkdown() {
 		bool isMetatable = false;
 
 		for (const auto &entry : entries) {
-			const core::String entryType = entry.strVal("type", "").c_str();
+			const core::String &entryType = entry.strVal("type", "");
 			const json::Json methods = entry.get("methods");
 
 			if (entryType == "metatable") {
@@ -1055,15 +1119,15 @@ void FormatPrinter::printLuaApiMarkdown() {
 			}
 
 			for (const auto &method : methods) {
-				const core::String methodName = method.strVal("name", "").c_str();
+				const core::String &methodName = method.strVal("name", "");
 				if (methodName.empty() || methodName[0] == '_') {
 					continue; // Skip metamethods
 				}
 
 				// Store for documentation (avoid duplicates for vector types)
-				if (allMethods.find(methodName.c_str()) == allMethods.end()) {
-					allMethods.put(methodName.c_str(), method);
-					sortedMethodNames.push_back(methodName.c_str());
+				if (allMethods.find(methodName) == allMethods.end()) {
+					allMethods.put(methodName, method);
+					sortedMethodNames.push_back(methodName);
 				}
 			}
 		}
@@ -1088,7 +1152,7 @@ void FormatPrinter::printLuaApiMarkdown() {
 				continue;
 			}
 			const json::Json &method = mit->value;
-			const core::String summary = method.strVal("summary", "").c_str();
+			const core::String &summary = method.strVal("summary", "");
 
 			// Build parameter signature
 			core::String params;
@@ -1098,7 +1162,7 @@ void FormatPrinter::printLuaApiMarkdown() {
 					if (!first) {
 						params += ", ";
 					}
-					params += param.strVal("name", "").c_str();
+					params += param.strVal("name", "");
 					first = false;
 				}
 			}
@@ -1115,7 +1179,7 @@ void FormatPrinter::printLuaApiMarkdown() {
 			}
 			const json::Json &method = mit->value;
 
-			const core::String summary = method.strVal("summary", "").c_str();
+			const core::String &summary = method.strVal("summary", "");
 
 			Log::printf("### %s\n\n", methodName.c_str());
 
@@ -1128,9 +1192,9 @@ void FormatPrinter::printLuaApiMarkdown() {
 				Log::printf("| Name | Type | Description |\n");
 				Log::printf("| ---- | ---- | ----------- |\n");
 				for (const auto &param : method.get("parameters")) {
-					const core::String pname = param.strVal("name", "").c_str();
-					const core::String ptype = param.strVal("type", "").c_str();
-					const core::String pdesc = param.strVal("description", "").c_str();
+					const core::String &pname = param.strVal("name", "");
+					const core::String &ptype = param.strVal("type", "");
+					const core::String &pdesc = param.strVal("description", "");
 					Log::printf("| `%s` | `%s` | %s |\n", pname.c_str(), ptype.c_str(), pdesc.c_str());
 				}
 				Log::printf("\n");
@@ -1141,8 +1205,8 @@ void FormatPrinter::printLuaApiMarkdown() {
 				Log::printf("| Type | Description |\n");
 				Log::printf("| ---- | ----------- |\n");
 				for (const auto &ret : method.get("returns")) {
-					const core::String rtype = ret.strVal("type", "").c_str();
-					const core::String rdesc = ret.strVal("description", "").c_str();
+					const core::String &rtype = ret.strVal("type", "");
+					const core::String &rdesc = ret.strVal("description", "");
 					Log::printf("| `%s` | %s |\n", rtype.c_str(), rdesc.c_str());
 				}
 				Log::printf("\n");

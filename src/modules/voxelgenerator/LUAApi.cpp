@@ -33,6 +33,7 @@
 #include "voxel/RawVolumeMoveWrapper.h"
 #include "voxel/RawVolumeWrapper.h"
 #include "voxel/Region.h"
+#include "voxel/SparseVolume.h"
 #include "voxel/Voxel.h"
 #include "voxelfont/VoxelFont.h"
 #include "voxelformat/Format.h"
@@ -40,6 +41,7 @@
 #include "voxelgenerator/Genland.h"
 #include "voxelgenerator/LSystem.h"
 #include "voxelgenerator/ShapeGenerator.h"
+#include "voxelutil/AStarPathfinder.h"
 #include "voxelutil/FillHollow.h"
 #include "voxelutil/Hollow.h"
 #include "voxelutil/ImageUtils.h"
@@ -53,6 +55,8 @@
 #include "voxelutil/VolumeRotator.h"
 #include "voxelutil/VolumeSplitter.h"
 #include "voxelutil/VolumeSculpt.h"
+#include "voxelutil/VolumeSelect.h"
+#include "voxelutil/VolumeVisitor.h"
 #include "voxelutil/VoxelUtil.h"
 
 #define GENERATOR_LUA_SANTITY 1
@@ -129,7 +133,7 @@ public:
 	}
 };
 
-static const char *luaVoxel_globalscenegraph() {
+const char *luaVoxel_globalscenegraph() {
 	return "__global_scenegraph";
 }
 
@@ -137,11 +141,11 @@ static const char *luaVoxel_globalnodeid() {
 	return "__global_nodeid";
 }
 
-static const char *luaVoxel_globalnoise() {
+const char *luaVoxel_globalnoise() {
 	return "__global_noise";
 }
 
-static const char *luaVoxel_globaldirtyregions() {
+const char *luaVoxel_globaldirtyregions() {
 	return "__global_dirtyregions";
 }
 
@@ -167,6 +171,14 @@ static const char *luaVoxel_metakeyframe() {
 
 static const char *luaVoxel_metavolumewrapper() {
 	return "__meta_volumewrapper";
+}
+
+static const char *luaVoxel_metasparsevolume() {
+	return "__meta_sparsevolume";
+}
+
+static const char *luaVoxel_metasparsevolumeglobal() {
+	return "__meta_sparsevolume_global";
 }
 
 static const char *luaVoxel_metapaletteglobal() {
@@ -229,9 +241,9 @@ static inline const char *luaVoxel_metaregion() {
 	return "__meta_region";
 }
 
-static void luaVoxel_newGlobalData(lua_State *L, const core::String& prefix, void *userData) {
+void luaVoxel_setGlobalData(lua_State *L, const char *name, void *userData) {
 	lua_pushlightuserdata(L, userData);
-	lua_setglobal(L, prefix.c_str());
+	lua_setglobal(L, name);
 }
 
 template<class T>
@@ -276,7 +288,7 @@ static voxel::Region* luaVoxel_toregion(lua_State* s, int n) {
 	return *(voxel::Region**)clua_getudata<voxel::Region*>(s, n, luaVoxel_metaregion());
 }
 
-static int luaVoxel_pushregion(lua_State* s, const voxel::Region& region) {
+int luaVoxel_pushregion(lua_State* s, const voxel::Region& region) {
 	return clua_pushudata(s, new voxel::Region(region), luaVoxel_metaregion_gc());
 }
 
@@ -284,7 +296,7 @@ static LuaSceneGraphNode* luaVoxel_toscenegraphnode(lua_State* s, int n) {
 	return *(LuaSceneGraphNode**)clua_getudata<LuaSceneGraphNode*>(s, n, luaVoxel_metascenegraphnode());
 }
 
-static int luaVoxel_pushscenegraphnode(lua_State* s, scenegraph::SceneGraphNode& node) {
+int luaVoxel_pushscenegraphnode(lua_State* s, scenegraph::SceneGraphNode& node) {
 	LuaSceneGraphNode *wrapper = new LuaSceneGraphNode(&node);
 	return clua_pushudata(s, wrapper, luaVoxel_metascenegraphnode());
 }
@@ -398,6 +410,16 @@ static int luaVoxel_volumewrapper_voxel_jsonhelp(lua_State* s) {
 		]})";
 
 	lua_pushstring(s, json);
+	return 1;
+}
+
+static int luaVoxel_volumewrapper_flags(lua_State* s) {
+	const LuaRawVolumeWrapper* volume = luaVoxel_tovolumewrapper(s, 1);
+	const int x = (int)luaL_checkinteger(s, 2);
+	const int y = (int)luaL_checkinteger(s, 3);
+	const int z = (int)luaL_checkinteger(s, 4);
+	const voxel::Voxel& voxel = volume->voxel(x, y, z);
+	lua_pushinteger(s, voxel.getFlags());
 	return 1;
 }
 
@@ -679,6 +701,88 @@ static int luaVoxel_volumewrapper_normal(lua_State* s) {
 	return 1;
 }
 
+static int luaVoxel_volumewrapper_isselected(lua_State* s) {
+	const LuaRawVolumeWrapper* volume = luaVoxel_tovolumewrapper(s, 1);
+	const int x = (int)luaL_checkinteger(s, 2);
+	const int y = (int)luaL_checkinteger(s, 3);
+	const int z = (int)luaL_checkinteger(s, 4);
+	const voxel::Voxel& voxel = volume->voxel(x, y, z);
+	lua_pushboolean(s, (voxel.getFlags() & voxel::FlagOutline) != 0 ? 1 : 0);
+	return 1;
+}
+
+static int luaVoxel_volumewrapper_setselected(lua_State* s) {
+	LuaRawVolumeWrapper* volume = luaVoxel_tovolumewrapper(s, 1);
+	const int x = (int)luaL_checkinteger(s, 2);
+	const int y = (int)luaL_checkinteger(s, 3);
+	const int z = (int)luaL_checkinteger(s, 4);
+	const bool selected = clua_optboolean(s, 5, true);
+	voxel::Voxel voxel = volume->voxel(x, y, z);
+	if (voxel::isAir(voxel.getMaterial())) {
+		lua_pushboolean(s, 0);
+		return 1;
+	}
+	if (selected) {
+		voxel.setFlags(voxel.getFlags() | voxel::FlagOutline);
+	} else {
+		voxel.setFlags(voxel.getFlags() & ~voxel::FlagOutline);
+	}
+	const bool insideRegion = volume->setVoxel(x, y, z, voxel);
+	lua_pushboolean(s, insideRegion ? 1 : 0);
+	return 1;
+}
+
+static int luaVoxel_volumewrapper_visitslopesurface(lua_State *s) {
+	LuaRawVolumeWrapper *volume = luaVoxel_tovolumewrapper(s, 1);
+	const int x = (int)luaL_checkinteger(s, 2);
+	const int y = (int)luaL_checkinteger(s, 3);
+	const int z = (int)luaL_checkinteger(s, 4);
+	const voxel::FaceNames face = luaVoxel_getFace(s, 5);
+	const int maxDeviation = (int)luaL_checkinteger(s, 6);
+	const int sampleDistance = (int)luaL_checkinteger(s, 7);
+	luaL_checktype(s, 8, LUA_TFUNCTION);
+	const glm::ivec3 position(x, y, z);
+	const voxel::RawVolumeWrapper &wrapper = static_cast<const voxel::RawVolumeWrapper &>(*volume);
+	int cnt = voxelutil::visitSlopeSurface(wrapper, position, face, maxDeviation, sampleDistance,
+		[s](int vx, int vy, int vz, const voxel::Voxel &) {
+			lua_pushvalue(s, 8);
+			lua_pushinteger(s, vx);
+			lua_pushinteger(s, vy);
+			lua_pushinteger(s, vz);
+			lua_pcall(s, 3, 0, 0);
+		});
+	lua_pushinteger(s, cnt);
+	return 1;
+}
+
+static int luaVoxel_volumewrapper_lassocontains(lua_State *s) {
+	luaVoxel_tovolumewrapper(s, 1);
+	luaL_checktype(s, 2, LUA_TTABLE);
+	const int pu = (int)luaL_checkinteger(s, 3);
+	const int pv = (int)luaL_checkinteger(s, 4);
+	const int uAxis = (int)luaL_checkinteger(s, 5);
+	const int vAxis = (int)luaL_checkinteger(s, 6);
+	core::DynamicArray<glm::ivec3> path;
+	const int len = (int)lua_rawlen(s, 2);
+	path.reserve(len);
+	for (int i = 1; i <= len; ++i) {
+		lua_rawgeti(s, 2, i);
+		lua_getfield(s, -1, "x");
+		const int px = (int)lua_tointeger(s, -1);
+		lua_pop(s, 1);
+		lua_getfield(s, -1, "y");
+		const int py = (int)lua_tointeger(s, -1);
+		lua_pop(s, 1);
+		lua_getfield(s, -1, "z");
+		const int pz = (int)lua_tointeger(s, -1);
+		lua_pop(s, 1);
+		lua_pop(s, 1);
+		path.push_back(glm::ivec3(px, py, pz));
+	}
+	lua_pushboolean(s, voxelutil::lassoContains(path, pu, pv, uAxis, vAxis) ? 1 : 0);
+	return 1;
+}
+
 static int luaVoxel_volumewrapper_fill(lua_State *s) {
 	LuaRawVolumeWrapper *volume = luaVoxel_tovolumewrapper(s, 1);
 	const voxel::Voxel voxel = luaVoxel_getVoxel(s, 2);
@@ -724,6 +828,106 @@ static int luaVoxel_volumewrapper_istouching(lua_State *s) {
 		connectivity = voxel::Connectivity::TwentySixConnected;
 	}
 	lua_pushboolean(s, voxelutil::isTouching(*volume->volume(), glm::ivec3(x, y, z), connectivity) ? 1 : 0);
+	return 1;
+}
+
+static int luaVoxel_volumewrapper_visitsurface(lua_State *s) {
+	LuaRawVolumeWrapper *volume = luaVoxel_tovolumewrapper(s, 1);
+	luaL_checktype(s, 2, LUA_TFUNCTION);
+	const voxel::RawVolumeWrapper &wrapper = (const voxel::RawVolumeWrapper &)*volume;
+	int cnt = voxelutil::visitSurfaceVolume(wrapper,
+		[s](int vx, int vy, int vz, const voxel::Voxel &) {
+			lua_pushvalue(s, 2);
+			lua_pushinteger(s, vx);
+			lua_pushinteger(s, vy);
+			lua_pushinteger(s, vz);
+			lua_pcall(s, 3, 0, 0);
+		});
+	lua_pushinteger(s, cnt);
+	return 1;
+}
+
+static int luaVoxel_volumewrapper_issurface(lua_State *s) {
+	LuaRawVolumeWrapper *volume = luaVoxel_tovolumewrapper(s, 1);
+	const int x = (int)luaL_checkinteger(s, 2);
+	const int y = (int)luaL_checkinteger(s, 3);
+	const int z = (int)luaL_checkinteger(s, 4);
+	const voxel::RawVolumeWrapper &wrapper = (const voxel::RawVolumeWrapper &)*volume;
+	lua_pushboolean(s, voxel::visibleFaces(wrapper, x, y, z) != voxel::FaceBits::None ? 1 : 0);
+	return 1;
+}
+
+static int luaVoxel_volumewrapper_isair(lua_State *s) {
+	LuaRawVolumeWrapper *volume = luaVoxel_tovolumewrapper(s, 1);
+	const int x = (int)luaL_checkinteger(s, 2);
+	const int y = (int)luaL_checkinteger(s, 3);
+	const int z = (int)luaL_checkinteger(s, 4);
+	lua_pushboolean(s, voxel::isAir(volume->voxel(x, y, z).getMaterial()) ? 1 : 0);
+	return 1;
+}
+
+static int luaVoxel_volumewrapper_containspoint(lua_State *s) {
+	LuaRawVolumeWrapper *volume = luaVoxel_tovolumewrapper(s, 1);
+	const int x = (int)luaL_checkinteger(s, 2);
+	const int y = (int)luaL_checkinteger(s, 3);
+	const int z = (int)luaL_checkinteger(s, 4);
+	lua_pushboolean(s, volume->region().containsPoint(x, y, z) ? 1 : 0);
+	return 1;
+}
+
+static int luaVoxel_volumewrapper_pathfinder(lua_State *s) {
+	LuaRawVolumeWrapper *volume = luaVoxel_tovolumewrapper(s, 1);
+	const int startX = (int)luaL_checkinteger(s, 2);
+	const int startY = (int)luaL_checkinteger(s, 3);
+	const int startZ = (int)luaL_checkinteger(s, 4);
+	const int endX = (int)luaL_checkinteger(s, 5);
+	const int endY = (int)luaL_checkinteger(s, 6);
+	const int endZ = (int)luaL_checkinteger(s, 7);
+	const char *connectivityStr = luaL_optstring(s, 8, "18");
+	voxel::Connectivity connectivity = voxel::Connectivity::EighteenConnected;
+	if (SDL_strcmp(connectivityStr, "6") == 0) {
+		connectivity = voxel::Connectivity::SixConnected;
+	} else if (SDL_strcmp(connectivityStr, "26") == 0) {
+		connectivity = voxel::Connectivity::TwentySixConnected;
+	}
+	const float hBias = (float)luaL_optnumber(s, 9, 4.0);
+	const int maxNodes = (int)luaL_optinteger(s, 10, 10000);
+
+	const glm::ivec3 start(startX, startY, startZ);
+	const glm::ivec3 end(endX, endY, endZ);
+
+	core::List<glm::ivec3> listResult(4096);
+	const voxel::RawVolume *vol = volume->volume();
+	auto func = [connectivity](const voxel::RawVolume *v, const glm::ivec3 &pos) {
+		if (!v->region().containsPoint(pos)) {
+			return false;
+		}
+		if (voxel::isBlocked(v->voxel(pos).getMaterial())) {
+			return false;
+		}
+		return voxelutil::isTouching(*v, pos, connectivity);
+	};
+	voxelutil::AStarPathfinderParams<voxel::RawVolume> params(vol, start, end, &listResult,
+															  func, hBias, (uint32_t)maxNodes, connectivity);
+	voxelutil::AStarPathfinder pathfinder(params);
+	if (!pathfinder.execute()) {
+		lua_pushnil(s);
+		return 1;
+	}
+
+	int idx = 1;
+	lua_createtable(s, (int)listResult.size(), 0);
+	for (const glm::ivec3 &p : listResult) {
+		lua_pushinteger(s, idx++);
+		lua_createtable(s, 0, 3);
+		lua_pushinteger(s, p.x);
+		lua_setfield(s, -2, "x");
+		lua_pushinteger(s, p.y);
+		lua_setfield(s, -2, "y");
+		lua_pushinteger(s, p.z);
+		lua_setfield(s, -2, "z");
+		lua_settable(s, -3);
+	}
 	return 1;
 }
 
@@ -921,6 +1125,236 @@ static int luaVoxel_volumewrapper_gc(lua_State *s) {
 	}
 	delete volume;
 	return 0;
+}
+
+static voxel::SparseVolume *luaVoxel_tosparsevolume(lua_State *s, int n) {
+	return *(voxel::SparseVolume **)clua_getudata<voxel::SparseVolume *>(s, n, luaVoxel_metasparsevolume());
+}
+
+static int luaVoxel_pushsparsevolume(lua_State *s, voxel::SparseVolume *vol) {
+	return clua_pushudata(s, vol, luaVoxel_metasparsevolume());
+}
+
+static int luaVoxel_sparsevolume_new(lua_State *s) {
+	voxel::SparseVolume *vol;
+	if (lua_gettop(s) >= 6) {
+		const int minsx = (int)luaL_checkinteger(s, 1);
+		const int minsy = (int)luaL_checkinteger(s, 2);
+		const int minsz = (int)luaL_checkinteger(s, 3);
+		const int maxsx = (int)luaL_checkinteger(s, 4);
+		const int maxsy = (int)luaL_checkinteger(s, 5);
+		const int maxsz = (int)luaL_checkinteger(s, 6);
+		vol = new voxel::SparseVolume(voxel::Region(minsx, minsy, minsz, maxsx, maxsy, maxsz));
+	} else {
+		vol = new voxel::SparseVolume();
+	}
+	return luaVoxel_pushsparsevolume(s, vol);
+}
+
+static int luaVoxel_sparsevolume_new_jsonhelp(lua_State *s) {
+	const char *json = R"({
+		"name": "new",
+		"summary": "Create a new sparse volume. Optionally specify a limiting region.",
+		"parameters": [
+			{"name": "minsx", "type": "integer", "description": "The min x coordinate (optional)."},
+			{"name": "minsy", "type": "integer", "description": "The min y coordinate (optional)."},
+			{"name": "minsz", "type": "integer", "description": "The min z coordinate (optional)."},
+			{"name": "maxsx", "type": "integer", "description": "The max x coordinate (optional)."},
+			{"name": "maxsy", "type": "integer", "description": "The max y coordinate (optional)."},
+			{"name": "maxsz", "type": "integer", "description": "The max z coordinate (optional)."}
+		],
+		"returns": [
+			{"type": "sparsevolume", "description": "A new sparse volume instance."}
+		]})";
+	lua_pushstring(s, json);
+	return 1;
+}
+
+static int luaVoxel_sparsevolume_gc(lua_State *s) {
+	voxel::SparseVolume *vol = luaVoxel_tosparsevolume(s, 1);
+	delete vol;
+	return 0;
+}
+
+static int luaVoxel_sparsevolume_voxel(lua_State *s) {
+	const voxel::SparseVolume *vol = luaVoxel_tosparsevolume(s, 1);
+	const int x = (int)luaL_checkinteger(s, 2);
+	const int y = (int)luaL_checkinteger(s, 3);
+	const int z = (int)luaL_checkinteger(s, 4);
+	const voxel::Voxel &v = vol->voxel(x, y, z);
+	if (voxel::isAir(v.getMaterial())) {
+		lua_pushinteger(s, -1);
+	} else {
+		lua_pushinteger(s, v.getColor());
+	}
+	return 1;
+}
+
+static int luaVoxel_sparsevolume_voxel_jsonhelp(lua_State *s) {
+	const char *json = R"({
+		"name": "voxel",
+		"summary": "Get the voxel color index at the specified coordinates.",
+		"parameters": [
+			{"name": "x", "type": "integer", "description": "The x coordinate."},
+			{"name": "y", "type": "integer", "description": "The y coordinate."},
+			{"name": "z", "type": "integer", "description": "The z coordinate."}
+		],
+		"returns": [
+			{"type": "integer", "description": "The color index of the voxel, or -1 if air."}
+		]})";
+	lua_pushstring(s, json);
+	return 1;
+}
+
+static int luaVoxel_sparsevolume_setvoxel(lua_State *s) {
+	voxel::SparseVolume *vol = luaVoxel_tosparsevolume(s, 1);
+	const int x = (int)luaL_checkinteger(s, 2);
+	const int y = (int)luaL_checkinteger(s, 3);
+	const int z = (int)luaL_checkinteger(s, 4);
+	const int color = (int)luaL_optinteger(s, 5, 1);
+	voxel::Voxel v;
+	if (color == -1) {
+		v = voxel::createVoxel(voxel::VoxelType::Air, 0);
+	} else {
+		v = voxel::createVoxel(voxel::VoxelType::Generic, color);
+	}
+	const bool result = vol->setVoxel(x, y, z, v);
+	lua_pushboolean(s, result ? 1 : 0);
+	return 1;
+}
+
+static int luaVoxel_sparsevolume_setvoxel_jsonhelp(lua_State *s) {
+	const char *json = R"({
+		"name": "setVoxel",
+		"summary": "Set the voxel at the specified coordinates.",
+		"parameters": [
+			{"name": "x", "type": "integer", "description": "The x coordinate."},
+			{"name": "y", "type": "integer", "description": "The y coordinate."},
+			{"name": "z", "type": "integer", "description": "The z coordinate."},
+			{"name": "color", "type": "integer", "description": "The color index (optional, default 1). Use -1 to set air."}
+		],
+		"returns": [
+			{"type": "boolean", "description": "True if the voxel was set."}
+		]})";
+	lua_pushstring(s, json);
+	return 1;
+}
+
+static int luaVoxel_sparsevolume_empty(lua_State *s) {
+	const voxel::SparseVolume *vol = luaVoxel_tosparsevolume(s, 1);
+	lua_pushboolean(s, vol->empty() ? 1 : 0);
+	return 1;
+}
+
+static int luaVoxel_sparsevolume_empty_jsonhelp(lua_State *s) {
+	const char *json = R"({
+		"name": "empty",
+		"summary": "Check if the sparse volume has no voxels.",
+		"parameters": [],
+		"returns": [
+			{"type": "boolean", "description": "True if the volume is empty."}
+		]})";
+	lua_pushstring(s, json);
+	return 1;
+}
+
+static int luaVoxel_sparsevolume_size(lua_State *s) {
+	const voxel::SparseVolume *vol = luaVoxel_tosparsevolume(s, 1);
+	lua_pushinteger(s, (lua_Integer)vol->size());
+	return 1;
+}
+
+static int luaVoxel_sparsevolume_size_jsonhelp(lua_State *s) {
+	const char *json = R"({
+		"name": "size",
+		"summary": "Get the number of stored voxels.",
+		"parameters": [],
+		"returns": [
+			{"type": "integer", "description": "The number of voxels stored."}
+		]})";
+	lua_pushstring(s, json);
+	return 1;
+}
+
+static int luaVoxel_sparsevolume_clear(lua_State *s) {
+	voxel::SparseVolume *vol = luaVoxel_tosparsevolume(s, 1);
+	vol->clear();
+	return 0;
+}
+
+static int luaVoxel_sparsevolume_clear_jsonhelp(lua_State *s) {
+	const char *json = R"({
+		"name": "clear",
+		"summary": "Remove all voxels from the sparse volume.",
+		"parameters": [],
+		"returns": []})";
+	lua_pushstring(s, json);
+	return 1;
+}
+
+static int luaVoxel_sparsevolume_region(lua_State *s) {
+	const voxel::SparseVolume *vol = luaVoxel_tosparsevolume(s, 1);
+	const voxel::Region &region = vol->region();
+	if (region.isValid()) {
+		return luaVoxel_pushregion(s, region);
+	}
+	return luaVoxel_pushregion(s, vol->calculateRegion());
+}
+
+static int luaVoxel_sparsevolume_region_jsonhelp(lua_State *s) {
+	const char *json = R"({
+		"name": "region",
+		"summary": "Get the region of the sparse volume. If no limiting region was set, calculates bounds from stored voxels.",
+		"parameters": [],
+		"returns": [
+			{"type": "region", "description": "The region of the volume."}
+		]})";
+	lua_pushstring(s, json);
+	return 1;
+}
+
+static int luaVoxel_sparsevolume_copytovolume(lua_State *s) {
+	voxel::SparseVolume *vol = luaVoxel_tosparsevolume(s, 1);
+	LuaRawVolumeWrapper *wrapper = luaVoxel_tovolumewrapper(s, 2);
+	vol->copyTo(*wrapper);
+	return 0;
+}
+
+static int luaVoxel_sparsevolume_copytovolume_jsonhelp(lua_State *s) {
+	const char *json = R"({
+		"name": "copyToVolume",
+		"summary": "Copy all voxels from the sparse volume into a volume.",
+		"parameters": [
+			{"name": "volume", "type": "volume", "description": "The target volume to copy into."}
+		],
+		"returns": []})";
+	lua_pushstring(s, json);
+	return 1;
+}
+
+static int luaVoxel_sparsevolume_copyfromvolume(lua_State *s) {
+	voxel::SparseVolume *vol = luaVoxel_tosparsevolume(s, 1);
+	LuaRawVolumeWrapper *wrapper = luaVoxel_tovolumewrapper(s, 2);
+	vol->copyFrom(*wrapper);
+	return 0;
+}
+
+static int luaVoxel_sparsevolume_copyfromvolume_jsonhelp(lua_State *s) {
+	const char *json = R"({
+		"name": "copyFromVolume",
+		"summary": "Copy all solid voxels from a volume into the sparse volume.",
+		"parameters": [
+			{"name": "volume", "type": "volume", "description": "The source volume to copy from."}
+		],
+		"returns": []})";
+	lua_pushstring(s, json);
+	return 1;
+}
+
+static int luaVoxel_sparsevolume_tostring(lua_State *s) {
+	const voxel::SparseVolume *vol = luaVoxel_tosparsevolume(s, 1);
+	lua_pushfstring(s, "sparsevolume[size: %d]", (int)vol->size());
+	return 1;
 }
 
 static int luaVoxel_shape_cylinder(lua_State* s) {
@@ -2975,6 +3409,12 @@ static int luaVoxel_scenegraphnode_region(lua_State* s) {
 	return luaVoxel_pushregion(s, region);
 }
 
+static int luaVoxel_scenegraphnode_clearselection(lua_State* s) {
+	LuaSceneGraphNode* node = luaVoxel_toscenegraphnode(s, 1);
+	node->node->clearSelection();
+	return 0;
+}
+
 static int luaVoxel_scenegraphnode_hide(lua_State* s) {
 	LuaSceneGraphNode* node = luaVoxel_toscenegraphnode(s, 1);
 	node->node->setVisible(false);
@@ -3218,6 +3658,93 @@ static int luaVoxel_volumewrapper_normal_jsonhelp(lua_State* s) {
 	return 1;
 }
 
+static int luaVoxel_volumewrapper_flags_jsonhelp(lua_State* s) {
+	const char *json = R"({
+		"name": "flags",
+		"summary": "Get the flags of the voxel at the specified coordinates.",
+		"parameters": [
+			{"name": "x", "type": "integer", "description": "The x coordinate."},
+			{"name": "y", "type": "integer", "description": "The y coordinate."},
+			{"name": "z", "type": "integer", "description": "The z coordinate."}
+		],
+		"returns": [
+			{"type": "integer", "description": "The flags of the voxel at the specified coordinates." }
+		]})";
+	lua_pushstring(s, json);
+	return 1;
+}
+
+static int luaVoxel_volumewrapper_isselected_jsonhelp(lua_State* s) {
+	const char *json = R"({
+		"name": "isSelected",
+		"summary": "Check whether the voxel at the specified coordinates is selected (has the outline flag).",
+		"parameters": [
+			{"name": "x", "type": "integer", "description": "The x coordinate."},
+			{"name": "y", "type": "integer", "description": "The y coordinate."},
+			{"name": "z", "type": "integer", "description": "The z coordinate."}
+		],
+		"returns": [
+			{"type": "boolean", "description": "True if the voxel is selected, false otherwise."}
+		]})";
+	lua_pushstring(s, json);
+	return 1;
+}
+
+static int luaVoxel_volumewrapper_setselected_jsonhelp(lua_State* s) {
+	const char *json = R"({
+		"name": "setSelected",
+		"summary": "Set or clear the selection (outline flag) on a solid voxel at the specified coordinates. Air voxels cannot be selected.",
+		"parameters": [
+			{"name": "x", "type": "integer", "description": "The x coordinate."},
+			{"name": "y", "type": "integer", "description": "The y coordinate."},
+			{"name": "z", "type": "integer", "description": "The z coordinate."},
+			{"name": "selected", "type": "boolean", "description": "True to select, false to deselect (optional, default true)."}
+		],
+		"returns": [
+			{"type": "boolean", "description": "True if the voxel was inside the region and not air, false otherwise."}
+		]})";
+	lua_pushstring(s, json);
+	return 1;
+}
+
+static int luaVoxel_volumewrapper_visitslopesurface_jsonhelp(lua_State *s) {
+	const char *json = R"({
+		"name": "visitSlopeSurface",
+		"summary": "Visit all surface voxels that lie on a slope plane starting from the given position. The visitor callback is called with (x, y, z) for each accepted voxel.",
+		"parameters": [
+			{"name": "x", "type": "integer", "description": "The x coordinate of the seed voxel."},
+			{"name": "y", "type": "integer", "description": "The y coordinate of the seed voxel."},
+			{"name": "z", "type": "integer", "description": "The z coordinate of the seed voxel."},
+			{"name": "face", "type": "string", "description": "The face direction (e.g. 'up', 'positivey')."},
+			{"name": "maxDeviation", "type": "integer", "description": "Maximum height deviation from the slope plane."},
+			{"name": "sampleDistance", "type": "integer", "description": "Grid spacing for slope plane computation."},
+			{"name": "callback", "type": "function", "description": "Called with (x, y, z) for each slope surface voxel."}
+		],
+		"returns": [
+			{"type": "integer", "description": "The number of voxels visited."}
+		]})";
+	lua_pushstring(s, json);
+	return 1;
+}
+
+static int luaVoxel_volumewrapper_lassocontains_jsonhelp(lua_State *s) {
+	const char *json = R"({
+		"name": "lassoContains",
+		"summary": "Test whether a 2D point lies inside a polygon defined by a path of 3D positions, projected onto the given axis plane.",
+		"parameters": [
+			{"name": "path", "type": "table", "description": "Array of {x, y, z} tables forming the polygon."},
+			{"name": "pu", "type": "integer", "description": "The U coordinate of the test point."},
+			{"name": "pv", "type": "integer", "description": "The V coordinate of the test point."},
+			{"name": "uAxis", "type": "integer", "description": "Axis index for U (0=X, 1=Y, 2=Z)."},
+			{"name": "vAxis", "type": "integer", "description": "Axis index for V (0=X, 1=Y, 2=Z)."}
+		],
+		"returns": [
+			{"type": "boolean", "description": "True if the point is inside the polygon."}
+		]})";
+	lua_pushstring(s, json);
+	return 1;
+}
+
 // Region jsonhelp functions
 
 static int luaVoxel_volumewrapper_fill_jsonhelp(lua_State* s) {
@@ -3274,6 +3801,90 @@ static int luaVoxel_volumewrapper_istouching_jsonhelp(lua_State* s) {
 		],
 		"returns": [
 			{"type": "boolean", "description": "True if the position is adjacent to a solid voxel."}
+		]})";
+	lua_pushstring(s, json);
+	return 1;
+}
+
+static int luaVoxel_volumewrapper_visitsurface_jsonhelp(lua_State *s) {
+	const char *json = R"({
+		"name": "visitSurface",
+		"summary": "Visit all surface voxels in the volume. Surface voxels are solid voxels that have at least one air neighbor.",
+		"parameters": [
+			{"name": "callback", "type": "function", "description": "Called with (x, y, z) for each surface voxel."}
+		],
+		"returns": [
+			{"type": "integer", "description": "The number of surface voxels visited."}
+		]})";
+	lua_pushstring(s, json);
+	return 1;
+}
+
+static int luaVoxel_volumewrapper_issurface_jsonhelp(lua_State *s) {
+	const char *json = R"({
+		"name": "isSurface",
+		"summary": "Check if a voxel is a surface voxel (solid with at least one exposed air face).",
+		"parameters": [
+			{"name": "x", "type": "integer", "description": "The x coordinate."},
+			{"name": "y", "type": "integer", "description": "The y coordinate."},
+			{"name": "z", "type": "integer", "description": "The z coordinate."}
+		],
+		"returns": [
+			{"type": "boolean", "description": "True if the voxel is on the surface."}
+		]})";
+	lua_pushstring(s, json);
+	return 1;
+}
+
+static int luaVoxel_volumewrapper_isair_jsonhelp(lua_State *s) {
+	const char *json = R"({
+		"name": "isAir",
+		"summary": "Check if the voxel at the given position is air (empty).",
+		"parameters": [
+			{"name": "x", "type": "integer", "description": "The x coordinate."},
+			{"name": "y", "type": "integer", "description": "The y coordinate."},
+			{"name": "z", "type": "integer", "description": "The z coordinate."}
+		],
+		"returns": [
+			{"type": "boolean", "description": "True if the voxel is air."}
+		]})";
+	lua_pushstring(s, json);
+	return 1;
+}
+
+static int luaVoxel_volumewrapper_containspoint_jsonhelp(lua_State *s) {
+	const char *json = R"({
+		"name": "containsPoint",
+		"summary": "Check if a point is inside the volume's region bounds (inclusive).",
+		"parameters": [
+			{"name": "x", "type": "integer", "description": "The x coordinate."},
+			{"name": "y", "type": "integer", "description": "The y coordinate."},
+			{"name": "z", "type": "integer", "description": "The z coordinate."}
+		],
+		"returns": [
+			{"type": "boolean", "description": "True if the point is inside the volume region."}
+		]})";
+	lua_pushstring(s, json);
+	return 1;
+}
+
+static int luaVoxel_volumewrapper_pathfinder_jsonhelp(lua_State* s) {
+	const char *json = R"({
+		"name": "pathfinder",
+		"summary": "Find a path over existing voxels between two points using A* pathfinding. The path walks over the surface of solid voxels.",
+		"parameters": [
+			{"name": "startX", "type": "integer", "description": "The x coordinate of the start position."},
+			{"name": "startY", "type": "integer", "description": "The y coordinate of the start position."},
+			{"name": "startZ", "type": "integer", "description": "The z coordinate of the start position."},
+			{"name": "endX", "type": "integer", "description": "The x coordinate of the end position."},
+			{"name": "endY", "type": "integer", "description": "The y coordinate of the end position."},
+			{"name": "endZ", "type": "integer", "description": "The z coordinate of the end position."},
+			{"name": "connectivity", "type": "string", "description": "Connectivity type: '6' (faces), '18' (faces+edges), '26' (faces+edges+corners) (optional, default '18')."},
+			{"name": "hBias", "type": "number", "description": "Heuristic bias for pathfinding. Higher values find paths faster but may be less optimal (optional, default 4.0)."},
+			{"name": "maxNodes", "type": "integer", "description": "Maximum number of nodes to explore before giving up (optional, default 10000)."}
+		],
+		"returns": [
+			{"type": "table", "description": "An array of tables with x, y, z fields representing the path positions, or nil if no path was found."}
 		]})";
 	lua_pushstring(s, json);
 	return 1;
@@ -5320,6 +5931,16 @@ static int luaVoxel_scenegraphnode_removekeyframe_jsonhelp(lua_State* s) {
 	return 1;
 }
 
+static int luaVoxel_scenegraphnode_clearselection_jsonhelp(lua_State* s) {
+	const char *json = R"({
+		"name": "clearSelection",
+		"summary": "Clear all selection flags from the node's volume.",
+		"parameters": [],
+		"returns": []})";
+	lua_pushstring(s, json);
+	return 1;
+}
+
 static int luaVoxel_scenegraphnode_hide_jsonhelp(lua_State* s) {
 	const char *json = R"({
 		"name": "hide",
@@ -5753,7 +6374,7 @@ static int luaVoxel_shadow_jsonhelp(lua_State* s) {
 	return 1;
 }
 
-static void prepareState(lua_State* s) {
+void luaVoxel_prepareState(lua_State* s) {
 	static const clua_Reg volumeFuncs[] = {
 		{"voxel", luaVoxel_volumewrapper_voxel, luaVoxel_volumewrapper_voxel_jsonhelp},
 		{"region", luaVoxel_volumewrapper_region, luaVoxel_volumewrapper_region_jsonhelp},
@@ -5772,10 +6393,20 @@ static void prepareState(lua_State* s) {
 		{"setVoxel", luaVoxel_volumewrapper_setvoxel, luaVoxel_volumewrapper_setvoxel_jsonhelp},
 		{"setNormal", luaVoxel_volumewrapper_setnormal, luaVoxel_volumewrapper_setnormal_jsonhelp},
 		{"normal", luaVoxel_volumewrapper_normal, luaVoxel_volumewrapper_normal_jsonhelp},
+		{"flags", luaVoxel_volumewrapper_flags, luaVoxel_volumewrapper_flags_jsonhelp},
+		{"isSelected", luaVoxel_volumewrapper_isselected, luaVoxel_volumewrapper_isselected_jsonhelp},
+		{"setSelected", luaVoxel_volumewrapper_setselected, luaVoxel_volumewrapper_setselected_jsonhelp},
+		{"visitSlopeSurface", luaVoxel_volumewrapper_visitslopesurface, luaVoxel_volumewrapper_visitslopesurface_jsonhelp},
+		{"lassoContains", luaVoxel_volumewrapper_lassocontains, luaVoxel_volumewrapper_lassocontains_jsonhelp},
 		{"fill", luaVoxel_volumewrapper_fill, luaVoxel_volumewrapper_fill_jsonhelp},
 		{"clear", luaVoxel_volumewrapper_clear, luaVoxel_volumewrapper_clear_jsonhelp},
 		{"isEmpty", luaVoxel_volumewrapper_isempty, luaVoxel_volumewrapper_isempty_jsonhelp},
 		{"isTouching", luaVoxel_volumewrapper_istouching, luaVoxel_volumewrapper_istouching_jsonhelp},
+		{"visitSurface", luaVoxel_volumewrapper_visitsurface, luaVoxel_volumewrapper_visitsurface_jsonhelp},
+		{"isSurface", luaVoxel_volumewrapper_issurface, luaVoxel_volumewrapper_issurface_jsonhelp},
+		{"isAir", luaVoxel_volumewrapper_isair, luaVoxel_volumewrapper_isair_jsonhelp},
+		{"containsPoint", luaVoxel_volumewrapper_containspoint, luaVoxel_volumewrapper_containspoint_jsonhelp},
+		{"pathfinder", luaVoxel_volumewrapper_pathfinder, luaVoxel_volumewrapper_pathfinder_jsonhelp},
 		{"erasePlane", luaVoxel_volumewrapper_erasePlane, luaVoxel_volumewrapper_erasePlane_jsonhelp},
 		{"extrudePlane", luaVoxel_volumewrapper_extrudePlane, luaVoxel_volumewrapper_extrudePlane_jsonhelp},
 		{"overridePlane", luaVoxel_volumewrapper_overridePlane, luaVoxel_volumewrapper_overridePlane_jsonhelp},
@@ -5793,6 +6424,27 @@ static void prepareState(lua_State* s) {
 		{nullptr, nullptr, nullptr}
 	};
 	clua_registerfuncs(s, volumeFuncs, luaVoxel_metavolumewrapper());
+
+	static const clua_Reg sparseVolumeFuncs[] = {
+		{"voxel", luaVoxel_sparsevolume_voxel, luaVoxel_sparsevolume_voxel_jsonhelp},
+		{"setVoxel", luaVoxel_sparsevolume_setvoxel, luaVoxel_sparsevolume_setvoxel_jsonhelp},
+		{"empty", luaVoxel_sparsevolume_empty, luaVoxel_sparsevolume_empty_jsonhelp},
+		{"size", luaVoxel_sparsevolume_size, luaVoxel_sparsevolume_size_jsonhelp},
+		{"clear", luaVoxel_sparsevolume_clear, luaVoxel_sparsevolume_clear_jsonhelp},
+		{"region", luaVoxel_sparsevolume_region, luaVoxel_sparsevolume_region_jsonhelp},
+		{"copyToVolume", luaVoxel_sparsevolume_copytovolume, luaVoxel_sparsevolume_copytovolume_jsonhelp},
+		{"copyFromVolume", luaVoxel_sparsevolume_copyfromvolume, luaVoxel_sparsevolume_copyfromvolume_jsonhelp},
+		{"__tostring", luaVoxel_sparsevolume_tostring, nullptr},
+		{"__gc", luaVoxel_sparsevolume_gc, nullptr},
+		{nullptr, nullptr, nullptr}
+	};
+	clua_registerfuncs(s, sparseVolumeFuncs, luaVoxel_metasparsevolume());
+
+	static const clua_Reg sparseVolumeGlobalFuncs[] = {
+		{"new", luaVoxel_sparsevolume_new, luaVoxel_sparsevolume_new_jsonhelp},
+		{nullptr, nullptr, nullptr}
+	};
+	clua_registerfuncsglobal(s, sparseVolumeGlobalFuncs, luaVoxel_metasparsevolumeglobal(), "g_sparsevolume");
 
 	static const clua_Reg regionFuncs[] = {
 		{"width", luaVoxel_region_width, luaVoxel_region_width_jsonhelp},
@@ -5880,6 +6532,7 @@ static void prepareState(lua_State* s) {
 		{"numKeyFrames", luaVoxel_scenegraphnode_numkeyframes, luaVoxel_scenegraphnode_numkeyframes_jsonhelp},
 		{"children", luaVoxel_scenegraphnode_children, luaVoxel_scenegraphnode_children_jsonhelp},
 		{"region", luaVoxel_scenegraphnode_region, luaVoxel_scenegraphnode_region_jsonhelp},
+		{"clearSelection", luaVoxel_scenegraphnode_clearselection, luaVoxel_scenegraphnode_clearselection_jsonhelp},
 		{"hide", luaVoxel_scenegraphnode_hide, luaVoxel_scenegraphnode_hide_jsonhelp},
 		{"show", luaVoxel_scenegraphnode_show, luaVoxel_scenegraphnode_show_jsonhelp},
 		{"lock", luaVoxel_scenegraphnode_lock, luaVoxel_scenegraphnode_lock_jsonhelp},
@@ -6159,9 +6812,9 @@ bool LUAApi::init() {
 	if (!_noise.init()) {
 		Log::warn("Failed to initialize noise");
 	}
-	luaVoxel_newGlobalData(_lua, luaVoxel_globalnoise(), &_noise);
-	luaVoxel_newGlobalData(_lua, luaVoxel_globaldirtyregions(), &_dirtyRegions);
-	prepareState(_lua);
+	luaVoxel_setGlobalData(_lua, luaVoxel_globalnoise(), &_noise);
+	luaVoxel_setGlobalData(_lua, luaVoxel_globaldirtyregions(), &_dirtyRegions);
+	luaVoxel_prepareState(_lua);
 	return true;
 }
 
@@ -6431,7 +7084,7 @@ bool LUAApi::argumentInfo(lua::LUA &lua, core::DynamicArray<LUAParameterDescript
 	return true;
 }
 
-static bool luaVoxel_pushargs(lua_State* s, const core::DynamicArray<core::String>& args, const core::DynamicArray<LUAParameterDescription>& argsInfo, const palette::Palette &palette) {
+bool luaVoxel_pushargs(lua_State* s, const core::DynamicArray<core::String>& args, const core::DynamicArray<LUAParameterDescription>& argsInfo, const palette::Palette &palette) {
 	if (!lua_checkstack(s, (int)argsInfo.size())) {
 		Log::error("Failed to grow lua stack for %i arguments", (int)argsInfo.size());
 		return false;
@@ -6570,7 +7223,7 @@ bool LUAApi::exec(const core::String &luaScript, scenegraph::SceneGraph &sceneGr
 	}
 
 	lua_State *s = _lua.state();
-	luaVoxel_newGlobalData(s, luaVoxel_globalscenegraph(), &sceneGraph);
+	luaVoxel_setGlobalData(s, luaVoxel_globalscenegraph(), &sceneGraph);
 
 	lua_pushinteger(s, nodeId);
 	lua_setglobal(s, luaVoxel_globalnodeid());
@@ -6648,48 +7301,6 @@ bool LUAApi::apiJsonToStream(io::WriteStream &stream) const {
 		return false;
 	}
 
-	// Helper lambda to write method JSON including help data
-	auto writeMethodJson = [&](const char *methodName, const char *metaName, bool &firstMethod) -> bool {
-		if (methodName[0] == '_') {
-			return true; // Skip metamethods
-		}
-		if (!firstMethod) {
-			if (!stream.writeString(",", false)) {
-				return false;
-			}
-		}
-		firstMethod = false;
-
-		// Try to get the jsonhelp function for this method
-		lua_CFunction jsonHelpFunc = clua_getjsonhelp(s, metaName, methodName);
-		if (jsonHelpFunc) {
-			// Call the jsonhelp function to get the JSON string
-			lua_pushcfunction(s, jsonHelpFunc);
-			if (lua_pcall(s, 0, 1, 0) == LUA_OK && lua_isstring(s, -1)) {
-				const char *helpJson = lua_tostring(s, -1);
-				if (!stream.writeString(helpJson, false)) {
-					lua_pop(s, 1);
-					return false;
-				}
-			} else {
-				// Fallback to just the method name if jsonhelp call fails
-				core::String methodJson = core::String::format("{\"name\":\"%s\"}", methodName);
-				if (!stream.writeString(methodJson.c_str(), false)) {
-					lua_pop(s, 1);
-					return false;
-				}
-			}
-			lua_pop(s, 1); // pop result
-		} else {
-			// No jsonhelp available, just output name
-			core::String methodJson = core::String::format("{\"name\":\"%s\"}", methodName);
-			if (!stream.writeString(methodJson.c_str(), false)) {
-				return false;
-			}
-		}
-		return true;
-	};
-
 	// Iterate global table to find our registered globals (g_*)
 	lua_pushglobaltable(s);
 	lua_pushnil(s);
@@ -6734,6 +7345,8 @@ bool LUAApi::apiJsonToStream(io::WriteStream &stream) const {
 					metaName = luaVoxel_metasculpt();
 				} else if (SDL_strcmp(name, "g_font") == 0) {
 					metaName = luaVoxel_metavoxelfontglobal();
+				} else if (SDL_strcmp(name, "g_sparsevolume") == 0) {
+					metaName = luaVoxel_metasparsevolumeglobal();
 				} else if (SDL_strcmp(name, "g_http") == 0) {
 					metaName = clua_metahttp();
 				} else if (SDL_strcmp(name, "g_io") == 0) {
@@ -6765,18 +7378,9 @@ bool LUAApi::apiJsonToStream(io::WriteStream &stream) const {
 				bool firstMethod = true;
 				// Iterate through the table's methods
 				if (lua_istable(s, -1)) {
-					lua_pushnil(s);
-					while (lua_next(s, -2) != 0) {
-						if (lua_type(s, -2) == LUA_TSTRING) {
-							const char *methodName = lua_tostring(s, -2);
-							if (methodName && lua_isfunction(s, -1)) {
-								if (!writeMethodJson(methodName, metaName.c_str(), firstMethod)) {
-									lua_pop(s, 4); // pop key, value, inner key, global table
-									return false;
-								}
-							}
-						}
-						lua_pop(s, 1);
+					if (!clua_writejsonmethods(s, metaName.c_str(), stream, firstMethod)) {
+						lua_pop(s, 2); // pop value, global table
+						return false;
 					}
 				}
 
@@ -6797,6 +7401,7 @@ bool LUAApi::apiJsonToStream(io::WriteStream &stream) const {
 	};
 	const MetaInfo metas[] = {
 		{luaVoxel_metavolumewrapper(), "volume"},
+		{luaVoxel_metasparsevolume(), "sparsevolume"},
 		{luaVoxel_metaregion(), "region"},
 		{luaVoxel_metaregion_gc(), "region_gc"},
 		{luaVoxel_metascenegraphnode(), "scenegraphnode"},
@@ -6829,18 +7434,9 @@ bool LUAApi::apiJsonToStream(io::WriteStream &stream) const {
 			}
 
 			bool firstMethod = true;
-			lua_pushnil(s);
-			while (lua_next(s, -2) != 0) {
-				if (lua_type(s, -2) == LUA_TSTRING) {
-					const char *methodName = lua_tostring(s, -2);
-					if (methodName && lua_isfunction(s, -1)) {
-						if (!writeMethodJson(methodName, meta.name, firstMethod)) {
-							lua_pop(s, 3); // pop key, value, metatable
-							return false;
-						}
-					}
-				}
-				lua_pop(s, 1);
+			if (!clua_writejsonmethods(s, meta.name, stream, firstMethod)) {
+				lua_pop(s, 1); // pop metatable
+				return false;
 			}
 
 			if (!stream.writeString("]}", false)) {

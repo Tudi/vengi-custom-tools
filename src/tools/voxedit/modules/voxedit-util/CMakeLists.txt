@@ -3,14 +3,16 @@ set(SRCS
 	modifier/brush/BrushGizmo.h
 	modifier/brush/Brush.cpp modifier/brush/Brush.h
 	modifier/brush/LineBrush.cpp modifier/brush/LineBrush.h
+	modifier/brush/LUABrush.cpp modifier/brush/LUABrush.h
+	modifier/brush/LUAIconMapping.cpp modifier/brush/LUAIconMapping.h
 	modifier/brush/NormalBrush.cpp modifier/brush/NormalBrush.h
 	modifier/brush/PaintBrush.cpp modifier/brush/PaintBrush.h
-	modifier/brush/PathBrush.cpp modifier/brush/PathBrush.h
 	modifier/brush/PlaneBrush.cpp modifier/brush/PlaneBrush.h
 	modifier/brush/ShapeBrush.cpp modifier/brush/ShapeBrush.h
 	modifier/brush/StampBrush.cpp modifier/brush/StampBrush.h
 	modifier/brush/TextBrush.cpp modifier/brush/TextBrush.h
 	modifier/brush/SelectBrush.cpp modifier/brush/SelectBrush.h
+	modifier/brush/LUASelectionMode.cpp modifier/brush/LUASelectionMode.h
 	modifier/brush/ExtrudeBrush.cpp modifier/brush/ExtrudeBrush.h
 	modifier/brush/TransformBrush.cpp modifier/brush/TransformBrush.h
 	modifier/brush/RulerBrush.cpp modifier/brush/RulerBrush.h
@@ -97,17 +99,22 @@ set(SRCS
 	SceneRenderer.h SceneRenderer.cpp
 
 	ModelNodeSettings.h
-
-	Clipboard.h Clipboard.cpp
 )
 
 set(LIB voxedit-util)
 set(DEPENDENCIES ui voxelrender voxelformat voxelgenerator memento network sound)
-engine_add_module(TARGET ${LIB} SRCS ${SRCS} DEPENDENCIES ${DEPENDENCIES})
+set(LUA_SRCS
+	brushes/path.lua
+	brushes/modules/brush.lua
+	selectionmodes/modules/selection.lua
+)
+set(FILES
+	voxedit/chat-ping.wav
+)
+engine_add_module(TARGET ${LIB} SRCS ${SRCS} LUA_SRCS ${LUA_SRCS} FILES ${FILES} DEPENDENCIES ${DEPENDENCIES})
 
 set(TEST_SRCS
 	tests/AbstractBrushTest.cpp tests/AbstractBrushTest.h
-	tests/ClipboardTest.cpp
 	tests/ExtrudeBrushTest.cpp
 	tests/TransformBrushTest.cpp
 	tests/SculptBrushTest.cpp
@@ -116,7 +123,6 @@ set(TEST_SRCS
 	tests/ModifierVolumeWrapperTest.cpp
 	tests/NormalBrushTest.cpp
 	tests/PaintBrushTest.cpp
-	tests/PathBrushTest.cpp
 	tests/PlaneBrushTest.cpp
 	tests/RulerBrushTest.cpp
 	tests/ProtocolMessageFactoryTest.cpp
@@ -129,6 +135,7 @@ set(TEST_SRCS
 	tests/TextureBrushTest.cpp
 	tests/ClientTest.cpp
 	tests/SessionRecorderTest.cpp
+	tests/LUABrushTest.cpp
 )
 set(TEST_FILES
 	shared/font.ttf
@@ -138,17 +145,27 @@ set(TEST_FILES
 	tests/test-palette-in.png
 	tests/rgb_small.vox
 )
+set(TEST_LUA_SRCS
+	selectionmodes/slope.lua
+	selectionmodes/columnrim2d.lua
+	selectionmodes/holerim2d.lua
+	selectionmodes/holerim3d.lua
+	${LUA_SRCS}
+)
+
 gtest_suite_sources(tests
 	${TEST_SRCS}
 )
 gtest_suite_deps(tests ${LIB} test-app)
 gtest_suite_files(tests ${TEST_FILES})
+gtest_suite_lua_sources(tests ${TEST_LUA_SRCS})
 
 # CMake Error: Xcode generator: Duplicate object ids not allowed
 if (NOT CMAKE_GENERATOR STREQUAL "Xcode")
 	gtest_suite_begin(tests-${LIB} TEMPLATE ${ROOT_DIR}/src/modules/core/tests/main.cpp.in)
 	gtest_suite_sources(tests-${LIB} ${TEST_SRCS})
 	gtest_suite_files(tests-${LIB} ${TEST_FILES})
+	gtest_suite_lua_sources(tests-${LIB} ${TEST_LUA_SRCS})
 	gtest_suite_deps(tests-${LIB} ${LIB} test-app)
 	gtest_suite_end(tests-${LIB})
 endif()

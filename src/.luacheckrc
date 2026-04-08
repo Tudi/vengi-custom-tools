@@ -43,6 +43,8 @@ globals = {
 	"g_io",
 	"g_algorithm",
 	"g_lsystem",
+	"g_brushcontext",
+	"g_selectioncontext",
 
 	"tracy"
 }

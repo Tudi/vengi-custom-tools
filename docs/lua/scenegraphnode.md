@@ -6,6 +6,7 @@
 | ------ | ----------- |
 | `addKeyFrame(frame, interpolation)` | Add a new keyframe at the specified frame. |
 | `children()` | Get the child node IDs. |
+| `clearSelection()` | Clear all selection flags from the node's volume. |
 | `clone()` | Create a copy of the node. |
 | `hasKeyFrameForFrame(frame)` | Check if a keyframe exists at the specified frame. |
 | `hasNormalPalette()` | Check if the node has a normal palette. |
@@ -69,6 +70,10 @@ Get the child node IDs.
 | Type | Description |
 | ---- | ----------- |
 | `table` | A table of child node IDs. |
+
+### clearSelection
+
+Clear all selection flags from the node's volume.
 
 ### clone
 

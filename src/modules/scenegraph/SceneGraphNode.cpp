@@ -50,8 +50,6 @@ SceneGraphNode::SceneGraphNode(SceneGraphNode &&move) noexcept {
 	move._type = SceneGraphNodeType::Max;
 	_flags = move._flags;
 	move._flags &= ~VolumeOwned;
-	_selectionRegion = move._selectionRegion;
-	_hasSelection = move._hasSelection;
 }
 
 SceneGraphNode::~SceneGraphNode() {
@@ -89,8 +87,6 @@ SceneGraphNode &SceneGraphNode::operator=(SceneGraphNode &&move) noexcept {
 	_type = move._type;
 	_flags = move._flags;
 	move._flags &= ~VolumeOwned;
-	_selectionRegion = move._selectionRegion;
-	_hasSelection = move._hasSelection;
 	return *this;
 }
 
@@ -484,7 +480,17 @@ const voxel::Region &SceneGraphNode::region() const {
 }
 
 bool SceneGraphNode::hasSelection() const {
-	return _hasSelection;
+	if (_volume == nullptr) {
+		return false;
+	}
+	return _volume->hasFlags(_volume->region(), voxel::FlagOutline);
+}
+
+void SceneGraphNode::invertSelection() {
+	if (_volume == nullptr) {
+		return;
+	}
+	_volume->toggleFlags(_volume->region(), voxel::FlagOutline);
 }
 
 void SceneGraphNode::clearSelection() {
@@ -492,31 +498,34 @@ void SceneGraphNode::clearSelection() {
 		return;
 	}
 	_volume->removeFlags(_volume->region(), voxel::FlagOutline);
-	_selectionRegion = voxel::Region::InvalidRegion;
-	_hasSelection = false;
-}
-
-const voxel::Region &SceneGraphNode::selectionRegion() const {
-	return _selectionRegion;
-}
-
-void SceneGraphNode::setSelectionRegion(const voxel::Region &region) {
-	_selectionRegion = region;
 }
 
 void SceneGraphNode::select(const voxel::Region &region) {
 	if (_volume == nullptr) {
 		return;
 	}
-	_volume->setFlags(region, voxel::FlagOutline);
-	_hasSelection = true;
+	if (!region.isValid()) {
+		return;
+	}
+	voxel::Region clamped = region;
+	if (!clamped.cropTo(_volume->region())) {
+		return;
+	}
+	_volume->setFlags(clamped, voxel::FlagOutline);
 }
 
 void SceneGraphNode::unselect(const voxel::Region &region) {
 	if (_volume == nullptr) {
 		return;
 	}
-	_volume->removeFlags(region, voxel::FlagOutline);
+	if (!region.isValid()) {
+		return;
+	}
+	voxel::Region clamped = region;
+	if (!clamped.cropTo(_volume->region())) {
+		return;
+	}
+	_volume->removeFlags(clamped, voxel::FlagOutline);
 }
 
 bool SceneGraphNode::isLeaf() const {

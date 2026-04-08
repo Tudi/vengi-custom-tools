@@ -5,24 +5,31 @@
 | Method | Description |
 | ------ | ----------- |
 | `clear()` | Clear all voxels in the volume (set to air). |
+| `containsPoint(x, y, z)` | Check if a point is inside the volume's region bounds (inclusive). |
 | `crop()` | Crop the volume to remove empty space around the voxels. |
 | `erasePlane(x, y, z, face, groundColor, thickness)` | Erase connected voxels on a plane starting from a position. |
 | `extrudePlane(x, y, z, face, groundColor, newColor, thickness)` | Extrude a plane of connected voxels from a position. |
 | `fill(color, overwrite)` | Fill the entire volume with the specified color index. |
 | `fillHollow(color)` | Fill hollow areas in the volume with the specified voxel color. |
 | `fillPlane(image, searchVoxelColor, x, y, z, face)` | Fill a plane at the given position using colors from an image. |
+| `flags(x, y, z)` | Get the flags of the voxel at the specified coordinates. |
 | `hollow()` | Make the volume hollow by removing interior voxels. |
 | `importColoredHeightmap(image, underground)` | Import a colored heightmap image into the volume. |
 | `importHeightmap(image, underground, surface)` | Import a heightmap image into the volume. |
 | `importImageAsVolume(texture, depthmap, palette, thickness, bothSides)` | Import an image as a 3D volume using depth information. |
+| `isAir(x, y, z)` | Check if the voxel at the given position is air (empty). |
 | `isEmpty(minsx, minsy, minsz, maxsx, maxsy, maxsz)` | Check if a region is empty (contains only air). |
+| `isSelected(x, y, z)` | Check whether the voxel at the specified coordinates is selected (has the outline flag). |
+| `isSurface(x, y, z)` | Check if a voxel is a surface voxel (solid with at least one exposed air face). |
 | `isTouching(x, y, z, connectivity)` | Check if a position is touching (adjacent to) a solid voxel. |
+| `lassoContains(path, pu, pv, uAxis, vAxis)` | Test whether a 2D point lies inside a polygon defined by a path of 3D positions, projected onto the given axis plane. |
 | `merge(source)` | Merge another volume into this one. |
 | `mirrorAxis(axis)` | Mirror the volume along the specified axis. |
 | `move(x, y, z)` | Move the voxels within the volume by the specified offset. |
 | `normal(x, y, z)` | Get the normal palette index of the voxel at the specified coordinates. |
 | `overridePlane(x, y, z, face, color, thickness)` | Override existing voxels on a plane with a new color. |
 | `paintPlane(x, y, z, face, searchColor, replaceColor)` | Paint connected voxels on a plane with a new color. |
+| `pathfinder(startX, startY, startZ, endX, endY, endZ, connectivity, hBias, maxNodes)` | Find a path over existing voxels between two points using A* pathfinding. The path walks over the surface of solid voxels. |
 | `region()` | Get the region of the volume. |
 | `remapToPalette(oldPalette, newPalette, skipColorIndex)` | Remap all voxel colors from an old palette to a new palette. |
 | `renderIsometricImage(face)` | Render an isometric view of the volume to an image. |
@@ -34,9 +41,12 @@
 | `scaleDown()` | Scale the volume down by a factor of 2, averaging the colors. |
 | `scaleUp()` | Scale the volume up by a factor of 2. |
 | `setNormal(x, y, z, normal)` | Set the normal index on an existing voxel at the specified coordinates. |
+| `setSelected(x, y, z, selected)` | Set or clear the selection (outline flag) on a solid voxel at the specified coordinates. Air voxels cannot be selected. |
 | `setVoxel(x, y, z, color, normal)` | Set a voxel at the specified coordinates. |
 | `text(font, text, x, y, z, size, thickness, spacing)` | Render text into the volume using a TrueType font. |
 | `translate(x, y, z)` | Translate the region of the volume without moving the voxels. |
+| `visitSlopeSurface(x, y, z, face, maxDeviation, sampleDistance, callback)` | Visit all surface voxels that lie on a slope plane starting from the given position. The visitor callback is called with (x, y, z) for each accepted voxel. |
+| `visitSurface(callback)` | Visit all surface voxels in the volume. Surface voxels are solid voxels that have at least one air neighbor. |
 | `voxel(x, y, z)` | Get the voxel at the specified coordinates. |
 
 ## Detailed Documentation
@@ -44,6 +54,24 @@
 ### clear
 
 Clear all voxels in the volume (set to air).
+
+### containsPoint
+
+Check if a point is inside the volume's region bounds (inclusive).
+
+**Parameters:**
+
+| Name | Type | Description |
+| ---- | ---- | ----------- |
+| `x` | `integer` | The x coordinate. |
+| `y` | `integer` | The y coordinate. |
+| `z` | `integer` | The z coordinate. |
+
+**Returns:**
+
+| Type | Description |
+| ---- | ----------- |
+| `boolean` | True if the point is inside the volume region. |
 
 ### crop
 
@@ -134,6 +162,24 @@ Fill a plane at the given position using colors from an image.
 | ---- | ----------- |
 | `integer` | The number of voxels filled. |
 
+### flags
+
+Get the flags of the voxel at the specified coordinates.
+
+**Parameters:**
+
+| Name | Type | Description |
+| ---- | ---- | ----------- |
+| `x` | `integer` | The x coordinate. |
+| `y` | `integer` | The y coordinate. |
+| `z` | `integer` | The z coordinate. |
+
+**Returns:**
+
+| Type | Description |
+| ---- | ----------- |
+| `integer` | The flags of the voxel at the specified coordinates. |
+
 ### hollow
 
 Make the volume hollow by removing interior voxels.
@@ -175,6 +221,24 @@ Import an image as a 3D volume using depth information.
 | `thickness` | `integer` | Thickness of the volume (optional, default 8). |
 | `bothSides` | `boolean` | Create voxels on both sides (optional, default false). |
 
+### isAir
+
+Check if the voxel at the given position is air (empty).
+
+**Parameters:**
+
+| Name | Type | Description |
+| ---- | ---- | ----------- |
+| `x` | `integer` | The x coordinate. |
+| `y` | `integer` | The y coordinate. |
+| `z` | `integer` | The z coordinate. |
+
+**Returns:**
+
+| Type | Description |
+| ---- | ----------- |
+| `boolean` | True if the voxel is air. |
+
 ### isEmpty
 
 Check if a region is empty (contains only air).
@@ -196,6 +260,42 @@ Check if a region is empty (contains only air).
 | ---- | ----------- |
 | `boolean` | True if the region is empty. |
 
+### isSelected
+
+Check whether the voxel at the specified coordinates is selected (has the outline flag).
+
+**Parameters:**
+
+| Name | Type | Description |
+| ---- | ---- | ----------- |
+| `x` | `integer` | The x coordinate. |
+| `y` | `integer` | The y coordinate. |
+| `z` | `integer` | The z coordinate. |
+
+**Returns:**
+
+| Type | Description |
+| ---- | ----------- |
+| `boolean` | True if the voxel is selected, false otherwise. |
+
+### isSurface
+
+Check if a voxel is a surface voxel (solid with at least one exposed air face).
+
+**Parameters:**
+
+| Name | Type | Description |
+| ---- | ---- | ----------- |
+| `x` | `integer` | The x coordinate. |
+| `y` | `integer` | The y coordinate. |
+| `z` | `integer` | The z coordinate. |
+
+**Returns:**
+
+| Type | Description |
+| ---- | ----------- |
+| `boolean` | True if the voxel is on the surface. |
+
 ### isTouching
 
 Check if a position is touching (adjacent to) a solid voxel.
@@ -214,6 +314,26 @@ Check if a position is touching (adjacent to) a solid voxel.
 | Type | Description |
 | ---- | ----------- |
 | `boolean` | True if the position is adjacent to a solid voxel. |
+
+### lassoContains
+
+Test whether a 2D point lies inside a polygon defined by a path of 3D positions, projected onto the given axis plane.
+
+**Parameters:**
+
+| Name | Type | Description |
+| ---- | ---- | ----------- |
+| `path` | `table` | Array of {x, y, z} tables forming the polygon. |
+| `pu` | `integer` | The U coordinate of the test point. |
+| `pv` | `integer` | The V coordinate of the test point. |
+| `uAxis` | `integer` | Axis index for U (0=X, 1=Y, 2=Z). |
+| `vAxis` | `integer` | Axis index for V (0=X, 1=Y, 2=Z). |
+
+**Returns:**
+
+| Type | Description |
+| ---- | ----------- |
+| `boolean` | True if the point is inside the polygon. |
 
 ### merge
 
@@ -312,6 +432,30 @@ Paint connected voxels on a plane with a new color.
 | Type | Description |
 | ---- | ----------- |
 | `integer` | The number of voxels painted. |
+
+### pathfinder
+
+Find a path over existing voxels between two points using A* pathfinding. The path walks over the surface of solid voxels.
+
+**Parameters:**
+
+| Name | Type | Description |
+| ---- | ---- | ----------- |
+| `startX` | `integer` | The x coordinate of the start position. |
+| `startY` | `integer` | The y coordinate of the start position. |
+| `startZ` | `integer` | The z coordinate of the start position. |
+| `endX` | `integer` | The x coordinate of the end position. |
+| `endY` | `integer` | The y coordinate of the end position. |
+| `endZ` | `integer` | The z coordinate of the end position. |
+| `connectivity` | `string` | Connectivity type: '6' (faces), '18' (faces+edges), '26' (faces+edges+corners) (optional, default '18'). |
+| `hBias` | `number` | Heuristic bias for pathfinding. Higher values find paths faster but may be less optimal (optional, default 4.0). |
+| `maxNodes` | `integer` | Maximum number of nodes to explore before giving up (optional, default 10000). |
+
+**Returns:**
+
+| Type | Description |
+| ---- | ----------- |
+| `table` | An array of tables with x, y, z fields representing the path positions, or nil if no path was found. |
 
 ### region
 
@@ -447,6 +591,25 @@ Set the normal index on an existing voxel at the specified coordinates.
 | ---- | ----------- |
 | `boolean` | True if the voxel was updated, false if the voxel is air or outside the region. |
 
+### setSelected
+
+Set or clear the selection (outline flag) on a solid voxel at the specified coordinates. Air voxels cannot be selected.
+
+**Parameters:**
+
+| Name | Type | Description |
+| ---- | ---- | ----------- |
+| `x` | `integer` | The x coordinate. |
+| `y` | `integer` | The y coordinate. |
+| `z` | `integer` | The z coordinate. |
+| `selected` | `boolean` | True to select, false to deselect (optional, default true). |
+
+**Returns:**
+
+| Type | Description |
+| ---- | ----------- |
+| `boolean` | True if the voxel was inside the region and not air, false otherwise. |
+
 ### setVoxel
 
 Set a voxel at the specified coordinates.
@@ -495,6 +658,44 @@ Translate the region of the volume without moving the voxels.
 | `x` | `integer` | The x translation. |
 | `y` | `integer` | The y translation (optional, default 0). |
 | `z` | `integer` | The z translation (optional, default 0). |
+
+### visitSlopeSurface
+
+Visit all surface voxels that lie on a slope plane starting from the given position. The visitor callback is called with (x, y, z) for each accepted voxel.
+
+**Parameters:**
+
+| Name | Type | Description |
+| ---- | ---- | ----------- |
+| `x` | `integer` | The x coordinate of the seed voxel. |
+| `y` | `integer` | The y coordinate of the seed voxel. |
+| `z` | `integer` | The z coordinate of the seed voxel. |
+| `face` | `string` | The face direction (e.g. 'up', 'positivey'). |
+| `maxDeviation` | `integer` | Maximum height deviation from the slope plane. |
+| `sampleDistance` | `integer` | Grid spacing for slope plane computation. |
+| `callback` | `function` | Called with (x, y, z) for each slope surface voxel. |
+
+**Returns:**
+
+| Type | Description |
+| ---- | ----------- |
+| `integer` | The number of voxels visited. |
+
+### visitSurface
+
+Visit all surface voxels in the volume. Surface voxels are solid voxels that have at least one air neighbor.
+
+**Parameters:**
+
+| Name | Type | Description |
+| ---- | ---- | ----------- |
+| `callback` | `function` | Called with (x, y, z) for each surface voxel. |
+
+**Returns:**
+
+| Type | Description |
+| ---- | ----------- |
+| `integer` | The number of surface voxels visited. |
 
 ### voxel
 

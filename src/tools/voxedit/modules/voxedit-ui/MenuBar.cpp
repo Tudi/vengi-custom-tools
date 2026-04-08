@@ -12,9 +12,7 @@
 #include "imgui.h"
 #include "ui/IMGUIApp.h"
 #include "ui/IMGUIEx.h"
-#include "ui/IMGUIStyle.h"
 #include "ui/IconsLucide.h"
-#include "ui/PopupAbout.h"
 #include "voxedit-util/Config.h"
 #include "voxedit-util/SceneManager.h"
 #include "voxel/SurfaceExtractor.h"
@@ -82,10 +80,10 @@ bool MenuBar::update(ui::IMGUIApp *app, command::CommandExecutionListener &liste
 	if (ImGui::BeginMenuBar()) {
 		ImGui::Dummy({});
 
-		const scenegraph::SceneGraphNode *activeModelNode = _sceneMgr->sceneGraphModelNode(_sceneMgr->sceneGraph().activeNode());
-		const bool hasSelection = activeModelNode && activeModelNode->hasSelection();
+		int activeNodeId = _sceneMgr->sceneGraph().activeNode();
 
 		if (ImGui::BeginIconMenu(ICON_LC_FILE, _("File"))) {
+			const bool hasSelection = _sceneMgr->hasSelection(activeNodeId);
 			ImGui::CommandIconMenuItem(ICON_LC_SQUARE, _("New"), "new", true, &listener);
 			ImGui::CommandIconMenuItem(ICON_LC_FILE_INPUT, _("Load"), "load", true, &listener);
 			_app->lastOpenedMenu();
@@ -132,6 +130,7 @@ bool MenuBar::update(ui::IMGUIApp *app, command::CommandExecutionListener &liste
 			ImGui::EndMenu();
 		}
 		if (ImGui::BeginIconMenu(ICON_LC_MENU, _("Edit"))) {
+			const bool hasSelection = _sceneMgr->hasSelection(activeNodeId);
 			const memento::MementoHandler &mementoHandler = _sceneMgr->mementoHandler();
 			ImGui::CommandIconMenuItem(ICON_LC_UNDO, _("Undo"), "undo", mementoHandler.canUndo(), &listener);
 			ImGui::CommandIconMenuItem(ICON_LC_REDO, _("Redo"), "redo", mementoHandler.canRedo(), &listener);
@@ -163,7 +162,7 @@ bool MenuBar::update(ui::IMGUIApp *app, command::CommandExecutionListener &liste
 			}
 			ImGui::EndMenu();
 		}
-		if (ImGui::BeginIconMenu(ICON_LC_SCAN, _("Mask"))) {
+		if (ImGui::BeginIconMenu(ICON_LC_SCAN, _("Select"))) {
 			ImGui::CommandIconMenuItem(ICON_LC_SCAN, _("None"), "select none", true, &listener);
 			ImGui::CommandIconMenuItem(ICON_LC_SQUARE_DASHED_MOUSE_POINTER, _("Select"), "brushselect", true, &listener);
 			ImGui::CommandIconMenuItem(ICON_LC_SCAN, _("Invert"), "select invert", true, &listener);
@@ -204,6 +203,12 @@ bool MenuBar::update(ui::IMGUIApp *app, command::CommandExecutionListener &liste
 			if (ImGui::MenuItem(_("Welcome screen"))) {
 				core::getVar(cfg::VoxEditPopupWelcome)->setVal(true);
 			}
+			if (ImGui::IconMenuItem(ICON_LC_DOWNLOAD, _("Download scripts..."))) {
+				if (_scriptBrowserPanel) {
+					_scriptBrowserPanel->open();
+				}
+			}
+			ImGui::CommandIconMenuItem(ICON_LC_FILE_PLUS, _("Install script..."), "script_install", true, &listener);
 			ImGui::Separator();
 			if (ImGui::MenuItem(_("Minecraft mapping"))) {
 				core::getVar(cfg::VoxEditPopupMinecraftMapping)->setVal(true);

@@ -11,8 +11,9 @@
 #include "brush/Brush.h"
 #include "brush/BrushType.h"
 #include "brush/LineBrush.h"
+#include "brush/LUABrush.h"
+#include "brush/LUASelectionMode.h"
 #include "brush/PaintBrush.h"
-#include "brush/PathBrush.h"
 #include "brush/PlaneBrush.h"
 #include "brush/ExtrudeBrush.h"
 #include "brush/SelectBrush.h"
@@ -98,7 +99,6 @@ protected:
 	ShapeBrush _shapeBrush;
 	StampBrush _stampBrush;
 	LineBrush _lineBrush;
-	PathBrush _pathBrush;
 	PaintBrush _paintBrush;
 	TextBrush _textBrush;
 	SelectBrush _selectBrush;
@@ -108,6 +108,16 @@ protected:
 	TransformBrush _transformBrush;
 	SculptBrush _sculptBrush;
 	RulerBrush _rulerBrush;
+
+	core::DynamicArray<LUABrush *> _luaBrushes;
+	int _activeLuaBrushIndex = -1;
+
+	core::DynamicArray<LUASelectionMode *> _luaSelectionModes;
+
+	void discoverBrushScripts();
+	void clearBrushScripts();
+	void discoverSelectionModeScripts();
+	void clearSelectionModeScripts();
 
 	ModifierButton _actionExecuteButton;
 	ModifierButton _deleteExecuteButton;
@@ -218,6 +228,10 @@ public:
 				 const ModifiedRegionCallback &callback = {});
 	void endBrush();
 	/**
+	 * @brief Commit pending brush changes to all active group nodes.
+	 */
+	void commit();
+	/**
 	 * @brief Apply pending brush changes without switching brushes.
 	 * Commits any accumulated state (e.g. sculpt iterations, extrude depth).
 	 */
@@ -242,7 +256,6 @@ public:
 	LineBrush &lineBrush();
 	StampBrush &stampBrush();
 	PlaneBrush &planeBrush();
-	PathBrush &pathBrush();
 	PaintBrush &paintBrush();
 	BrushContext &brushContext();
 	SelectBrush &selectBrush();
@@ -299,6 +312,16 @@ public:
 
 	void onSceneChange();
 	void reset();
+
+	const core::DynamicArray<LUABrush *> &luaBrushes() const;
+	int activeLuaBrushIndex() const;
+	void setActiveLuaBrushIndex(int index);
+	LUABrush *activeLuaBrush();
+	const LUABrush *activeLuaBrush() const;
+	void reloadBrushScripts();
+
+	const core::DynamicArray<LUASelectionMode *> &luaSelectionModes() const;
+	void reloadSelectionModeScripts();
 };
 
 inline uint8_t Modifier::normalColorIndex() const {
@@ -343,10 +366,6 @@ inline StampBrush &Modifier::stampBrush() {
 
 inline PlaneBrush &Modifier::planeBrush() {
 	return _planeBrush;
-}
-
-inline PathBrush &Modifier::pathBrush() {
-	return _pathBrush;
 }
 
 inline PaintBrush &Modifier::paintBrush() {
@@ -450,6 +469,18 @@ inline bool Modifier::autoSelect() const {
 
 inline void Modifier::setAutoSelect(bool enable) {
 	_autoSelect->setVal(enable);
+}
+
+inline const core::DynamicArray<LUABrush *> &Modifier::luaBrushes() const {
+	return _luaBrushes;
+}
+
+inline int Modifier::activeLuaBrushIndex() const {
+	return _activeLuaBrushIndex;
+}
+
+inline const core::DynamicArray<LUASelectionMode *> &Modifier::luaSelectionModes() const {
+	return _luaSelectionModes;
 }
 
 } // namespace voxedit

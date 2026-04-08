@@ -31,7 +31,7 @@ private:
 	bool _paint;
 	bool _normalPaint;
 	bool _hasSelection;
-	voxel::Region _selectionRegion;
+	voxel::Region _box3DSelectionRegion;
 
 	// if we have a selection, we only handle voxels inside the selection
 	bool skip(const glm::aligned_ivec4 &pos) const {
@@ -39,7 +39,7 @@ private:
 			return false;
 		}
 		// Box3D region: allow editing anywhere inside the region (including air positions)
-		if (_selectionRegion.isValid() && _selectionRegion.containsPoint(pos)) {
+		if (_box3DSelectionRegion.isValid() && _box3DSelectionRegion.containsPoint(pos)) {
 			return false;
 		}
 		const voxel::Voxel &voxel = _volume->voxel(pos.x, pos.y, pos.z);
@@ -121,14 +121,15 @@ public:
 		}
 	};
 
-	ModifierVolumeWrapper(scenegraph::SceneGraphNode &node, ModifierType modifierType)
+	ModifierVolumeWrapper(scenegraph::SceneGraphNode &node, ModifierType modifierType,
+						  const voxel::Region &box3DSelectionRegion = voxel::Region::InvalidRegion)
 		: Super(node.volume()), _modifierType(modifierType), _node(node) {
 		_erase = _modifierType == ModifierType::Erase;
 		_override = _modifierType == ModifierType::Override;
 		_paint = _modifierType == ModifierType::Paint;
 		_normalPaint = _modifierType == ModifierType::NormalPaint;
 		_hasSelection = _node.hasSelection();
-		_selectionRegion = _node.selectionRegion();
+		_box3DSelectionRegion = box3DSelectionRegion;
 	}
 	scenegraph::SceneGraphNode &node() const {
 		return _node;
@@ -143,9 +144,6 @@ public:
 	 */
 	void setFlags(const voxel::Region &region, uint8_t flags) {
 		_volume->setFlags(region, flags);
-		if (flags & voxel::FlagOutline) {
-			_node.setHasSelection(true);
-		}
 		if (_dirtyRegion.isValid()) {
 			_dirtyRegion.accumulate(region);
 		} else {
@@ -200,9 +198,6 @@ public:
 		}
 		v.setFlags(v.getFlags() | flags);
 		sampler.setVoxel(v);
-		if (flags & voxel::FlagOutline) {
-			_node.setHasSelection(true);
-		}
 		if (_dirtyRegion.isValid()) {
 			_dirtyRegion.accumulate(x, y, z);
 		} else {
@@ -247,7 +242,6 @@ public:
 			setFlagAt(x, y, z, voxel::FlagOutline);
 		};
 		voxelutil::visitVolumeParallel(*this, _dirtyRegion, func, voxelutil::VisitSolid());
-		_node.setHasSelection(true);
 	}
 
 	/**
@@ -265,7 +259,6 @@ public:
 			setFlagAt(x, y, z, voxel::FlagOutline);
 		};
 		voxelutil::visitVolumeParallel(*this, _dirtyRegion, func, voxelutil::VisitSolid());
-		_node.setHasSelection(true);
 	}
 
 	bool setVoxel(int x, int y, int z, const voxel::Voxel &voxel) override {

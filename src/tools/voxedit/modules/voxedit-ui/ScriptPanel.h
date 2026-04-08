@@ -8,6 +8,9 @@
 #include "ui/TextEditor.h"
 #include "voxelgenerator/LUAApi.h"
 #include "voxelui/LUAApiWidget.h"
+namespace voxelui {
+class ScriptBrowserPanel;
+}
 
 namespace command {
 struct CommandExecutionListener;
@@ -28,12 +31,14 @@ private:
 	TextEditor _textEditor;
 	SceneManagerPtr _sceneMgr;
 	voxelui::LUAApiWidget _luaApiWidget;
+	voxelui::ScriptBrowserPanel *_scriptBrowserPanel = nullptr;
 	bool _scriptEditor = false;
 	core::String _activeScriptFilename;
 	voxelgenerator::LUAScript _luaScript;
 
 public:
-	ScriptPanel(ui::IMGUIApp *app, const SceneManagerPtr &sceneMgr) : Super(app, "script"), _sceneMgr(sceneMgr) {
+	ScriptPanel(ui::IMGUIApp *app, const SceneManagerPtr &sceneMgr, voxelui::ScriptBrowserPanel *scriptBrowserPanel)
+		: Super(app, "script"), _sceneMgr(sceneMgr), _scriptBrowserPanel(scriptBrowserPanel) {
 	}
 	void update(const char *id, command::CommandExecutionListener &listener);
 
