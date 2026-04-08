@@ -1881,11 +1881,14 @@ bool SceneManager::mergeActiveToBackground() {
 
 		// Add missing source colors to the target palette before mapping
 		palette::Palette &destPalette = targetNode.palette();
+		bool paletteChanged = false;
 		for (int i = 0; i < sourcePalette.colorCount(); ++i) {
-			const color::RGBA rgba = sourcePalette.color(i);
-			if (!destPalette.hasColor(rgba)) {
-				destPalette.tryAdd(rgba, false);
+			if (destPalette.tryAdd(sourcePalette.color(i), false)) {
+				paletteChanged = true;
 			}
+		}
+		if (paletteChanged) {
+			destPalette.markDirty();
 		}
 		palette::PaletteLookup palLookup(destPalette);
 
@@ -3359,7 +3362,11 @@ void SceneManager::construct() {
 			const color::RGBA rgba(r, g, b, a);
 			uint8_t index = 0;
 			if (!pal.tryAdd(rgba, false, &index)) {
-				Log::warn("palette_addcolor: palette is full");
+				if (pal.hasColor(rgba)) {
+					Log::info("palette_addcolor: color already exists at index %u", index);
+				} else {
+					Log::warn("palette_addcolor: palette is full");
+				}
 				return;
 			}
 			pal.markSave();
