@@ -68,4 +68,4 @@ constexpr const char *VoxEditLastCameraTarget = "ve_lastcameratarget";
 constexpr const char *VoxEditLastCameraAngles = "ve_lastcameraangles";
 constexpr const char *VoxEditLastCameraDistance = "ve_lastcameradist";
 
-}
+} // namespace cfg

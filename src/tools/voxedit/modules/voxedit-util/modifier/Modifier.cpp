@@ -629,6 +629,7 @@ void Modifier::commit() {
 		return;
 	}
 	if (!brush->onDeactivated()) {
+		brush->reset();
 		return;
 	}
 	if (beginBrushFromPanel()) {
@@ -669,6 +670,7 @@ BrushType Modifier::setBrushType(BrushType type) {
 	// Auto-commit pending changes from the current brush before switching.
 	// Must happen before changing _brushType so currentBrush() returns the old brush.
 	commit();
+	resetPreview();
 
 	_brushType = type;
 	Brush *newBrush = currentBrush();
@@ -901,6 +903,16 @@ void Modifier::render(const video::Camera &camera, palette::Palette &activePalet
 	}
 	if (const scenegraph::SceneGraphNode *node = _sceneMgr->sceneGraphModelNode(activeNodeId)) {
 		ctx.activeRegion = node->region();
+	}
+
+	// Detect when the active node's region changed (e.g. model gizmo shift)
+	// and mark the current brush dirty so its preview is regenerated at the
+	// new position instead of lingering at the old one.
+	if (ctx.activeRegion.isValid() && ctx.activeRegion != _lastActiveRegion) {
+		if (brush) {
+			brush->markDirty();
+		}
+		_lastActiveRegion = ctx.activeRegion;
 	}
 
 	// Handle brush preview with deferred updates
