@@ -162,6 +162,32 @@ RawVolume::RawVolume(const RawVolume& src, const Region& region, bool *onlyAir) 
 	}
 }
 
+#ifdef VENGI_COMPACT_VOXEL
+// Compact 1-byte voxel: FlagOutline is bit 7 (0x80). Process 8 voxels at a time.
+static inline uint8_t compactFlagsMask(uint8_t flags) {
+	return (flags & FlagOutline) ? Voxel::FLAG_OUTLINE_MASK : 0;
+}
+
+// Scan a contiguous block of compact voxels for any matching flags.
+static CORE_FORCE_INLINE CORE_NO_SANITIZE_ADDRESS bool scanFlagsLinear(const Voxel *data, int64_t count, uint8_t mask) {
+	const uint8_t *p = (const uint8_t *)data;
+	const uint64_t mask64 = mask * UINT64_C(0x0101010101010101);
+	int64_t i = 0;
+	for (; i + 8 <= count; i += 8) {
+		uint64_t val;
+		core_memcpy(&val, &p[i], sizeof(val));
+		if (val & mask64) {
+			return true;
+		}
+	}
+	for (; i < count; ++i) {
+		if (p[i] & mask) {
+			return true;
+		}
+	}
+	return false;
+}
+#else
 // Scan a contiguous block of voxels for any matching flags.
 static CORE_FORCE_INLINE CORE_NO_SANITIZE_ADDRESS bool scanFlagsLinear(const Voxel *data, int64_t count, uint32_t mask) {
 	// Uses uint32_t (matching sizeof(Voxel)==4) for natural alignment.
@@ -180,6 +206,7 @@ static CORE_FORCE_INLINE CORE_NO_SANITIZE_ADDRESS bool scanFlagsLinear(const Vox
 	}
 	return (acc & mask) != 0;
 }
+#endif
 
 bool RawVolume::hasFlags(const Region &region, uint8_t flags) const {
 	if (!intersects(_region, region)) {
@@ -191,8 +218,12 @@ bool RawVolume::hasFlags(const Region &region, uint8_t flags) const {
 		r.cropTo(_region);
 	}
 
+#ifdef VENGI_COMPACT_VOXEL
+	const uint8_t flagsMask = compactFlagsMask(flags);
+#else
 	// This assumes that the flags are stored at a particular position in the Voxel struct
 	const uint32_t flagsMask = (uint32_t)(flags & 0x3) << 2;
+#endif
 
 	const int width = _region.getWidthInVoxels();
 	const int height = _region.getHeightInVoxels();
@@ -250,8 +281,12 @@ Region RawVolume::regionForFlag(uint8_t flag) const {
 	const int d = _region.getDepthInVoxels();
 	const int64_t yStride = w;
 	const int64_t zStride = (int64_t)w * h;
+#ifdef VENGI_COMPACT_VOXEL
+	const uint8_t flagsMask = compactFlagsMask(flag);
+#else
 	// See voxel::Voxel::_flags
 	const uint32_t flagsMask = (uint32_t)(flag & 0x3) << 2;
+#endif
 
 	// Phase 1: Find Z bounds by scanning slices from both ends
 	int minZ = -1;
