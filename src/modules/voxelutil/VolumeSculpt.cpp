@@ -1111,7 +1111,10 @@ void sculptSmoothWall(voxel::BitVolume &solid, voxel::SparseVolume &voxelMap, co
 					pos[uAxis] = coordU;
 					pos[vAxis] = coordV;
 					pos[axisIdx] = av;
-					if (!isSolid(solid, anchors, pos)) {
+					// Only count voxels that are in the selected solid (not anchor neighbors).
+					// Anchors cannot be cleared, so including them would inflate column heights
+					// and cause the clear loop to target positions outside the snapshot.
+					if (!solid.hasValue(pos.x, pos.y, pos.z)) {
 						continue;
 					}
 					if (topVal == EMPTY) {
@@ -1354,15 +1357,11 @@ void sculptSmoothWall(voxel::BitVolume &solid, voxel::SparseVolume &voxelMap, co
 				const int coordU = baseU + iu;
 				const int coordV = baseV + iv;
 
-				// Clamp target so it never goes past the column bottom (avoids
-				// empty fill loop + destructive clear loop = holes)
-				const int clampedTarget = positiveUp
-					? glm::max(target, currentBottom)
-					: glm::min(target, currentBottom);
-
-				// Fill from column bottom up to target (close internal gaps)
-				const int fillLo = positiveUp ? currentBottom : clampedTarget;
-				const int fillHi = positiveUp ? clampedTarget : currentBottom;
+				// Fill from column bottom up to target (close internal gaps).
+				// When target < currentBottom the loop range is empty (fillLo > fillHi
+				// for positiveUp) so no voxels are added -- no clamping needed.
+				const int fillLo = positiveUp ? currentBottom : target;
+				const int fillHi = positiveUp ? target : currentBottom;
 				for (int av = fillLo; av <= fillHi; ++av) {
 					glm::ivec3 pos;
 					pos[uAxis] = coordU;
@@ -1373,12 +1372,14 @@ void sculptSmoothWall(voxel::BitVolume &solid, voxel::SparseVolume &voxelMap, co
 					}
 				}
 
-				// Remove voxels above target up to removeAboveDepth (0 = skip clearing)
+				// Remove voxels above target up to removeAboveDepth (0 = skip clearing).
+				// Use target directly (no clamping): when target < currentBottom the
+				// entire column is above the target and should be cleared.
 				if (removeAboveDepth > 0) {
-					const int clearStart = positiveUp ? clampedTarget + 1 : clampedTarget - 1;
+					const int clearStart = positiveUp ? target + 1 : target - 1;
 					const int clearEnd = positiveUp
-						? glm::min(clampedTarget + removeAboveDepth, axisHi)
-						: glm::max(clampedTarget - removeAboveDepth, axisLo);
+						? glm::min(target + removeAboveDepth, axisHi)
+						: glm::max(target - removeAboveDepth, axisLo);
 					const int clearStep = positiveUp ? 1 : -1;
 					for (int av = clearStart; positiveUp ? (av <= clearEnd) : (av >= clearEnd); av += clearStep) {
 						glm::ivec3 pos;
