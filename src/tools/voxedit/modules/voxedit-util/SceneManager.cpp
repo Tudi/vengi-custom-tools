@@ -1860,13 +1860,15 @@ bool SceneManager::mergeActiveToBackground() {
 	const voxel::Region &sourceWorldRegion = worldSource->region();
 	const palette::Palette &sourcePalette = sourceNode->palette();
 
-	// Detect grid parameters from existing background nodes
+	// Detect grid parameters from existing background nodes.
+	// Only consider hidden nodes: mergelockedtotemp hides all model nodes before creating
+	// the merged node, so hidden nodes are the ones that belong to the merge set.
 	const int chunkSize = _maxSuggestedVolumeSize->intVal();
 	glm::ivec3 gridOffset(0);
 	int backgroundParentId = _sceneGraph.root().id();
-	for (auto iter = _sceneGraph.beginModel(); iter != _sceneGraph.end(); ++iter) {
+	for (auto iter = _sceneGraph.beginAllModels(); iter != _sceneGraph.end(); ++iter) {
 		const scenegraph::SceneGraphNode &node = *iter;
-		if (node.id() == sourceNodeId || !node.isModelNode()) {
+		if (node.id() == sourceNodeId || !node.isAnyModelNode() || node.visible()) {
 			continue;
 		}
 		const voxel::Region wr = _sceneGraph.sceneRegion(node, _currentFrameIdx);
@@ -1914,10 +1916,12 @@ bool SceneManager::mergeActiveToBackground() {
 		}
 	}
 
-	// Match existing background nodes to grid cells
-	for (auto iter = _sceneGraph.beginModel(); iter != _sceneGraph.end(); ++iter) {
+	// Match existing background nodes to grid cells.
+	// Only hidden nodes are background nodes from the merge set; visible nodes were not
+	// part of the merge and must not be stamped (their content was never in the source).
+	for (auto iter = _sceneGraph.beginAllModels(); iter != _sceneGraph.end(); ++iter) {
 		const scenegraph::SceneGraphNode &node = *iter;
-		if (node.id() == sourceNodeId || !node.isModelNode()) {
+		if (node.id() == sourceNodeId || !node.isAnyModelNode() || node.visible()) {
 			continue;
 		}
 		const voxel::Region wr = _sceneGraph.sceneRegion(node, _currentFrameIdx);
@@ -2079,7 +2083,7 @@ bool SceneManager::mergeActiveToBackground() {
 
 	// Show all hidden model nodes and unhide them in the mesh state so that
 	// scheduleRegionExtraction does not skip extraction for hidden volumes
-	for (auto iter = _sceneGraph.beginModel(); iter != _sceneGraph.end(); ++iter) {
+	for (auto iter = _sceneGraph.beginAllModels(); iter != _sceneGraph.end(); ++iter) {
 		scenegraph::SceneGraphNode &node = *iter;
 		if (node.id() != sourceNodeId && !node.visible()) {
 			nodeSetVisible(node.id(), true);
@@ -2172,9 +2176,9 @@ int SceneManager::mergeVisibleToTemp() {
 int SceneManager::mergeLockedToTemp() {
 	core::Buffer<int> lockedNodeIds;
 	lockedNodeIds.reserve(_sceneGraph.size());
-	for (auto iter = _sceneGraph.beginModel(); iter != _sceneGraph.end(); ++iter) {
+	for (auto iter = _sceneGraph.beginAllModels(); iter != _sceneGraph.end(); ++iter) {
 		const scenegraph::SceneGraphNode &node = *iter;
-		if (node.locked() && node.isModelNode()) {
+		if (node.locked() && node.isAnyModelNode()) {
 			lockedNodeIds.push_back(node.id());
 		}
 	}
@@ -2184,9 +2188,90 @@ int SceneManager::mergeLockedToTemp() {
 		return InvalidNodeId;
 	}
 
-	// Bake all locked nodes into world space and merge
-	scenegraph::SceneGraph tempSceneGraph;
+	// Compute the bounding region of all locked nodes in world space, snapped to
+	// grid-cell boundaries. Nodes may have volumes cropped to their actual non-air
+	// content (e.g. 2 voxels at the edge of a 128-unit chunk). Using sceneRegion()
+	// directly would give a tiny bounds that misses adjacent chunks. Snapping each
+	// locked node's region to the chunk grid ensures the full chunk is represented.
+	// Detect grid offset from the first locked node so we can snap to the same grid
+	// that mergeactivetobackground uses. Nodes may have volumes cropped to their
+	// actual non-air content (e.g. 2 voxels at the edge of a 128-unit chunk), so
+	// sceneRegion() gives a tiny extent. Snapping each locked node to its full grid
+	// cell ensures all nodes in the intended selection area are captured.
+	const int chunkSize = _maxSuggestedVolumeSize->intVal();
+	glm::ivec3 gridOffset(0);
 	for (int nodeId : lockedNodeIds) {
+		const scenegraph::SceneGraphNode *node = sceneGraphNode(nodeId);
+		if (node == nullptr) {
+			continue;
+		}
+		const voxel::Region wr = _sceneGraph.sceneRegion(*node, _currentFrameIdx);
+		if (!wr.isValid()) {
+			continue;
+		}
+		const glm::ivec3 &lc = wr.getLowerCorner();
+		gridOffset = ((lc % chunkSize) + glm::ivec3(chunkSize)) % glm::ivec3(chunkSize);
+		break;
+	}
+	auto gridCellOrigin = [&](const glm::ivec3 &pos) -> glm::ivec3 {
+		const glm::ivec3 shifted = pos - gridOffset;
+		glm::ivec3 cell;
+		for (int i = 0; i < 3; ++i) {
+			cell[i] = (shifted[i] >= 0) ? (shifted[i] / chunkSize)
+			                            : ((shifted[i] - chunkSize + 1) / chunkSize);
+		}
+		return cell * chunkSize + gridOffset;
+	};
+	voxel::Region lockedBounds;
+	bool firstBounds = true;
+	for (int nodeId : lockedNodeIds) {
+		const scenegraph::SceneGraphNode *node = sceneGraphNode(nodeId);
+		if (node == nullptr) {
+			continue;
+		}
+		const voxel::Region wr = _sceneGraph.sceneRegion(*node, _currentFrameIdx);
+		if (!wr.isValid()) {
+			continue;
+		}
+		// Snap the node's region to its full grid cell so that nodes with content
+		// only at the edge of a chunk still contribute the whole chunk to the bounds.
+		const glm::ivec3 cellLower = gridCellOrigin(wr.getLowerCorner());
+		const voxel::Region cellRegion(cellLower, cellLower + glm::ivec3(chunkSize - 1));
+		if (firstBounds) {
+			lockedBounds = cellRegion;
+			firstBounds = false;
+		} else {
+			lockedBounds.accumulate(cellRegion);
+		}
+	}
+
+	// Collect all model nodes whose world region intersects the grid-snapped locked bounds
+	core::DynamicSet<int, 64> lockedSet;
+	for (int nodeId : lockedNodeIds) {
+		lockedSet.insert(nodeId);
+	}
+	core::Buffer<int> mergeNodeIds;
+	mergeNodeIds.reserve(_sceneGraph.size());
+	for (auto iter = _sceneGraph.beginAllModels(); iter != _sceneGraph.end(); ++iter) {
+		const scenegraph::SceneGraphNode &node = *iter;
+		if (!node.isAnyModelNode()) {
+			continue;
+		}
+		if (lockedSet.has(node.id())) {
+			mergeNodeIds.push_back(node.id());
+			continue;
+		}
+		const voxel::Region wr = _sceneGraph.sceneRegion(node, _currentFrameIdx);
+		if (voxel::intersects(lockedBounds, wr)) {
+			mergeNodeIds.push_back(node.id());
+		}
+	}
+	Log::info("mergelockedtotemp: %i locked nodes, %i total nodes to merge (including enclosed)",
+			  (int)lockedNodeIds.size(), (int)mergeNodeIds.size());
+
+	// Bake all collected nodes into world space and merge
+	scenegraph::SceneGraph tempSceneGraph;
+	for (int nodeId : mergeNodeIds) {
 		const scenegraph::SceneGraphNode *node = sceneGraphNode(nodeId);
 		if (node == nullptr) {
 			continue;
@@ -2212,11 +2297,11 @@ int SceneManager::mergeLockedToTemp() {
 
 	memento::ScopedMementoGroup mementoGroup(_mementoHandler, "mergelockedtotemp");
 
-	// Unlock source nodes and hide all nodes
+	// Unlock locked nodes and hide all model nodes
 	for (int nodeId : lockedNodeIds) {
 		nodeSetLocked(nodeId, false);
 	}
-	for (auto iter = _sceneGraph.beginModel(); iter != _sceneGraph.end(); ++iter) {
+	for (auto iter = _sceneGraph.beginAllModels(); iter != _sceneGraph.end(); ++iter) {
 		nodeSetVisible((*iter).id(), false);
 	}
 
@@ -2230,11 +2315,10 @@ int SceneManager::mergeLockedToTemp() {
 
 	const int newNodeId = moveNodeToSceneGraph(newNode);
 	if (newNodeId == InvalidNodeId) {
-		// Restore locked and visible state on failure
 		for (int nodeId : lockedNodeIds) {
 			nodeSetLocked(nodeId, true);
 		}
-		for (auto iter = _sceneGraph.beginModel(); iter != _sceneGraph.end(); ++iter) {
+		for (auto iter = _sceneGraph.beginAllModels(); iter != _sceneGraph.end(); ++iter) {
 			nodeSetVisible((*iter).id(), true);
 		}
 		Log::warn("mergelockedtotemp: failed to create merged node");
@@ -2244,7 +2328,7 @@ int SceneManager::mergeLockedToTemp() {
 	nodeActivate(newNodeId);
 
 	const scenegraph::SceneGraphNode &createdNode = _sceneGraph.node(newNodeId);
-	if (createdNode.isModelNode()) {
+	if (createdNode.isAnyModelNode()) {
 		const voxel::Region &region = createdNode.region();
 		setReferencePosition(region.getCenter());
 		command::Command::execute("camera_target_reference");
