@@ -1860,15 +1860,13 @@ bool SceneManager::mergeActiveToBackground() {
 	const voxel::Region &sourceWorldRegion = worldSource->region();
 	const palette::Palette &sourcePalette = sourceNode->palette();
 
-	// Detect grid parameters from existing background nodes.
-	// Only consider hidden nodes: mergelockedtotemp hides all model nodes before creating
-	// the merged node, so hidden nodes are the ones that belong to the merge set.
+	// Detect grid parameters from existing background nodes
 	const int chunkSize = _maxSuggestedVolumeSize->intVal();
 	glm::ivec3 gridOffset(0);
 	int backgroundParentId = _sceneGraph.root().id();
-	for (auto iter = _sceneGraph.beginAllModels(); iter != _sceneGraph.end(); ++iter) {
+	for (auto iter = _sceneGraph.beginModel(); iter != _sceneGraph.end(); ++iter) {
 		const scenegraph::SceneGraphNode &node = *iter;
-		if (node.id() == sourceNodeId || !node.isAnyModelNode() || node.visible()) {
+		if (node.id() == sourceNodeId || !node.isModelNode()) {
 			continue;
 		}
 		const voxel::Region wr = _sceneGraph.sceneRegion(node, _currentFrameIdx);
@@ -1916,12 +1914,10 @@ bool SceneManager::mergeActiveToBackground() {
 		}
 	}
 
-	// Match existing background nodes to grid cells.
-	// Only hidden nodes are background nodes from the merge set; visible nodes were not
-	// part of the merge and must not be stamped (their content was never in the source).
-	for (auto iter = _sceneGraph.beginAllModels(); iter != _sceneGraph.end(); ++iter) {
+	// Match existing background nodes to grid cells
+	for (auto iter = _sceneGraph.beginModel(); iter != _sceneGraph.end(); ++iter) {
 		const scenegraph::SceneGraphNode &node = *iter;
-		if (node.id() == sourceNodeId || !node.isAnyModelNode() || node.visible()) {
+		if (node.id() == sourceNodeId || !node.isModelNode()) {
 			continue;
 		}
 		const voxel::Region wr = _sceneGraph.sceneRegion(node, _currentFrameIdx);
@@ -2083,7 +2079,7 @@ bool SceneManager::mergeActiveToBackground() {
 
 	// Show all hidden model nodes and unhide them in the mesh state so that
 	// scheduleRegionExtraction does not skip extraction for hidden volumes
-	for (auto iter = _sceneGraph.beginAllModels(); iter != _sceneGraph.end(); ++iter) {
+	for (auto iter = _sceneGraph.beginModel(); iter != _sceneGraph.end(); ++iter) {
 		scenegraph::SceneGraphNode &node = *iter;
 		if (node.id() != sourceNodeId && !node.visible()) {
 			nodeSetVisible(node.id(), true);
