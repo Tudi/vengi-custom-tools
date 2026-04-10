@@ -1039,7 +1039,7 @@ static void fillSmoothWallVoxel(voxel::BitVolume &solid, voxel::SparseVolume &vo
 
 void sculptSmoothWall(voxel::BitVolume &solid, voxel::SparseVolume &voxelMap, const voxel::BitVolume &anchors,
 					  voxel::FaceNames face, int iterations, const voxel::Voxel &fillVoxel,
-					  int removeAboveDepth, SmoothWallInterp interp) {
+					  int removeAboveDepth, SmoothWallInterp interp, bool fillHoles) {
 	if (face == voxel::FaceNames::Max || iterations < 1) {
 		return;
 	}
@@ -1092,8 +1092,20 @@ void sculptSmoothWall(voxel::BitVolume &solid, voxel::SparseVolume &voxelMap, co
 	core::DynamicArray<int> nearEdgeHeightBottom(numColumns);
 	core::DynamicArray<int> nearEdgeDistBottom(numColumns);
 
+	// Exterior-empty BFS (only used when fillHoles=true)
+	core::DynamicArray<bool> isExteriorEmpty;
+	core::DynamicArray<int> bfsQueue;
+	if (fillHoles) {
+		isExteriorEmpty.resize(numColumns);
+		bfsQueue.reserve(numColumns);
+	}
+
 	for (int iter = 0; iter < iterations; ++iter) {
-		// Step 1: Build column top/bottom from the solid BitVolume + anchors
+		// Step 1: Build column top/bottom from the solid BitVolume only.
+		// Anchor voxels (non-selected solid neighbors) are intentionally excluded:
+		// they are not in solid and cannot be cleared, so including them in the
+		// height scan causes colTopArr to reflect positions that the clear loop
+		// cannot remove (solid.hasValue returns false for anchors).
 		for (int idx = 0; idx < numColumns; ++idx) {
 			colTopArr[idx] = EMPTY;
 			colBotArr[idx] = EMPTY;
@@ -1111,9 +1123,6 @@ void sculptSmoothWall(voxel::BitVolume &solid, voxel::SparseVolume &voxelMap, co
 					pos[uAxis] = coordU;
 					pos[vAxis] = coordV;
 					pos[axisIdx] = av;
-					// Only count voxels that are in the selected solid (not anchor neighbors).
-					// Anchors cannot be cleared, so including them would inflate column heights
-					// and cause the clear loop to target positions outside the snapshot.
 					if (!solid.hasValue(pos.x, pos.y, pos.z)) {
 						continue;
 					}
@@ -1133,13 +1142,55 @@ void sculptSmoothWall(voxel::BitVolume &solid, voxel::SparseVolume &voxelMap, co
 			}
 		}
 
+		// Step 1.5 (fillHoles only): BFS from boundary to identify exterior-empty columns.
+		// Interior-empty columns (holes) are those not reachable from outside.
+		if (fillHoles) {
+			for (int idx = 0; idx < numColumns; ++idx) {
+				isExteriorEmpty[idx] = false;
+			}
+			bfsQueue.clear();
+			for (int iu = 0; iu < extentU; ++iu) {
+				for (int iv = 0; iv < extentV; ++iv) {
+					const int flatIdx = iu * extentV + iv;
+					const bool onBoundary = (iu == 0 || iu == extentU - 1 || iv == 0 || iv == extentV - 1);
+					if (onBoundary && colTopArr[flatIdx] == EMPTY) {
+						isExteriorEmpty[flatIdx] = true;
+						bfsQueue.push_back(flatIdx);
+					}
+				}
+			}
+			static constexpr int bfsDU[4] = {-1, 1, 0, 0};
+			static constexpr int bfsDV[4] = {0, 0, -1, 1};
+			for (int qi = 0; qi < (int)bfsQueue.size(); ++qi) {
+				const int fi = bfsQueue[qi];
+				const int biu = fi / extentV;
+				const int biv = fi % extentV;
+				for (int di = 0; di < 4; ++di) {
+					const int nu = biu + bfsDU[di];
+					const int nv = biv + bfsDV[di];
+					if (nu < 0 || nu >= extentU || nv < 0 || nv >= extentV) {
+						continue;
+					}
+					const int nIdx = nu * extentV + nv;
+					if (isExteriorEmpty[nIdx] || colTopArr[nIdx] != EMPTY) {
+						continue;
+					}
+					isExteriorEmpty[nIdx] = true;
+					bfsQueue.push_back(nIdx);
+				}
+			}
+		}
+
 		// Step 2: Identify edge columns, precompute nearest-edge in 4 directions
 		// via O(N) sweeps, then compute target heights for interior columns.
 		for (int idx = 0; idx < numColumns; ++idx) {
 			targetArr[idx] = EMPTY;
 		}
 
-		// Mark edge columns: solid AND has at least one empty/out-of-bounds UV neighbor
+		// Mark edge columns.
+		// fillHoles=false: solid column adjacent to any empty or out-of-bounds UV neighbor.
+		// fillHoles=true: solid column adjacent to exterior-empty or out-of-bounds only
+		//   (hole-boundary columns are NOT edges -- they get interpolated heights too).
 		for (int iu = 0; iu < extentU; ++iu) {
 			for (int iv = 0; iv < extentV; ++iv) {
 				const int flatIdx = iu * extentV + iv;
@@ -1147,28 +1198,50 @@ void sculptSmoothWall(voxel::BitVolume &solid, voxel::SparseVolume &voxelMap, co
 					isEdgeArr[flatIdx] = false;
 					continue;
 				}
-				bool edge = (iu == 0 || iu == extentU - 1 || iv == 0 || iv == extentV - 1);
-				if (!edge) {
-					edge = (colTopArr[(iu - 1) * extentV + iv] == EMPTY)
-						|| (colTopArr[(iu + 1) * extentV + iv] == EMPTY)
-						|| (colTopArr[iu * extentV + (iv - 1)] == EMPTY)
-						|| (colTopArr[iu * extentV + (iv + 1)] == EMPTY);
+				if (fillHoles) {
+					bool enclosingEdge = false;
+					static constexpr int edgeDU[4] = {-1, 1, 0, 0};
+					static constexpr int edgeDV[4] = {0, 0, -1, 1};
+					for (int di = 0; di < 4; ++di) {
+						const int nu = iu + edgeDU[di];
+						const int nv = iv + edgeDV[di];
+						if (nu < 0 || nu >= extentU || nv < 0 || nv >= extentV) {
+							enclosingEdge = true;
+							break;
+						}
+						if (isExteriorEmpty[nu * extentV + nv]) {
+							enclosingEdge = true;
+							break;
+						}
+					}
+					isEdgeArr[flatIdx] = enclosingEdge;
+				} else {
+					bool edge = (iu == 0 || iu == extentU - 1 || iv == 0 || iv == extentV - 1);
+					if (!edge) {
+						edge = (colTopArr[(iu - 1) * extentV + iv] == EMPTY)
+							|| (colTopArr[(iu + 1) * extentV + iv] == EMPTY)
+							|| (colTopArr[iu * extentV + (iv - 1)] == EMPTY)
+							|| (colTopArr[iu * extentV + (iv + 1)] == EMPTY);
+					}
+					isEdgeArr[flatIdx] = edge;
 				}
-				isEdgeArr[flatIdx] = edge;
 			}
 		}
 
 		// Sweep precomputation: for each column, find nearest edge in 4 directions.
 		// Each sweep is O(extentU * extentV), total O(N) instead of O(N * sqrt(N)).
 
-		// Left (-U) and Right (+U) sweeps: for each row iv, sweep along iu
+		// Left (-U) and Right (+U) sweeps: for each row iv, sweep along iu.
+		// fillHoles=true: holes (interior empty) are transparent -- only exterior-empty resets.
+		// fillHoles=false: any empty column resets (current behavior).
 		for (int iv = 0; iv < extentV; ++iv) {
 			// Left sweep: iu = 0 to extentU-1
 			int lastEdgeHeight = EMPTY;
 			int lastEdgeDist = 0;
 			for (int iu = 0; iu < extentU; ++iu) {
 				const int flatIdx = iu * extentV + iv;
-				if (colTopArr[flatIdx] == EMPTY) {
+				const bool shouldReset = fillHoles ? isExteriorEmpty[flatIdx] : (colTopArr[flatIdx] == EMPTY);
+				if (shouldReset) {
 					lastEdgeHeight = EMPTY;
 				} else if (isEdgeArr[flatIdx]) {
 					lastEdgeHeight = colTopArr[flatIdx];
@@ -1185,7 +1258,8 @@ void sculptSmoothWall(voxel::BitVolume &solid, voxel::SparseVolume &voxelMap, co
 			lastEdgeDist = 0;
 			for (int iu = extentU - 1; iu >= 0; --iu) {
 				const int flatIdx = iu * extentV + iv;
-				if (colTopArr[flatIdx] == EMPTY) {
+				const bool shouldReset = fillHoles ? isExteriorEmpty[flatIdx] : (colTopArr[flatIdx] == EMPTY);
+				if (shouldReset) {
 					lastEdgeHeight = EMPTY;
 				} else if (isEdgeArr[flatIdx]) {
 					lastEdgeHeight = colTopArr[flatIdx];
@@ -1205,7 +1279,8 @@ void sculptSmoothWall(voxel::BitVolume &solid, voxel::SparseVolume &voxelMap, co
 			int lastEdgeDist = 0;
 			for (int iv = 0; iv < extentV; ++iv) {
 				const int flatIdx = iu * extentV + iv;
-				if (colTopArr[flatIdx] == EMPTY) {
+				const bool shouldReset = fillHoles ? isExteriorEmpty[flatIdx] : (colTopArr[flatIdx] == EMPTY);
+				if (shouldReset) {
 					lastEdgeHeight = EMPTY;
 				} else if (isEdgeArr[flatIdx]) {
 					lastEdgeHeight = colTopArr[flatIdx];
@@ -1222,7 +1297,8 @@ void sculptSmoothWall(voxel::BitVolume &solid, voxel::SparseVolume &voxelMap, co
 			lastEdgeDist = 0;
 			for (int iv = extentV - 1; iv >= 0; --iv) {
 				const int flatIdx = iu * extentV + iv;
-				if (colTopArr[flatIdx] == EMPTY) {
+				const bool shouldReset = fillHoles ? isExteriorEmpty[flatIdx] : (colTopArr[flatIdx] == EMPTY);
+				if (shouldReset) {
 					lastEdgeHeight = EMPTY;
 				} else if (isEdgeArr[flatIdx]) {
 					lastEdgeHeight = colTopArr[flatIdx];
@@ -1236,12 +1312,20 @@ void sculptSmoothWall(voxel::BitVolume &solid, voxel::SparseVolume &voxelMap, co
 			}
 		}
 
-		// Compute target for each interior column using precomputed nearest edges
+		// Compute target for each interior column using precomputed nearest edges.
+		// fillHoles=true: also compute targets for interior-hole columns (EMPTY, not exterior-empty).
+		// fillHoles=false: only process solid interior columns.
 		for (int iu = 0; iu < extentU; ++iu) {
 			for (int iv = 0; iv < extentV; ++iv) {
 				const int flatIdx = iu * extentV + iv;
-				if (colTopArr[flatIdx] == EMPTY || isEdgeArr[flatIdx]) {
-					continue;
+				if (fillHoles) {
+					if (isExteriorEmpty[flatIdx] || isEdgeArr[flatIdx]) {
+						continue;
+					}
+				} else {
+					if (colTopArr[flatIdx] == EMPTY || isEdgeArr[flatIdx]) {
+						continue;
+					}
 				}
 
 				const int edgeLeft = nearEdgeHeightLeft[flatIdx];
@@ -1342,6 +1426,7 @@ void sculptSmoothWall(voxel::BitVolume &solid, voxel::SparseVolume &voxelMap, co
 		// Step 3: Enforce the smooth surface for each interior column.
 		// - Make solid from column bottom up to target (fill gaps)
 		// - Remove all voxels above target up to removeAboveDepth
+		// - fillHoles=true: also fill interior-hole columns from region floor to target
 		// This eliminates floating layers and discontinuities.
 		for (int iu = 0; iu < extentU; ++iu) {
 			for (int iv = 0; iv < extentV; ++iv) {
@@ -1350,7 +1435,10 @@ void sculptSmoothWall(voxel::BitVolume &solid, voxel::SparseVolume &voxelMap, co
 				if (target == EMPTY) {
 					continue;
 				}
-				const int currentBottom = colBotArr[flatIdx];
+				// For interior holes (fillHoles=true): fill from region floor/ceiling.
+				// For solid columns: fill from existing column bottom.
+				const bool isInteriorHole = fillHoles && (colTopArr[flatIdx] == EMPTY) && !isExteriorEmpty[flatIdx];
+				const int currentBottom = isInteriorHole ? (positiveUp ? axisLo : axisHi) : colBotArr[flatIdx];
 				if (currentBottom == EMPTY) {
 					continue;
 				}
@@ -1407,7 +1495,8 @@ void sculptSmoothWall(voxel::BitVolume &solid, voxel::SparseVolume &voxelMap, co
 				if (myTarget == EMPTY) {
 					continue;
 				}
-				const int currentBottom = colBotArr[flatIdx];
+				const bool isInteriorHole = fillHoles && (colTopArr[flatIdx] == EMPTY) && !isExteriorEmpty[flatIdx];
+				const int currentBottom = isInteriorHole ? (positiveUp ? axisLo : axisHi) : colBotArr[flatIdx];
 				if (currentBottom == EMPTY) {
 					continue;
 				}
@@ -2014,7 +2103,7 @@ int sculptSmoothGaussian(voxel::RawVolume &volume, const voxel::Region &region, 
 
 int sculptSmoothWall(voxel::RawVolume &volume, const voxel::Region &region, voxel::FaceNames face,
 					 int iterations, const voxel::Voxel &fillVoxel, int removeAboveDepth,
-					 SmoothWallInterp interp) {
+					 SmoothWallInterp interp, bool fillHoles) {
 	core_trace_scoped(SculptSmoothWallVolume);
 	voxel::BitVolume solid(region);
 	voxel::SparseVolume voxelMap;
@@ -2023,7 +2112,7 @@ int sculptSmoothWall(voxel::RawVolume &volume, const voxel::Region &region, voxe
 	anchorRegion.cropTo(volume.region());
 	voxel::BitVolume anchors(anchorRegion);
 	buildFromVolume(volume, region, solid, voxelMap, anchors);
-	sculptSmoothWall(solid, voxelMap, anchors, face, iterations, fillVoxel, removeAboveDepth, interp);
+	sculptSmoothWall(solid, voxelMap, anchors, face, iterations, fillVoxel, removeAboveDepth, interp, fillHoles);
 	return writeResultToVolume(volume, region, solid, voxelMap);
 }
 

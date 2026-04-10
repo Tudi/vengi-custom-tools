@@ -321,7 +321,8 @@ int sculptSquashToPlane(voxel::RawVolume &volume, const voxel::Region &region, v
  */
 void sculptSmoothWall(voxel::BitVolume &solid, voxel::SparseVolume &voxelMap, const voxel::BitVolume &anchors,
 					  voxel::FaceNames face, int iterations, const voxel::Voxel &fillVoxel,
-					  int removeAboveDepth = 0, SmoothWallInterp interp = SmoothWallInterp::InverseDistance);
+					  int removeAboveDepth = 0, SmoothWallInterp interp = SmoothWallInterp::InverseDistance,
+					  bool fillHoles = true);
 
 /**
  * @brief Smooth wall on a volume region along a face normal.
@@ -330,7 +331,8 @@ void sculptSmoothWall(voxel::BitVolume &solid, voxel::SparseVolume &voxelMap, co
  */
 int sculptSmoothWall(voxel::RawVolume &volume, const voxel::Region &region, voxel::FaceNames face,
 					 int iterations, const voxel::Voxel &fillVoxel, int removeAboveDepth = 0,
-					 SmoothWallInterp interp = SmoothWallInterp::InverseDistance);
+					 SmoothWallInterp interp = SmoothWallInterp::InverseDistance,
+					 bool fillHoles = true);
 
 /**
  * @brief Reskin: apply a skin volume (texture pattern) onto the selected surface.

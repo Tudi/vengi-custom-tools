@@ -83,6 +83,7 @@ void SculptBrush::reset() {
 	_flattenFace = voxel::FaceNames::Max;
 	_smoothWallClearDepth = MaxSmoothWallClearDepth;
 	_smoothWallInterp = voxelutil::SmoothWallInterp::InverseDistance;
+	_smoothWallFillHoles = true;
 	_removeAboveDepth = 0;
 	_extendOnly = true;
 	_brushRadius = 3;
@@ -387,7 +388,7 @@ void SculptBrush::applySculpt(ModifierVolumeWrapper &wrapper, const BrushContext
 		fillVoxel.setFlags(voxel::FlagOutline);
 		static constexpr int smoothWallIterations = 1;
 		voxelutil::sculptSmoothWall(currentSolid, voxelMap, anchorSolid, _flattenFace, smoothWallIterations,
-									fillVoxel, _smoothWallClearDepth, _smoothWallInterp);
+									fillVoxel, _smoothWallClearDepth, _smoothWallInterp, _smoothWallFillHoles);
 	}
 
 	// Write results using the collected snapshot entries - no hash lookups needed.

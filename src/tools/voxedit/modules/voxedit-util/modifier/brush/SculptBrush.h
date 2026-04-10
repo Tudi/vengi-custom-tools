@@ -61,6 +61,7 @@ private:
 	float _sigma = 4.0f;
 	int _smoothWallClearDepth = MaxSmoothWallClearDepth; ///< 0 = don't clear, max = clear entire depth
 	voxelutil::SmoothWallInterp _smoothWallInterp = voxelutil::SmoothWallInterp::InverseDistance;
+	bool _smoothWallFillHoles = true; ///< Fill enclosed empty areas with interpolated heights
 	voxel::FaceNames _flattenFace = voxel::FaceNames::Max;
 	int _squashPlaneCoord = 0;
 	bool _active = false;
@@ -178,6 +179,8 @@ public:
 	void setSmoothWallClearDepth(int depth);
 	voxelutil::SmoothWallInterp smoothWallInterp() const;
 	void setSmoothWallInterp(voxelutil::SmoothWallInterp interp);
+	bool smoothWallFillHoles() const;
+	void setSmoothWallFillHoles(bool fillHoles);
 
 	// ExtendPlane accessors
 	static constexpr int MaxBrushRadius = 32;
@@ -326,6 +329,15 @@ inline voxelutil::SmoothWallInterp SculptBrush::smoothWallInterp() const {
 
 inline void SculptBrush::setSmoothWallInterp(voxelutil::SmoothWallInterp interp) {
 	_smoothWallInterp = interp;
+	_paramsDirty = true;
+}
+
+inline bool SculptBrush::smoothWallFillHoles() const {
+	return _smoothWallFillHoles;
+}
+
+inline void SculptBrush::setSmoothWallFillHoles(bool fillHoles) {
+	_smoothWallFillHoles = fillHoles;
 	_paramsDirty = true;
 }
 

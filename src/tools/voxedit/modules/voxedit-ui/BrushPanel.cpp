@@ -1587,6 +1587,12 @@ void BrushPanel::updateSculptBrushPanel(command::CommandExecutionListener &liste
 			brush.setSmoothWallClearDepth(clearDepth);
 			executeSculptBrush();
 		}
+		bool fillHoles = brush.smoothWallFillHoles();
+		if (ImGui::Checkbox(_("Fill holes"), &fillHoles)) {
+			brush.setSmoothWallFillHoles(fillHoles);
+			executeSculptBrush();
+		}
+		ImGui::SetItemTooltipUnformatted(_("Fill enclosed empty areas with interpolated heights. When unchecked, holes are skipped and only solid columns are smoothed."));
 	} else if (currentMode == SculptMode::Reskin) {
 		if (brush.skinVolume() == nullptr) {
 			const glm::vec4 &warningTextColor = style::color(style::StyleColor::ColorWarningText);

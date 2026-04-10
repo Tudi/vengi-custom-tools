@@ -2748,9 +2748,10 @@ static int luaVoxel_sculpt_smoothwall(lua_State *s) {
 	const int removeAboveDepth = (int)luaL_optinteger(s, 5, 0);
 	const char *interpStr = luaL_optstring(s, 6, "inversedistance");
 	const voxelutil::SmoothWallInterp interp = luaVoxel_parseSmoothWallInterp(interpStr);
+	const bool fillHoles = lua_toboolean(s, 7) != 0 || lua_isnoneornil(s, 7);
 	const voxel::Voxel fillVoxel = voxel::createVoxel(voxel::VoxelType::Generic, color);
 	const int changed = voxelutil::sculptSmoothWall(*volume->volume(), volume->volume()->region(), face,
-													iterations, fillVoxel, removeAboveDepth, interp);
+													iterations, fillVoxel, removeAboveDepth, interp, fillHoles);
 	lua_pushinteger(s, changed);
 	return 1;
 }
@@ -2765,7 +2766,8 @@ static int luaVoxel_sculpt_smoothwall_jsonhelp(lua_State *s) {
 			{"name": "iterations", "type": "integer", "description": "Number of smoothing passes (optional, default 1)."},
 			{"name": "color", "type": "integer", "description": "Palette color index for new voxels (optional, default 1)."},
 			{"name": "removeAboveDepth", "type": "integer", "description": "How many voxels above the smooth surface to clear (optional, default 0 = don't clear)."},
-			{"name": "interpolation", "type": "string", "description": "Interpolation mode: 'linear', 'inversedistance' (default, smooth curves), or 'edgeaware' (follows sharp corners by favoring edges with similar height)."}
+			{"name": "interpolation", "type": "string", "description": "Interpolation mode: 'linear', 'inversedistance' (default, smooth curves), or 'edgeaware' (follows sharp corners by favoring edges with similar height)."},
+			{"name": "fillHoles", "type": "boolean", "description": "Fill enclosed empty areas with interpolated heights (optional, default true). When false, empty columns are skipped and only solid columns are smoothed."}
 		],
 		"returns": [
 			{"type": "integer", "description": "Number of voxels changed."}

@@ -1569,4 +1569,55 @@ TEST_F(VolumeSculptTest, testSmoothWallTooSmallSelection) {
 	EXPECT_EQ(changed, 0);
 }
 
+TEST_F(VolumeSculptTest, testSmoothWallFillHolesFilledInteriorHole) {
+	// A ring of solid columns surrounding an empty interior hole.
+	// With fillHoles=true the hole should be filled with interpolated heights.
+	// Layout (top view, face=PositiveY, Y=3):
+	//   X=[1,6], Z=[1,6] ring is solid at Y=3. Center (3,4) empty.
+	voxel::Region region(0, 8);
+	voxel::RawVolume volume(region);
+	const voxel::Voxel solid = voxel::createVoxel(voxel::VoxelType::Generic, 1);
+
+	// Fill the full slab first, then punch a 2x2 hole in the middle
+	fillRegion(volume, voxel::Region(glm::ivec3(1, 3, 1), glm::ivec3(6, 3, 6)), solid);
+	volume.setVoxel(3, 3, 3, voxel::Voxel());
+	volume.setVoxel(3, 3, 4, voxel::Voxel());
+	volume.setVoxel(4, 3, 3, voxel::Voxel());
+	volume.setVoxel(4, 3, 4, voxel::Voxel());
+
+	const voxel::Region selRegion(glm::ivec3(1, 3, 1), glm::ivec3(6, 3, 6));
+	// fillHoles=true: hole should be filled
+	const int changed = sculptSmoothWall(volume, selRegion, voxel::FaceNames::PositiveY, 1, solid, 0,
+										 voxelutil::SmoothWallInterp::InverseDistance, true);
+	EXPECT_GT(changed, 0);
+	// All four hole positions should now be solid
+	EXPECT_TRUE(voxel::isBlocked(volume.voxel(3, 3, 3).getMaterial()));
+	EXPECT_TRUE(voxel::isBlocked(volume.voxel(3, 3, 4).getMaterial()));
+	EXPECT_TRUE(voxel::isBlocked(volume.voxel(4, 3, 3).getMaterial()));
+	EXPECT_TRUE(voxel::isBlocked(volume.voxel(4, 3, 4).getMaterial()));
+}
+
+TEST_F(VolumeSculptTest, testSmoothWallSkipHolesLeavesInteriorHole) {
+	// Same ring setup as above, but with fillHoles=false.
+	// The hole should remain empty -- only solid columns are smoothed.
+	voxel::Region region(0, 8);
+	voxel::RawVolume volume(region);
+	const voxel::Voxel solid = voxel::createVoxel(voxel::VoxelType::Generic, 1);
+
+	fillRegion(volume, voxel::Region(glm::ivec3(1, 3, 1), glm::ivec3(6, 3, 6)), solid);
+	volume.setVoxel(3, 3, 3, voxel::Voxel());
+	volume.setVoxel(3, 3, 4, voxel::Voxel());
+	volume.setVoxel(4, 3, 3, voxel::Voxel());
+	volume.setVoxel(4, 3, 4, voxel::Voxel());
+
+	const voxel::Region selRegion(glm::ivec3(1, 3, 1), glm::ivec3(6, 3, 6));
+	// fillHoles=false: hole positions must stay empty
+	sculptSmoothWall(volume, selRegion, voxel::FaceNames::PositiveY, 1, solid, 0,
+					 voxelutil::SmoothWallInterp::InverseDistance, false);
+	EXPECT_FALSE(voxel::isBlocked(volume.voxel(3, 3, 3).getMaterial()));
+	EXPECT_FALSE(voxel::isBlocked(volume.voxel(3, 3, 4).getMaterial()));
+	EXPECT_FALSE(voxel::isBlocked(volume.voxel(4, 3, 3).getMaterial()));
+	EXPECT_FALSE(voxel::isBlocked(volume.voxel(4, 3, 4).getMaterial()));
+}
+
 } // namespace voxelutil
