@@ -410,7 +410,7 @@ public:
 	bool splatMerge(int sourceNodeId);
 	bool mergeActiveToBackground();
 	int mergeVisibleToTemp();
-	int mergeLockedToTemp();
+	int mergeLockedToTemp(bool onlySelected = false);
 
 	void selectionInvert(int nodeId);
 	void selectionUnselect(int nodeId);

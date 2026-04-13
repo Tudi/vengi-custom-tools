@@ -2169,7 +2169,7 @@ int SceneManager::mergeVisibleToTemp() {
 	return newNodeId;
 }
 
-int SceneManager::mergeLockedToTemp() {
+int SceneManager::mergeLockedToTemp(bool onlySelected) {
 	core::Buffer<int> lockedNodeIds;
 	lockedNodeIds.reserve(_sceneGraph.size());
 	for (auto iter = _sceneGraph.beginAllModels(); iter != _sceneGraph.end(); ++iter) {
@@ -2184,86 +2184,76 @@ int SceneManager::mergeLockedToTemp() {
 		return InvalidNodeId;
 	}
 
-	// Compute the bounding region of all locked nodes in world space, snapped to
-	// grid-cell boundaries. Nodes may have volumes cropped to their actual non-air
-	// content (e.g. 2 voxels at the edge of a 128-unit chunk). Using sceneRegion()
-	// directly would give a tiny bounds that misses adjacent chunks. Snapping each
-	// locked node's region to the chunk grid ensures the full chunk is represented.
-	// Detect grid offset from the first locked node so we can snap to the same grid
-	// that mergeactivetobackground uses. Nodes may have volumes cropped to their
-	// actual non-air content (e.g. 2 voxels at the edge of a 128-unit chunk), so
-	// sceneRegion() gives a tiny extent. Snapping each locked node to its full grid
-	// cell ensures all nodes in the intended selection area are captured.
-	const int chunkSize = _maxSuggestedVolumeSize->intVal();
-	glm::ivec3 gridOffset(0);
-	for (int nodeId : lockedNodeIds) {
-		const scenegraph::SceneGraphNode *node = sceneGraphNode(nodeId);
-		if (node == nullptr) {
-			continue;
-		}
-		const voxel::Region wr = _sceneGraph.sceneRegion(*node, _currentFrameIdx);
-		if (!wr.isValid()) {
-			continue;
-		}
-		const glm::ivec3 &lc = wr.getLowerCorner();
-		gridOffset = ((lc % chunkSize) + glm::ivec3(chunkSize)) % glm::ivec3(chunkSize);
-		break;
-	}
-	auto gridCellOrigin = [&](const glm::ivec3 &pos) -> glm::ivec3 {
-		const glm::ivec3 shifted = pos - gridOffset;
-		glm::ivec3 cell;
-		for (int i = 0; i < 3; ++i) {
-			cell[i] = (shifted[i] >= 0) ? (shifted[i] / chunkSize)
-			                            : ((shifted[i] - chunkSize + 1) / chunkSize);
-		}
-		return cell * chunkSize + gridOffset;
-	};
-	voxel::Region lockedBounds;
-	bool firstBounds = true;
-	for (int nodeId : lockedNodeIds) {
-		const scenegraph::SceneGraphNode *node = sceneGraphNode(nodeId);
-		if (node == nullptr) {
-			continue;
-		}
-		const voxel::Region wr = _sceneGraph.sceneRegion(*node, _currentFrameIdx);
-		if (!wr.isValid()) {
-			continue;
-		}
-		// Snap the node's region to its full grid cell so that nodes with content
-		// only at the edge of a chunk still contribute the whole chunk to the bounds.
-		const glm::ivec3 cellLower = gridCellOrigin(wr.getLowerCorner());
-		const voxel::Region cellRegion(cellLower, cellLower + glm::ivec3(chunkSize - 1));
-		if (firstBounds) {
-			lockedBounds = cellRegion;
-			firstBounds = false;
-		} else {
-			lockedBounds.accumulate(cellRegion);
-		}
-	}
-
-	// Collect all model nodes whose world region intersects the grid-snapped locked bounds
-	core::DynamicSet<int, 64> lockedSet;
-	for (int nodeId : lockedNodeIds) {
-		lockedSet.insert(nodeId);
-	}
 	core::Buffer<int> mergeNodeIds;
-	mergeNodeIds.reserve(_sceneGraph.size());
-	for (auto iter = _sceneGraph.beginAllModels(); iter != _sceneGraph.end(); ++iter) {
-		const scenegraph::SceneGraphNode &node = *iter;
-		if (!node.isAnyModelNode()) {
-			continue;
+	voxel::Region lockedBounds;
+	if (onlySelected) {
+		mergeNodeIds = lockedNodeIds;
+	} else {
+		// Compute the bounding region of all locked nodes in world space, snapped to
+		// grid-cell boundaries. Nodes may have volumes cropped to their actual non-air
+		// content (e.g. 2 voxels at the edge of a 128-unit chunk). Using sceneRegion()
+		// directly would give a tiny bounds that misses adjacent chunks. Snapping each
+		// locked node's lower corner down and upper corner up to the chunk grid ensures
+		// the full grid cells are represented.
+		const int chunkSize = _maxSuggestedVolumeSize->intVal();
+		auto floorToGrid = [&](int v) -> int {
+			return (v >= 0) ? (v / chunkSize) * chunkSize
+			                : ((v - chunkSize + 1) / chunkSize) * chunkSize;
+		};
+		auto ceilToGrid = [&](int v) -> int {
+			return floorToGrid(v) + chunkSize - 1;
+		};
+		bool firstBounds = true;
+		for (int nodeId : lockedNodeIds) {
+			const scenegraph::SceneGraphNode *node = sceneGraphNode(nodeId);
+			if (node == nullptr) {
+				continue;
+			}
+			const voxel::Region wr = _sceneGraph.sceneRegion(*node, _currentFrameIdx);
+			if (!wr.isValid()) {
+				continue;
+			}
+			// Snap lower corner down and upper corner up to grid-cell boundaries
+			const glm::ivec3 cellLower(
+				floorToGrid(wr.getLowerX()),
+				floorToGrid(wr.getLowerY()),
+				floorToGrid(wr.getLowerZ()));
+			const glm::ivec3 cellUpper(
+				ceilToGrid(wr.getUpperX()),
+				ceilToGrid(wr.getUpperY()),
+				ceilToGrid(wr.getUpperZ()));
+			const voxel::Region cellRegion(cellLower, cellUpper);
+			if (firstBounds) {
+				lockedBounds = cellRegion;
+				firstBounds = false;
+			} else {
+				lockedBounds.accumulate(cellRegion);
+			}
 		}
-		if (lockedSet.has(node.id())) {
-			mergeNodeIds.push_back(node.id());
-			continue;
+
+		// Collect all model nodes whose world region intersects the grid-snapped locked bounds
+		core::DynamicSet<int, 64> lockedSet;
+		for (int nodeId : lockedNodeIds) {
+			lockedSet.insert(nodeId);
 		}
-		const voxel::Region wr = _sceneGraph.sceneRegion(node, _currentFrameIdx);
-		if (voxel::intersects(lockedBounds, wr)) {
-			mergeNodeIds.push_back(node.id());
+		mergeNodeIds.reserve(_sceneGraph.size());
+		for (auto iter = _sceneGraph.beginAllModels(); iter != _sceneGraph.end(); ++iter) {
+			const scenegraph::SceneGraphNode &node = *iter;
+			if (!node.isAnyModelNode()) {
+				continue;
+			}
+			if (lockedSet.has(node.id())) {
+				mergeNodeIds.push_back(node.id());
+				continue;
+			}
+			const voxel::Region wr = _sceneGraph.sceneRegion(node, _currentFrameIdx);
+			if (voxel::intersects(lockedBounds, wr)) {
+				mergeNodeIds.push_back(node.id());
+			}
 		}
+		Log::info("mergelockedtotemp: %i locked nodes, %i total nodes to merge (including enclosed)",
+				  (int)lockedNodeIds.size(), (int)mergeNodeIds.size());
 	}
-	Log::info("mergelockedtotemp: %i locked nodes, %i total nodes to merge (including enclosed)",
-			  (int)lockedNodeIds.size(), (int)mergeNodeIds.size());
 
 	// Bake all collected nodes into world space and merge
 	scenegraph::SceneGraph tempSceneGraph;
@@ -2291,6 +2281,20 @@ int SceneManager::mergeLockedToTemp() {
 		return InvalidNodeId;
 	}
 
+	// Clip the merged volume to the locked bounding box so that partially
+	// overlapping nodes don't extend the temp node beyond the intended region.
+	voxel::RawVolume *mergedVolume = merged.volume();
+	voxel::RawVolume *clippedVolume;
+	if (!onlySelected && mergedVolume->region() != lockedBounds) {
+		const voxel::Region clipRegion(
+			glm::max(mergedVolume->region().getLowerCorner(), lockedBounds.getLowerCorner()),
+			glm::min(mergedVolume->region().getUpperCorner(), lockedBounds.getUpperCorner()));
+		clippedVolume = new voxel::RawVolume(*mergedVolume, clipRegion);
+		delete mergedVolume;
+	} else {
+		clippedVolume = mergedVolume;
+	}
+
 	memento::ScopedMementoGroup mementoGroup(_mementoHandler, "mergelockedtotemp");
 
 	// Unlock locked nodes and hide all model nodes
@@ -2303,7 +2307,7 @@ int SceneManager::mergeLockedToTemp() {
 
 	// Create the merged temporary node
 	scenegraph::SceneGraphNode newNode(scenegraph::SceneGraphNodeType::Model);
-	newNode.setVolume(merged.volume());
+	newNode.setVolume(clippedVolume);
 	newNode.setPalette(merged.palette);
 	newNode.setNormalPalette(merged.normalPalette);
 	newNode.setName(_("merged_temp"));
@@ -4030,9 +4034,12 @@ void SceneManager::construct() {
 		}).setHelp(_("Merge all visible nodes into a temporary editable node, hiding the originals"));
 
 	command::Command::registerCommand("mergelockedtotemp")
-		.setHandler([&] (const command::CommandArgs&) {
-			mergeLockedToTemp();
-		}).setHelp(_("Merge all locked nodes into a temporary editable node, unlocking and hiding the originals"));
+		.addArg({"onlyselected", command::ArgType::String, true, "", "Pass 'onlyselected' to merge only locked nodes without including enclosed nodes"})
+		.setHandler([&] (const command::CommandArgs& args) {
+			const core::String &mode = args.str("onlyselected");
+			const bool onlySelected = (mode == "onlyselected");
+			mergeLockedToTemp(onlySelected);
+		}).setHelp(_("Merge locked nodes (and any enclosed nodes) into a temporary editable node. Use 'onlyselected' to merge only locked nodes"));
 
 	command::Command::registerCommand("undo")
 		.setHandler([&] (const command::CommandArgs& args) {
