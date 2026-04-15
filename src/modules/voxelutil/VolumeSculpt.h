@@ -324,6 +324,15 @@ void sculptSmoothWall(voxel::BitVolume &solid, voxel::SparseVolume &voxelMap, co
 					  bool fillHoles = true);
 
 /**
+ * @brief Smooth wall using RawVolume as color source (fast path -- no SparseVolume allocation).
+ */
+void sculptSmoothWall(voxel::BitVolume &solid, voxel::RawVolume &colorVolume, const voxel::BitVolume &anchors,
+					  voxel::FaceNames face, int iterations, const voxel::Voxel &fillVoxel,
+					  int removeAboveDepth = 0, SmoothWallInterp interp = SmoothWallInterp::InverseDistance,
+					  bool fillHoles = true);
+
+
+/**
  * @brief Smooth wall on a volume region along a face normal.
  *
  * @return The number of voxels changed.

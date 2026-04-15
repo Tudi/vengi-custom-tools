@@ -1020,8 +1020,10 @@ void sculptSmoothGaussian(voxel::BitVolume &solid, voxel::SparseVolume &voxelMap
 	}
 }
 
-// Fill a single voxel position: mark solid in BitVolume and copy color from nearest neighbor
-static void fillSmoothWallVoxel(voxel::BitVolume &solid, voxel::SparseVolume &voxelMap,
+// Fill a single voxel position: mark solid in BitVolume and copy color from nearest neighbor.
+// Templated to work with SparseVolume (full path) or RawVolume (fast path).
+template<typename ColorSource>
+static void fillSmoothWallVoxel(voxel::BitVolume &solid, ColorSource &colorSource,
 								const glm::ivec3 &pos, const voxel::Voxel &fillVoxel) {
 	if (solid.hasValue(pos.x, pos.y, pos.z)) {
 		return;
@@ -1030,21 +1032,19 @@ static void fillSmoothWallVoxel(voxel::BitVolume &solid, voxel::SparseVolume &vo
 	voxel::Voxel newVoxel = fillVoxel;
 	for (const glm::ivec3 &offset : voxel::arrayPathfinderFaces) {
 		const glm::ivec3 neighbor = pos + offset;
-		if (voxelMap.hasVoxel(neighbor)) {
-			newVoxel = voxelMap.voxel(neighbor);
+		const voxel::Voxel &nv = colorSource.voxel(neighbor);
+		if (voxel::isBlocked(nv.getMaterial())) {
+			newVoxel = nv;
 			break;
 		}
 	}
-	voxelMap.setVoxel(pos, newVoxel);
+	colorSource.setVoxel(pos, newVoxel);
 }
 
-void sculptSmoothWall(voxel::BitVolume &solid, voxel::SparseVolume &voxelMap, const voxel::BitVolume &anchors,
+template<typename ColorSource>
+static void sculptSmoothWallImpl(voxel::BitVolume &solid, ColorSource &colorSource, const voxel::BitVolume &anchors,
 					  voxel::FaceNames face, int iterations, const voxel::Voxel &fillVoxel,
 					  int removeAboveDepth, SmoothWallInterp interp, bool fillHoles) {
-	if (face == voxel::FaceNames::Max || iterations < 1) {
-		return;
-	}
-
 	core_trace_scoped(SculptSmoothWall);
 
 	const int axisIdx = math::getIndexForAxis(voxel::faceToAxis(face));
@@ -1102,7 +1102,7 @@ void sculptSmoothWall(voxel::BitVolume &solid, voxel::SparseVolume &voxelMap, co
 	}
 
 	for (int iter = 0; iter < iterations; ++iter) {
-		// Step 1: Build column top/bottom from the solid BitVolume only.
+		// Step 1: Build column top/bottom from the solid BitVolume only (parallel).
 		// Anchor voxels (non-selected solid neighbors) are intentionally excluded:
 		// they are not in solid and cannot be cleared, so including them in the
 		// height scan causes colTopArr to reflect positions that the clear loop
@@ -1112,36 +1112,38 @@ void sculptSmoothWall(voxel::BitVolume &solid, voxel::SparseVolume &voxelMap, co
 			colBotArr[idx] = EMPTY;
 		}
 
-		for (int iu = 0; iu < extentU; ++iu) {
-			for (int iv = 0; iv < extentV; ++iv) {
-				const int flatIdx = iu * extentV + iv;
-				const int coordU = baseU + iu;
-				const int coordV = baseV + iv;
-				int topVal = EMPTY;
-				int botVal = EMPTY;
-				for (int av = axisLo; av <= axisHi; ++av) {
-					glm::ivec3 pos;
-					pos[uAxis] = coordU;
-					pos[vAxis] = coordV;
-					pos[axisIdx] = av;
-					if (!solid.hasValue(pos.x, pos.y, pos.z)) {
-						continue;
+		app::for_parallel(0, extentU, [&](int startRow, int endRow) {
+			for (int iu = startRow; iu < endRow; ++iu) {
+				for (int iv = 0; iv < extentV; ++iv) {
+					const int flatIdx = iu * extentV + iv;
+					const int coordU = baseU + iu;
+					const int coordV = baseV + iv;
+					int topVal = EMPTY;
+					int botVal = EMPTY;
+					for (int av = axisLo; av <= axisHi; ++av) {
+						glm::ivec3 pos;
+						pos[uAxis] = coordU;
+						pos[vAxis] = coordV;
+						pos[axisIdx] = av;
+						if (!solid.hasValue(pos.x, pos.y, pos.z)) {
+							continue;
+						}
+						if (topVal == EMPTY) {
+							topVal = av;
+							botVal = av;
+						} else if (positiveUp) {
+							topVal = glm::max(topVal, av);
+							botVal = glm::min(botVal, av);
+						} else {
+							topVal = glm::min(topVal, av);
+							botVal = glm::max(botVal, av);
+						}
 					}
-					if (topVal == EMPTY) {
-						topVal = av;
-						botVal = av;
-					} else if (positiveUp) {
-						topVal = glm::max(topVal, av);
-						botVal = glm::min(botVal, av);
-					} else {
-						topVal = glm::min(topVal, av);
-						botVal = glm::max(botVal, av);
-					}
+					colTopArr[flatIdx] = topVal;
+					colBotArr[flatIdx] = botVal;
 				}
-				colTopArr[flatIdx] = topVal;
-				colBotArr[flatIdx] = botVal;
 			}
-		}
+		});
 
 		// Step 1.5 (fillHoles only): BFS from boundary to identify exterior-empty columns.
 		// Interior-empty columns (holes) are those not reachable from outside.
@@ -1232,197 +1234,203 @@ void sculptSmoothWall(voxel::BitVolume &solid, voxel::SparseVolume &voxelMap, co
 		// Sweep precomputation: for each column, find nearest edge in 4 directions.
 		// Each sweep is O(extentU * extentV), total O(N) instead of O(N * sqrt(N)).
 
-		// Left (-U) and Right (+U) sweeps: for each row iv, sweep along iu.
+		// Left (-U) and Right (+U) sweeps: for each row iv, sweep along iu (parallel).
 		// fillHoles=true: holes (interior empty) are transparent -- only exterior-empty resets.
 		// fillHoles=false: any empty column resets (current behavior).
-		for (int iv = 0; iv < extentV; ++iv) {
-			// Left sweep: iu = 0 to extentU-1
-			int lastEdgeHeight = EMPTY;
-			int lastEdgeDist = 0;
-			for (int iu = 0; iu < extentU; ++iu) {
-				const int flatIdx = iu * extentV + iv;
-				const bool shouldReset = fillHoles ? isExteriorEmpty[flatIdx] : (colTopArr[flatIdx] == EMPTY);
-				if (shouldReset) {
-					lastEdgeHeight = EMPTY;
-				} else if (isEdgeArr[flatIdx]) {
-					lastEdgeHeight = colTopArr[flatIdx];
-					lastEdgeDist = 0;
+		app::for_parallel(0, extentV, [&](int startIv, int endIv) {
+			for (int iv = startIv; iv < endIv; ++iv) {
+				// Left sweep: iu = 0 to extentU-1
+				int lastEdgeHeight = EMPTY;
+				int lastEdgeDist = 0;
+				for (int iu = 0; iu < extentU; ++iu) {
+					const int flatIdx = iu * extentV + iv;
+					const bool shouldReset = fillHoles ? isExteriorEmpty[flatIdx] : (colTopArr[flatIdx] == EMPTY);
+					if (shouldReset) {
+						lastEdgeHeight = EMPTY;
+					} else if (isEdgeArr[flatIdx]) {
+						lastEdgeHeight = colTopArr[flatIdx];
+						lastEdgeDist = 0;
+					}
+					if (lastEdgeHeight != EMPTY) {
+						++lastEdgeDist;
+					}
+					nearEdgeHeightLeft[flatIdx] = lastEdgeHeight;
+					nearEdgeDistLeft[flatIdx] = lastEdgeDist;
 				}
-				if (lastEdgeHeight != EMPTY) {
-					++lastEdgeDist;
+				// Right sweep: iu = extentU-1 to 0
+				lastEdgeHeight = EMPTY;
+				lastEdgeDist = 0;
+				for (int iu = extentU - 1; iu >= 0; --iu) {
+					const int flatIdx = iu * extentV + iv;
+					const bool shouldReset = fillHoles ? isExteriorEmpty[flatIdx] : (colTopArr[flatIdx] == EMPTY);
+					if (shouldReset) {
+						lastEdgeHeight = EMPTY;
+					} else if (isEdgeArr[flatIdx]) {
+						lastEdgeHeight = colTopArr[flatIdx];
+						lastEdgeDist = 0;
+					}
+					if (lastEdgeHeight != EMPTY) {
+						++lastEdgeDist;
+					}
+					nearEdgeHeightRight[flatIdx] = lastEdgeHeight;
+					nearEdgeDistRight[flatIdx] = lastEdgeDist;
 				}
-				nearEdgeHeightLeft[flatIdx] = lastEdgeHeight;
-				nearEdgeDistLeft[flatIdx] = lastEdgeDist;
 			}
-			// Right sweep: iu = extentU-1 to 0
-			lastEdgeHeight = EMPTY;
-			lastEdgeDist = 0;
-			for (int iu = extentU - 1; iu >= 0; --iu) {
-				const int flatIdx = iu * extentV + iv;
-				const bool shouldReset = fillHoles ? isExteriorEmpty[flatIdx] : (colTopArr[flatIdx] == EMPTY);
-				if (shouldReset) {
-					lastEdgeHeight = EMPTY;
-				} else if (isEdgeArr[flatIdx]) {
-					lastEdgeHeight = colTopArr[flatIdx];
-					lastEdgeDist = 0;
+		});
+		// Top (-V) and Bottom (+V) sweeps: for each column iu, sweep along iv (parallel).
+		app::for_parallel(0, extentU, [&](int startIu, int endIu) {
+			for (int iu = startIu; iu < endIu; ++iu) {
+				// Top sweep: iv = 0 to extentV-1
+				int lastEdgeHeight = EMPTY;
+				int lastEdgeDist = 0;
+				for (int iv = 0; iv < extentV; ++iv) {
+					const int flatIdx = iu * extentV + iv;
+					const bool shouldReset = fillHoles ? isExteriorEmpty[flatIdx] : (colTopArr[flatIdx] == EMPTY);
+					if (shouldReset) {
+						lastEdgeHeight = EMPTY;
+					} else if (isEdgeArr[flatIdx]) {
+						lastEdgeHeight = colTopArr[flatIdx];
+						lastEdgeDist = 0;
+					}
+					if (lastEdgeHeight != EMPTY) {
+						++lastEdgeDist;
+					}
+					nearEdgeHeightTop[flatIdx] = lastEdgeHeight;
+					nearEdgeDistTop[flatIdx] = lastEdgeDist;
 				}
-				if (lastEdgeHeight != EMPTY) {
-					++lastEdgeDist;
+				// Bottom sweep: iv = extentV-1 to 0
+				lastEdgeHeight = EMPTY;
+				lastEdgeDist = 0;
+				for (int iv = extentV - 1; iv >= 0; --iv) {
+					const int flatIdx = iu * extentV + iv;
+					const bool shouldReset = fillHoles ? isExteriorEmpty[flatIdx] : (colTopArr[flatIdx] == EMPTY);
+					if (shouldReset) {
+						lastEdgeHeight = EMPTY;
+					} else if (isEdgeArr[flatIdx]) {
+						lastEdgeHeight = colTopArr[flatIdx];
+						lastEdgeDist = 0;
+					}
+					if (lastEdgeHeight != EMPTY) {
+						++lastEdgeDist;
+					}
+					nearEdgeHeightBottom[flatIdx] = lastEdgeHeight;
+					nearEdgeDistBottom[flatIdx] = lastEdgeDist;
 				}
-				nearEdgeHeightRight[flatIdx] = lastEdgeHeight;
-				nearEdgeDistRight[flatIdx] = lastEdgeDist;
 			}
-		}
-		// Top (-V) and Bottom (+V) sweeps: for each column iu, sweep along iv
-		for (int iu = 0; iu < extentU; ++iu) {
-			// Top sweep: iv = 0 to extentV-1
-			int lastEdgeHeight = EMPTY;
-			int lastEdgeDist = 0;
-			for (int iv = 0; iv < extentV; ++iv) {
-				const int flatIdx = iu * extentV + iv;
-				const bool shouldReset = fillHoles ? isExteriorEmpty[flatIdx] : (colTopArr[flatIdx] == EMPTY);
-				if (shouldReset) {
-					lastEdgeHeight = EMPTY;
-				} else if (isEdgeArr[flatIdx]) {
-					lastEdgeHeight = colTopArr[flatIdx];
-					lastEdgeDist = 0;
-				}
-				if (lastEdgeHeight != EMPTY) {
-					++lastEdgeDist;
-				}
-				nearEdgeHeightTop[flatIdx] = lastEdgeHeight;
-				nearEdgeDistTop[flatIdx] = lastEdgeDist;
-			}
-			// Bottom sweep: iv = extentV-1 to 0
-			lastEdgeHeight = EMPTY;
-			lastEdgeDist = 0;
-			for (int iv = extentV - 1; iv >= 0; --iv) {
-				const int flatIdx = iu * extentV + iv;
-				const bool shouldReset = fillHoles ? isExteriorEmpty[flatIdx] : (colTopArr[flatIdx] == EMPTY);
-				if (shouldReset) {
-					lastEdgeHeight = EMPTY;
-				} else if (isEdgeArr[flatIdx]) {
-					lastEdgeHeight = colTopArr[flatIdx];
-					lastEdgeDist = 0;
-				}
-				if (lastEdgeHeight != EMPTY) {
-					++lastEdgeDist;
-				}
-				nearEdgeHeightBottom[flatIdx] = lastEdgeHeight;
-				nearEdgeDistBottom[flatIdx] = lastEdgeDist;
-			}
-		}
+		});
 
-		// Compute target for each interior column using precomputed nearest edges.
+		// Compute target for each interior column using precomputed nearest edges (parallel).
 		// fillHoles=true: also compute targets for interior-hole columns (EMPTY, not exterior-empty).
 		// fillHoles=false: only process solid interior columns.
-		for (int iu = 0; iu < extentU; ++iu) {
-			for (int iv = 0; iv < extentV; ++iv) {
-				const int flatIdx = iu * extentV + iv;
-				if (fillHoles) {
-					if (isExteriorEmpty[flatIdx] || isEdgeArr[flatIdx]) {
-						continue;
+		app::for_parallel(0, extentU, [&](int startIu, int endIu) {
+			for (int iu = startIu; iu < endIu; ++iu) {
+				for (int iv = 0; iv < extentV; ++iv) {
+					const int flatIdx = iu * extentV + iv;
+					if (fillHoles) {
+						if (isExteriorEmpty[flatIdx] || isEdgeArr[flatIdx]) {
+							continue;
+						}
+					} else {
+						if (colTopArr[flatIdx] == EMPTY || isEdgeArr[flatIdx]) {
+							continue;
+						}
 					}
-				} else {
-					if (colTopArr[flatIdx] == EMPTY || isEdgeArr[flatIdx]) {
-						continue;
-					}
-				}
 
-				const int edgeLeft = nearEdgeHeightLeft[flatIdx];
-				const int distLeft = nearEdgeDistLeft[flatIdx];
-				const int edgeRight = nearEdgeHeightRight[flatIdx];
-				const int distRight = nearEdgeDistRight[flatIdx];
-				const int edgeTop = nearEdgeHeightTop[flatIdx];
-				const int distTop = nearEdgeDistTop[flatIdx];
-				const int edgeBottom = nearEdgeHeightBottom[flatIdx];
-				const int distBottom = nearEdgeDistBottom[flatIdx];
+					const int edgeLeft = nearEdgeHeightLeft[flatIdx];
+					const int distLeft = nearEdgeDistLeft[flatIdx];
+					const int edgeRight = nearEdgeHeightRight[flatIdx];
+					const int distRight = nearEdgeDistRight[flatIdx];
+					const int edgeTop = nearEdgeHeightTop[flatIdx];
+					const int distTop = nearEdgeDistTop[flatIdx];
+					const int edgeBottom = nearEdgeHeightBottom[flatIdx];
+					const int distBottom = nearEdgeDistBottom[flatIdx];
 
-				// Count valid edges
-				int edgeCount = 0;
-				int edgeHeights[4];
-				int edgeDists[4];
-				if (edgeLeft != EMPTY) {
-					edgeHeights[edgeCount] = edgeLeft;
-					edgeDists[edgeCount] = distLeft;
-					++edgeCount;
-				}
-				if (edgeRight != EMPTY) {
-					edgeHeights[edgeCount] = edgeRight;
-					edgeDists[edgeCount] = distRight;
-					++edgeCount;
-				}
-				if (edgeTop != EMPTY) {
-					edgeHeights[edgeCount] = edgeTop;
-					edgeDists[edgeCount] = distTop;
-					++edgeCount;
-				}
-				if (edgeBottom != EMPTY) {
-					edgeHeights[edgeCount] = edgeBottom;
-					edgeDists[edgeCount] = distBottom;
-					++edgeCount;
-				}
-
-				if (edgeCount < 2) {
-					continue;
-				}
-
-				int target;
-				if (interp == SmoothWallInterp::Linear && edgeLeft != EMPTY && edgeRight != EMPTY
-					&& edgeTop != EMPTY && edgeBottom != EMPTY) {
-					// Bilinear: lerp along each axis, then average
-					const int totalU = distLeft + distRight;
-					const int totalV = distTop + distBottom;
-					const int64_t interpU = ((int64_t)edgeLeft * distRight + (int64_t)edgeRight * distLeft
-											  + totalU / 2) / totalU;
-					const int64_t interpV = ((int64_t)edgeTop * distBottom + (int64_t)edgeBottom * distTop
-											  + totalV / 2) / totalV;
-					target = (int)((interpU + interpV + 1) / 2);
-				} else if (interp == SmoothWallInterp::EdgeAware && edgeCount >= 2) {
-					// Edge-aware IDW: weight = 1 / (dist * (1 + gradientAlongAxis)).
-					// Flat-wall axis pairs (small gradient) get stronger influence.
-					const float gradientU = (edgeLeft != EMPTY && edgeRight != EMPTY)
-						? (float)glm::abs(edgeLeft - edgeRight) : 0.0f;
-					const float gradientV = (edgeTop != EMPTY && edgeBottom != EMPTY)
-						? (float)glm::abs(edgeTop - edgeBottom) : 0.0f;
-					float totalWeight = 0.0f;
-					float weightedHeight = 0.0f;
+					// Count valid edges
+					int edgeCount = 0;
+					int edgeHeights[4];
+					int edgeDists[4];
 					if (edgeLeft != EMPTY) {
-						const float w = 1.0f / ((float)distLeft * (1.0f + gradientU));
-						totalWeight += w;
-						weightedHeight += (float)edgeLeft * w;
+						edgeHeights[edgeCount] = edgeLeft;
+						edgeDists[edgeCount] = distLeft;
+						++edgeCount;
 					}
 					if (edgeRight != EMPTY) {
-						const float w = 1.0f / ((float)distRight * (1.0f + gradientU));
-						totalWeight += w;
-						weightedHeight += (float)edgeRight * w;
+						edgeHeights[edgeCount] = edgeRight;
+						edgeDists[edgeCount] = distRight;
+						++edgeCount;
 					}
 					if (edgeTop != EMPTY) {
-						const float w = 1.0f / ((float)distTop * (1.0f + gradientV));
-						totalWeight += w;
-						weightedHeight += (float)edgeTop * w;
+						edgeHeights[edgeCount] = edgeTop;
+						edgeDists[edgeCount] = distTop;
+						++edgeCount;
 					}
 					if (edgeBottom != EMPTY) {
-						const float w = 1.0f / ((float)distBottom * (1.0f + gradientV));
-						totalWeight += w;
-						weightedHeight += (float)edgeBottom * w;
+						edgeHeights[edgeCount] = edgeBottom;
+						edgeDists[edgeCount] = distBottom;
+						++edgeCount;
 					}
-					target = (int)glm::round(weightedHeight / totalWeight);
-				} else {
-					// IDW fallback (also used for Linear when not all 4 edges found)
-					float totalWeight = 0.0f;
-					float weightedHeight = 0.0f;
-					for (int ei = 0; ei < edgeCount; ++ei) {
-						const float w = 1.0f / (float)edgeDists[ei];
-						totalWeight += w;
-						weightedHeight += (float)edgeHeights[ei] * w;
-					}
-					target = (int)glm::round(weightedHeight / totalWeight);
-				}
 
-				targetArr[flatIdx] = target;
+					if (edgeCount < 2) {
+						continue;
+					}
+
+					int target;
+					if (interp == SmoothWallInterp::Linear && edgeLeft != EMPTY && edgeRight != EMPTY
+						&& edgeTop != EMPTY && edgeBottom != EMPTY) {
+						// Bilinear: lerp along each axis, then average
+						const int totalU = distLeft + distRight;
+						const int totalV = distTop + distBottom;
+						const int64_t interpU = ((int64_t)edgeLeft * distRight + (int64_t)edgeRight * distLeft
+												  + totalU / 2) / totalU;
+						const int64_t interpV = ((int64_t)edgeTop * distBottom + (int64_t)edgeBottom * distTop
+												  + totalV / 2) / totalV;
+						target = (int)((interpU + interpV + 1) / 2);
+					} else if (interp == SmoothWallInterp::EdgeAware && edgeCount >= 2) {
+						// Edge-aware IDW: weight = 1 / (dist * (1 + gradientAlongAxis)).
+						// Flat-wall axis pairs (small gradient) get stronger influence.
+						const float gradientU = (edgeLeft != EMPTY && edgeRight != EMPTY)
+							? (float)glm::abs(edgeLeft - edgeRight) : 0.0f;
+						const float gradientV = (edgeTop != EMPTY && edgeBottom != EMPTY)
+							? (float)glm::abs(edgeTop - edgeBottom) : 0.0f;
+						float totalWeight = 0.0f;
+						float weightedHeight = 0.0f;
+						if (edgeLeft != EMPTY) {
+							const float w = 1.0f / ((float)distLeft * (1.0f + gradientU));
+							totalWeight += w;
+							weightedHeight += (float)edgeLeft * w;
+						}
+						if (edgeRight != EMPTY) {
+							const float w = 1.0f / ((float)distRight * (1.0f + gradientU));
+							totalWeight += w;
+							weightedHeight += (float)edgeRight * w;
+						}
+						if (edgeTop != EMPTY) {
+							const float w = 1.0f / ((float)distTop * (1.0f + gradientV));
+							totalWeight += w;
+							weightedHeight += (float)edgeTop * w;
+						}
+						if (edgeBottom != EMPTY) {
+							const float w = 1.0f / ((float)distBottom * (1.0f + gradientV));
+							totalWeight += w;
+							weightedHeight += (float)edgeBottom * w;
+						}
+						target = (int)glm::round(weightedHeight / totalWeight);
+					} else {
+						// IDW fallback (also used for Linear when not all 4 edges found)
+						float totalWeight = 0.0f;
+						float weightedHeight = 0.0f;
+						for (int ei = 0; ei < edgeCount; ++ei) {
+							const float w = 1.0f / (float)edgeDists[ei];
+							totalWeight += w;
+							weightedHeight += (float)edgeHeights[ei] * w;
+						}
+						target = (int)glm::round(weightedHeight / totalWeight);
+					}
+
+					targetArr[flatIdx] = target;
+				}
 			}
-		}
+		});
 
 		// Step 3: Enforce the smooth surface for each interior column.
 		// - Make solid from column bottom up to target (fill gaps)
@@ -1457,7 +1465,7 @@ void sculptSmoothWall(voxel::BitVolume &solid, voxel::SparseVolume &voxelMap, co
 					pos[vAxis] = coordV;
 					pos[axisIdx] = av;
 					if (region.containsPoint(pos)) {
-						fillSmoothWallVoxel(solid, voxelMap, pos, fillVoxel);
+						fillSmoothWallVoxel(solid, colorSource, pos, fillVoxel);
 					}
 				}
 
@@ -1477,7 +1485,7 @@ void sculptSmoothWall(voxel::BitVolume &solid, voxel::SparseVolume &voxelMap, co
 						pos[axisIdx] = av;
 						if (solid.hasValue(pos.x, pos.y, pos.z)) {
 							solid.setVoxel(pos, false);
-							voxelMap.setVoxel(pos, voxel::Voxel());
+							colorSource.setVoxel(pos, voxel::Voxel());
 						}
 					}
 				}
@@ -1537,13 +1545,26 @@ void sculptSmoothWall(voxel::BitVolume &solid, voxel::SparseVolume &voxelMap, co
 					pos[vAxis] = coordV;
 					pos[axisIdx] = av;
 					if (region.containsPoint(pos)) {
-						fillSmoothWallVoxel(solid, voxelMap, pos, fillVoxel);
+						fillSmoothWallVoxel(solid, colorSource, pos, fillVoxel);
 					}
 				}
 			}
 		}
 	}
 }
+
+void sculptSmoothWall(voxel::BitVolume &solid, voxel::SparseVolume &voxelMap, const voxel::BitVolume &anchors,
+					  voxel::FaceNames face, int iterations, const voxel::Voxel &fillVoxel,
+					  int removeAboveDepth, SmoothWallInterp interp, bool fillHoles) {
+	sculptSmoothWallImpl(solid, voxelMap, anchors, face, iterations, fillVoxel, removeAboveDepth, interp, fillHoles);
+}
+
+void sculptSmoothWall(voxel::BitVolume &solid, voxel::RawVolume &colorVolume, const voxel::BitVolume &anchors,
+					  voxel::FaceNames face, int iterations, const voxel::Voxel &fillVoxel,
+					  int removeAboveDepth, SmoothWallInterp interp, bool fillHoles) {
+	sculptSmoothWallImpl(solid, colorVolume, anchors, face, iterations, fillVoxel, removeAboveDepth, interp, fillHoles);
+}
+
 
 void sculptSquashToPlane(voxel::BitVolume &solid, voxel::SparseVolume &voxelMap, voxel::FaceNames face,
 						 int planeCoord) {

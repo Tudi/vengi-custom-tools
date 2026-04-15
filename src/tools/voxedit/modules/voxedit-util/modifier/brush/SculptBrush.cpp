@@ -79,6 +79,7 @@ void SculptBrush::reset() {
 	_historyEntries.clear();
 	_historyRegion = voxel::Region::InvalidRegion;
 	_cachedBitVolumeValid = false;
+	_cachedVoxelMapValid = false;
 	_snapshotRegion = voxel::Region::InvalidRegion;
 	_cachedRegion = voxel::Region::InvalidRegion;
 	_cachedRegionValid = false;
@@ -245,6 +246,7 @@ void SculptBrush::captureSnapshot(const voxel::RawVolume *volume, const voxel::R
 	_capturedVolumeLower = volRegion.getLowerCorner();
 	_hasSnapshot = true;
 	_cachedBitVolumeValid = false;
+	_cachedVoxelMapValid = false;
 }
 
 void SculptBrush::adjustSnapshotForRegionShift(const glm::ivec3 &delta) {
@@ -266,6 +268,7 @@ void SculptBrush::adjustSnapshotForRegionShift(const glm::ivec3 &delta) {
 		_historyRegion.shift(delta.x, delta.y, delta.z);
 	}
 	_cachedBitVolumeValid = false;
+	_cachedVoxelMapValid = false;
 }
 
 void SculptBrush::saveToHistory(voxel::RawVolume *vol, const glm::ivec3 &pos) {
@@ -300,6 +303,19 @@ void SculptBrush::rebuildCachedBitVolume() {
 		_cachedBitVolume.setVoxel(entry.pos.x, entry.pos.y, entry.pos.z, true);
 	}
 	_cachedBitVolumeValid = true;
+	_cachedVoxelMapValid = false;
+}
+
+void SculptBrush::rebuildCachedVoxelMap() {
+	if (_cachedVoxelMapValid) {
+		return;
+	}
+	core_trace_scoped(SculptBrushRebuildVoxelMap);
+	_cachedVoxelMap.clear();
+	for (const voxel::VoxelPosition &entry : _snapshotEntries) {
+		_cachedVoxelMap.setVoxel(entry.pos, entry.voxel);
+	}
+	_cachedVoxelMapValid = true;
 }
 
 void SculptBrush::applySculpt(ModifierVolumeWrapper &wrapper, const BrushContext &ctx) {
@@ -368,6 +384,89 @@ void SculptBrush::applySculpt(ModifierVolumeWrapper &wrapper, const BrushContext
 		return;
 	}
 
+	// ---- SmoothWall fast path ----
+	// Use a temporary RawVolume (flat array) instead of SparseVolume (hash map).
+	// Population is O(N) array-index writes vs O(N) hash insertions - orders of magnitude faster.
+	if (_sculptMode == SculptMode::SmoothWall && _flattenFace != voxel::FaceNames::Max) {
+		rebuildCachedBitVolume();
+		voxel::BitVolume currentSolid(_cachedBitVolume);
+
+		voxel::RawVolume *vol = wrapper.volume();
+		const voxel::Region &volRegion = vol->region();
+
+		// Build anchors
+		voxel::Region anchorRegion = _snapshotRegion;
+		anchorRegion.grow(1);
+		anchorRegion.cropTo(volRegion);
+		voxel::BitVolume anchorSolid(anchorRegion);
+		const glm::ivec3 &snapLo = _snapshotRegion.getLowerCorner();
+		const glm::ivec3 &snapHi = _snapshotRegion.getUpperCorner();
+		for (int z = snapLo.z; z <= snapHi.z; ++z) {
+			for (int y = snapLo.y; y <= snapHi.y; ++y) {
+				for (int x = snapLo.x; x <= snapHi.x; ++x) {
+					if (!currentSolid.hasValue(x, y, z)) {
+						continue;
+					}
+					for (const glm::ivec3 &offset : voxel::arrayPathfinderFaces) {
+						const glm::ivec3 neighbor = glm::ivec3(x, y, z) + offset;
+						if (currentSolid.hasValue(neighbor.x, neighbor.y, neighbor.z)) {
+							continue;
+						}
+						if (!volRegion.containsPoint(neighbor)) {
+							continue;
+						}
+						const voxel::Voxel &v = vol->voxel(neighbor);
+						if (voxel::isBlocked(v.getMaterial()) && !(v.getFlags() & voxel::FlagOutline)) {
+							anchorSolid.setVoxel(neighbor, true);
+						}
+					}
+				}
+			}
+		}
+
+		// Build a temporary RawVolume for color data - flat array, no hashing
+		voxel::RawVolume colorVolume(_snapshotRegion);
+		for (const voxel::VoxelPosition &entry : _snapshotEntries) {
+			colorVolume.setVoxel(entry.pos, entry.voxel);
+		}
+
+		voxel::Voxel fillVoxel = ctx.cursorVoxel;
+		fillVoxel.setFlags(voxel::FlagOutline);
+		static constexpr int smoothWallIterations = 1;
+		voxelutil::sculptSmoothWall(currentSolid, colorVolume, anchorSolid, _flattenFace, smoothWallIterations,
+									fillVoxel, _smoothWallClearDepth, _smoothWallInterp, _smoothWallFillHoles);
+
+		// Write-back: compare before/after BitVolumes, read colors from colorVolume
+		const voxel::Voxel air;
+		for (const voxel::VoxelPosition &entry : _snapshotEntries) {
+			if (!currentSolid.hasValue(entry.pos.x, entry.pos.y, entry.pos.z)) {
+				writeVoxel(wrapper, entry.pos, air);
+			}
+		}
+		// Added entries: in currentSolid but not in snapshot
+		const glm::ivec3 &workLo = _snapshotRegion.getLowerCorner();
+		const glm::ivec3 &workHi = _snapshotRegion.getUpperCorner();
+		for (int z = workLo.z; z <= workHi.z; ++z) {
+			for (int y = workLo.y; y <= workHi.y; ++y) {
+				for (int x = workLo.x; x <= workHi.x; ++x) {
+					if (!currentSolid.hasValue(x, y, z)) {
+						continue;
+					}
+					if (_cachedBitVolume.hasValue(x, y, z)) {
+						continue;
+					}
+					const glm::ivec3 pos(x, y, z);
+					voxel::Voxel v = colorVolume.voxel(pos);
+					if (voxel::isBlocked(v.getMaterial())) {
+						v.setFlags(voxel::FlagOutline);
+						writeVoxel(wrapper, pos, v);
+					}
+				}
+			}
+		}
+		return;
+	}
+
 	// ---- Generic path for all other sculpt modes ----
 	voxel::Region workRegion = _snapshotRegion;
 
@@ -375,16 +474,14 @@ void SculptBrush::applySculpt(ModifierVolumeWrapper &wrapper, const BrushContext
 	// Skip the expensive O(N) SparseVolume construction for it.
 	const bool needsVoxelMap = _sculptMode != SculptMode::Erode;
 
-	// Build BitVolume from cached entries. Only build SparseVolume when the mode needs it.
-	voxel::BitVolume currentSolid(workRegion);
+	// Reuse cached BitVolume (copy is cheap bit memcpy, since sculpt mutates it).
+	// Build cached SparseVolume once and deep-copy on each call.
+	rebuildCachedBitVolume();
+	voxel::BitVolume currentSolid(_cachedBitVolume);
 	voxel::SparseVolume voxelMap;
-	for (const voxel::VoxelPosition &entry : _snapshotEntries) {
-		currentSolid.setVoxel(entry.pos.x, entry.pos.y, entry.pos.z, true);
-	}
 	if (needsVoxelMap) {
-		for (const voxel::VoxelPosition &entry : _snapshotEntries) {
-			voxelMap.setVoxel(entry.pos, entry.voxel);
-		}
+		rebuildCachedVoxelMap();
+		_cachedVoxelMap.copyTo(voxelMap);
 	}
 
 	voxel::RawVolume *vol = wrapper.volume();
@@ -393,8 +490,7 @@ void SculptBrush::applySculpt(ModifierVolumeWrapper &wrapper, const BrushContext
 	// Build anchor set only for modes that use it
 	const bool needsAnchors = _sculptMode == SculptMode::Erode || _sculptMode == SculptMode::Grow ||
 							  _sculptMode == SculptMode::SmoothAdditive || _sculptMode == SculptMode::SmoothErode ||
-							  _sculptMode == SculptMode::SmoothGaussian || _sculptMode == SculptMode::BridgeGap ||
-							  _sculptMode == SculptMode::SmoothWall;
+							  _sculptMode == SculptMode::SmoothGaussian || _sculptMode == SculptMode::BridgeGap;
 	voxel::Region anchorRegion = _snapshotRegion;
 	anchorRegion.grow(1);
 	anchorRegion.cropTo(volRegion);
@@ -426,10 +522,7 @@ void SculptBrush::applySculpt(ModifierVolumeWrapper &wrapper, const BrushContext
 		}
 	}
 
-	// Save snapshot positions as a BitVolume before sculpt modifies currentSolid.
-	// Used later to distinguish original vs newly grown positions (O(1) bit test).
-	voxel::BitVolume snapshotSolid(currentSolid);
-
+	// Use _cachedBitVolume as snapshot reference (never mutated, avoids a full BitVolume copy).
 	if (_sculptMode == SculptMode::Erode) {
 		voxelutil::sculptErode(currentSolid, voxelMap, anchorSolid, _strength, _iterations);
 	} else if (_sculptMode == SculptMode::Grow) {
@@ -457,12 +550,6 @@ void SculptBrush::applySculpt(ModifierVolumeWrapper &wrapper, const BrushContext
 		voxelutil::sculptBridgeGap(currentSolid, voxelMap, anchorSolid, fillVoxel);
 	} else if (_sculptMode == SculptMode::SquashToPlane && _flattenFace != voxel::FaceNames::Max) {
 		voxelutil::sculptSquashToPlane(currentSolid, voxelMap, _flattenFace, _squashPlaneCoord);
-	} else if (_sculptMode == SculptMode::SmoothWall && _flattenFace != voxel::FaceNames::Max) {
-		voxel::Voxel fillVoxel = ctx.cursorVoxel;
-		fillVoxel.setFlags(voxel::FlagOutline);
-		static constexpr int smoothWallIterations = 1;
-		voxelutil::sculptSmoothWall(currentSolid, voxelMap, anchorSolid, _flattenFace, smoothWallIterations,
-									fillVoxel, _smoothWallClearDepth, _smoothWallInterp, _smoothWallFillHoles);
 	}
 
 	// Write-back: only write entries that actually CHANGED.
@@ -500,7 +587,7 @@ void SculptBrush::applySculpt(ModifierVolumeWrapper &wrapper, const BrushContext
 				if (!currentSolid.hasValue(x, y, z)) {
 					continue;
 				}
-				if (snapshotSolid.hasValue(x, y, z)) {
+				if (_cachedBitVolume.hasValue(x, y, z)) {
 					continue;
 				}
 				const glm::ivec3 pos(x, y, z);

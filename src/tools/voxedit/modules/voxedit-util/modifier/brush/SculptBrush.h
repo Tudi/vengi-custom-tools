@@ -12,6 +12,7 @@
 #include "palette/Palette.h"
 #include "voxel/BitVolume.h"
 #include "voxel/DynamicVoxelArray.h"
+#include "voxel/SparseVolume.h"
 #include "voxel/Face.h"
 #include "voxel/Voxel.h"
 #include "voxelutil/VolumeSculpt.h"
@@ -109,12 +110,15 @@ private:
 	voxel::BitVolume _historyBits;
 	voxel::Region _historyRegion;
 
-	// Cached BitVolume built from snapshot entries. Rebuilt when snapshot changes.
-	// Used by the Reskin fast path to avoid rebuilding O(N) data structures every frame.
+	// Cached data structures built from snapshot entries. Rebuilt when snapshot changes.
+	// Avoids rebuilding O(N) hash maps and bit arrays every frame.
 	bool _cachedBitVolumeValid = false;
 	voxel::BitVolume _cachedBitVolume;
+	voxel::SparseVolume _cachedVoxelMap;
+	bool _cachedVoxelMapValid = false;
 
 	void rebuildCachedBitVolume();
+	void rebuildCachedVoxelMap();
 
 	// Cached region for preview
 	voxel::Region _cachedRegion;
