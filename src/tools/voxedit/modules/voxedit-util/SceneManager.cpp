@@ -1779,6 +1779,7 @@ bool SceneManager::splatMerge(int sourceNodeId) {
 
 	memento::ScopedMementoGroup mementoGroup(_mementoHandler, "splatmerge");
 
+	core::DynamicArray<voxel::Region> stampedOverlaps;
 	int mergedCount = 0;
 	for (auto iter = _sceneGraph.beginModel(); iter != _sceneGraph.end(); ++iter) {
 		scenegraph::SceneGraphNode &targetNode = *iter;
@@ -1814,11 +1815,51 @@ bool SceneManager::splatMerge(int sourceNodeId) {
 			worldOverlap.getLowerCorner() + worldToLocal,
 			worldOverlap.getUpperCorner() + worldToLocal);
 
-		const int count = voxelutil::mergeVolumes(targetVolume, targetNode.palette(),
+		// Collect source color indices actually used by solid voxels in the overlap,
+		// then add only those colors to the target palette before merging.
+		palette::Palette &destPalette = targetNode.palette();
+		bool usedColors[palette::PaletteMaxColors] = {};
+		{
+			const glm::ivec3 &wLo = worldOverlap.getLowerCorner();
+			const glm::ivec3 &tLo = targetLocalOverlap.getLowerCorner();
+			const int32_t w = worldOverlap.getWidthInVoxels();
+			const int32_t h = worldOverlap.getHeightInVoxels();
+			const int32_t d = worldOverlap.getDepthInVoxels();
+			for (int32_t z = 0; z < d; ++z) {
+				for (int32_t y = 0; y < h; ++y) {
+					for (int32_t x = 0; x < w; ++x) {
+						const voxel::Voxel srcVoxel = worldSource->voxel(
+							wLo.x + x, wLo.y + y, wLo.z + z);
+						if (!voxel::isBlocked(srcVoxel.getMaterial())) {
+							continue;
+						}
+						const voxel::Voxel dstVoxel = targetVolume->voxel(
+							tLo.x + x, tLo.y + y, tLo.z + z);
+						if (voxel::isAir(dstVoxel.getMaterial())) {
+							usedColors[srcVoxel.getColor()] = true;
+						}
+					}
+				}
+			}
+		}
+		bool paletteChanged = false;
+		for (int i = 0; i < sourcePalette.colorCount(); ++i) {
+			if (usedColors[i]) {
+				if (destPalette.tryAdd(sourcePalette.color(i), false)) {
+					paletteChanged = true;
+				}
+			}
+		}
+		if (paletteChanged) {
+			destPalette.markDirty();
+		}
+
+		const int count = voxelutil::mergeVolumes(targetVolume, destPalette,
 			worldSource, sourcePalette, targetLocalOverlap, worldOverlap);
 		if (count > 0) {
 			modified(targetNode.id(), targetLocalOverlap, SceneModifiedFlags::All);
 			mergedCount += count;
+			stampedOverlaps.push_back(worldOverlap);
 		}
 	}
 
@@ -1828,6 +1869,51 @@ bool SceneManager::splatMerge(int sourceNodeId) {
 	}
 
 	Log::info("splatmerge: merged %i voxels into overlapping nodes", mergedCount);
+
+	// Erase stamped world regions from a working copy, then check for remainder voxels
+	// that had no coverage by any target node.
+	{
+		voxel::RawVolume workingCopy(*worldSource);
+		const voxel::Voxel airVoxel;
+		for (const auto &overlap : stampedOverlaps) {
+			for (int32_t z = overlap.getLowerZ(); z <= overlap.getUpperZ(); ++z) {
+				for (int32_t y = overlap.getLowerY(); y <= overlap.getUpperY(); ++y) {
+					for (int32_t x = overlap.getLowerX(); x <= overlap.getUpperX(); ++x) {
+						workingCopy.setVoxel(x, y, z, airVoxel);
+					}
+				}
+			}
+		}
+		const voxel::Region &srcReg = workingCopy.region();
+		const voxel::Voxel *voxels = workingCopy.voxels();
+		const int voxelCount =
+			srcReg.getWidthInVoxels() * srcReg.getHeightInVoxels() * srcReg.getDepthInVoxels();
+		bool hasRemainder = false;
+		for (int i = 0; i < voxelCount; ++i) {
+			if (!voxel::isAir(voxels[i].getMaterial())) {
+				hasRemainder = true;
+				break;
+			}
+		}
+		if (hasRemainder) {
+			voxel::RawVolume *remainder = voxelutil::cropVolume(&workingCopy);
+			if (remainder == nullptr) {
+				remainder = new voxel::RawVolume(workingCopy);
+			}
+			// Parent under root: remainder volume is in world-space coordinates (baked
+			// from source transform), so it must sit under a parent with identity transform.
+			const int remainderParentId = _sceneGraph.root().id();
+			scenegraph::SceneGraphNode remainderNode(scenegraph::SceneGraphNodeType::Model);
+			remainderNode.setVolume(remainder);
+			remainderNode.setPalette(sourcePalette);
+			remainderNode.setName(sourceNode->name());
+			const int newId = moveNodeToSceneGraph(remainderNode, remainderParentId);
+			if (newId != InvalidNodeId) {
+				modified(newId, remainder->region(), SceneModifiedFlags::All);
+			}
+		}
+	}
+
 	_mementoHandler.markNodeRemove(_sceneGraph, *sourceNode);
 	if (_sceneGraph.removeNode(sourceNodeId, false)) {
 		_sceneRenderer->removeNode(sourceNodeId);
@@ -3948,7 +4034,7 @@ void SceneManager::construct() {
 	command::Command::registerCommand("splatmerge")
 		.setHandler([&] (const command::CommandArgs&) {
 			splatMerge(activeNode());
-		}).setHelp(_("Merge active node voxels into all overlapping nodes and remove the source node"));
+		}).setHelp(_("Blend merge: merge active node voxels into all overlapping nodes"));
 
 	command::Command::registerCommand("mergeactivetobackground")
 		.setHandler([&] (const command::CommandArgs&) {
