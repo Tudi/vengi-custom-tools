@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include "core/collection/DynamicArray.h"
 #include "math/Axis.h"
 #include "voxel/BitVolume.h"
 #include "voxel/Face.h"
@@ -64,6 +65,15 @@ enum class ReskinTile : uint8_t {
 	Max
 };
 
+enum class ReskinAnchor : uint8_t {
+	TopLeft,     ///< Skin (0,0) maps to selection min-U, min-V corner
+	TopRight,    ///< Skin (0,0) maps to selection max-U, min-V corner
+	BottomLeft,  ///< Skin (0,0) maps to selection min-U, max-V corner
+	BottomRight, ///< Skin (0,0) maps to selection max-U, max-V corner
+
+	Max
+};
+
 /**
  * @brief Configuration for the reskin sculpt operation.
  */
@@ -84,8 +94,12 @@ struct ReskinConfig {
 	int maxRepeatU = 0;
 	/// Max repeat count for V tiling (0 = unlimited)
 	int maxRepeatV = 0;
-	/// Which axis of the skin volume is the depth/outward direction (auto-detected from thinnest axis on load)
-	math::Axis skinDepthAxis = math::Axis::Y;
+	/// Which face of the skin volume points outward. Encodes both the depth axis
+	/// and the reading direction (positive = read hi-to-lo, negative = read lo-to-hi).
+	/// Auto-detected from the thinnest axis on load; user can cycle through all 6.
+	voxel::FaceNames skinFace = voxel::FaceNames::PositiveY;
+	/// Which corner of the selection the skin (0,0) maps to
+	ReskinAnchor anchor = ReskinAnchor::TopLeft;
 };
 
 /**
@@ -320,16 +334,16 @@ int sculptSquashToPlane(voxel::RawVolume &volume, const voxel::Region &region, v
  */
 void sculptSmoothWall(voxel::BitVolume &solid, voxel::SparseVolume &voxelMap, const voxel::BitVolume &anchors,
 					  voxel::FaceNames face, int iterations, const voxel::Voxel &fillVoxel,
-					  int removeAboveDepth = 0, SmoothWallInterp interp = SmoothWallInterp::InverseDistance,
-					  bool fillHoles = true);
+					  int removeAboveDepth, SmoothWallInterp interp, bool fillHoles,
+					  core::DynamicArray<glm::ivec3> &addedPositions);
 
 /**
  * @brief Smooth wall using RawVolume as color source (fast path -- no SparseVolume allocation).
  */
 void sculptSmoothWall(voxel::BitVolume &solid, voxel::RawVolume &colorVolume, const voxel::BitVolume &anchors,
 					  voxel::FaceNames face, int iterations, const voxel::Voxel &fillVoxel,
-					  int removeAboveDepth = 0, SmoothWallInterp interp = SmoothWallInterp::InverseDistance,
-					  bool fillHoles = true);
+					  int removeAboveDepth, SmoothWallInterp interp, bool fillHoles,
+					  core::DynamicArray<glm::ivec3> &addedPositions);
 
 
 /**

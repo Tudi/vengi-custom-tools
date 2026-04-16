@@ -225,11 +225,12 @@ public:
 	void setReskinSkinDepth(int depth);
 	void setReskinZOffset(int offset);
 	void setReskinInvertSkin(bool invert);
+	void cycleReskinFace();
+	void cycleReskinAnchor();
 	void setReskinPreview(bool preview);
 	void setReskinMaxRepeatU(int count);
 	void setReskinMaxRepeatV(int count);
-	void setReskinSkinDepthAxis(math::Axis axis);
-	void cycleReskinSkinDepthAxis();
+	void setReskinSkinFace(voxel::FaceNames face);
 
 	/**
 	 * @brief Set the skin volume for reskin mode.
@@ -403,33 +404,16 @@ inline void SculptBrush::setReskinMaxRepeatV(int count) {
 	_paramsDirty = true;
 }
 
-inline void SculptBrush::setReskinSkinDepthAxis(math::Axis axis) {
-	_reskinConfig.skinDepthAxis = axis;
+inline void SculptBrush::setReskinSkinFace(voxel::FaceNames face) {
+	_reskinConfig.skinFace = face;
 	// Re-populate skin depth for the new axis
 	if (_skinVolume != nullptr) {
 		const voxel::Region &sr = _skinVolume->region();
-		const int upIdx = math::getIndexForAxis(axis);
+		const int upIdx = math::getIndexForAxis(voxel::faceToAxis(face));
 		const int depthExtent = sr.getUpperCorner()[upIdx] - sr.getLowerCorner()[upIdx] + 1;
 		_reskinConfig.skinDepth = glm::clamp(depthExtent, 1, MaxReskinDepth);
 	}
 	_paramsDirty = true;
-}
-
-inline void SculptBrush::cycleReskinSkinDepthAxis() {
-	switch (_reskinConfig.skinDepthAxis) {
-	case math::Axis::X:
-		setReskinSkinDepthAxis(math::Axis::Y);
-		break;
-	case math::Axis::Y:
-		setReskinSkinDepthAxis(math::Axis::Z);
-		break;
-	case math::Axis::Z:
-		setReskinSkinDepthAxis(math::Axis::X);
-		break;
-	default:
-		setReskinSkinDepthAxis(math::Axis::Y);
-		break;
-	}
 }
 
 inline void SculptBrush::setReskinOffsetU(int offset) {
@@ -454,6 +438,29 @@ inline void SculptBrush::setReskinZOffset(int offset) {
 
 inline void SculptBrush::setReskinInvertSkin(bool invert) {
 	_reskinConfig.invertSkin = invert;
+	_paramsDirty = true;
+}
+
+inline void SculptBrush::cycleReskinFace() {
+	// Cycle through: PositiveX, NegativeX, PositiveY, NegativeY, PositiveZ, NegativeZ
+	static constexpr voxel::FaceNames faces[] = {
+		voxel::FaceNames::PositiveX, voxel::FaceNames::NegativeX,
+		voxel::FaceNames::PositiveY, voxel::FaceNames::NegativeY,
+		voxel::FaceNames::PositiveZ, voxel::FaceNames::NegativeZ,
+	};
+	static constexpr int numFaces = 6;
+	for (int i = 0; i < numFaces; ++i) {
+		if (faces[i] == _reskinConfig.skinFace) {
+			setReskinSkinFace(faces[(i + 1) % numFaces]);
+			return;
+		}
+	}
+	setReskinSkinFace(voxel::FaceNames::PositiveX);
+}
+
+inline void SculptBrush::cycleReskinAnchor() {
+	int next = ((int)_reskinConfig.anchor + 1) % (int)voxelutil::ReskinAnchor::Max;
+	_reskinConfig.anchor = (voxelutil::ReskinAnchor)next;
 	_paramsDirty = true;
 }
 

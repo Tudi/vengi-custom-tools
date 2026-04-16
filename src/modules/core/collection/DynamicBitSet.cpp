@@ -101,31 +101,7 @@ size_t DynamicBitSet::bytes() const {
 	return requiredElements(_size) * sizeof(Type);
 }
 
-bool DynamicBitSet::operator[](size_t idx) const {
-	if (idx >= _size) {
-		return false;
-	}
-	const size_t arrayIdx = idx / bitsPerValue;
-	const size_t elementIdx = idx % bitsPerValue;
-	const Type &ref = _buffer[arrayIdx];
-	const Type mask = (Type(1) << elementIdx);
-	const bool val = (ref & mask) != 0;
-	return val;
-}
 
-void DynamicBitSet::set(size_t idx, bool value) {
-	if (idx >= _size) {
-		return;
-	}
-	const size_t arrayIdx = idx / bitsPerValue;
-	const size_t elementIdx = idx % bitsPerValue;
-	Type &ref = _buffer[arrayIdx];
-	if (value) {
-		ref |= (Type(1) << elementIdx);
-	} else {
-		ref &= ~(Type(1) << elementIdx);
-	}
-}
 
 
 bool DynamicBitSet::hasBitsSet() const {

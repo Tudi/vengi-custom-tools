@@ -319,7 +319,11 @@ void ExtrudeBrush::writeVoxel(ModifierVolumeWrapper &wrapper, PositionSet &saved
 		_history.push_back({pos, vol->voxel(pos)});
 		savedPositions.insert(pos);
 	}
-	vol->setVoxel(pos, newVoxel);
+	voxel::Voxel v = newVoxel;
+	if (voxel::isBlocked(v.getMaterial())) {
+		v.setFlags(voxel::FlagOutline);
+	}
+	vol->setVoxel(pos, v);
 	wrapper.addToDirtyRegion(pos);
 }
 
@@ -393,12 +397,48 @@ void ExtrudeBrush::generate(scenegraph::SceneGraph &, ModifierVolumeWrapper &wra
 				writeVoxel(wrapper, savedPositions, selPos + dir * step + shift, air);
 			}
 		}
+		// Loop 3: Place enclosing cap at the bottom of the well (one step beyond
+		// the last carved layer). Ensures the well is sealed even if the wall is
+		// thinner than the carve depth.
+		{
+			const glm::ivec3 shift = lateralShift(steps);
+			for (const glm::ivec3 &selPos : _cachedSelectedPositions) {
+				writeVoxel(wrapper, savedPositions, selPos + dir * steps + shift, ctx.cursorVoxel);
+			}
+		}
 	} else {
 		// Positive depth: place selected voxels at each step from 1 to depth
 		for (int step = 1; step <= steps; ++step) {
 			const glm::ivec3 shift = lateralShift(step);
 			for (const glm::ivec3 &selPos : _cachedSelectedPositions) {
 				writeVoxel(wrapper, savedPositions, selPos + dir * step + shift, ctx.cursorVoxel);
+			}
+		}
+		// Clear interior selected voxels. Keep "brim" voxels that border a
+		// solid non-selected neighbor (part of the enclosing wall). Air
+		// neighbors don't count as wall - only solid unselected voxels do.
+		PositionSet selectedSet;
+		for (const glm::ivec3 &pos : _cachedSelectedPositions) {
+			selectedSet.insert(pos);
+		}
+		voxel::RawVolume *vol = wrapper.volume();
+		const voxel::Region &volRegion = vol->region();
+		for (const glm::ivec3 &selPos : _cachedSelectedPositions) {
+			bool isBrim = false;
+			for (const glm::ivec3 &offset : voxel::arrayPathfinderFaces) {
+				const glm::ivec3 neighbor = selPos + offset;
+				if (selectedSet.has(neighbor)) {
+					continue;
+				}
+				// Non-selected neighbor: only counts as brim if it's solid
+				if (volRegion.containsPoint(neighbor) &&
+					voxel::isBlocked(vol->voxel(neighbor).getMaterial())) {
+					isBrim = true;
+					break;
+				}
+			}
+			if (!isBrim) {
+				writeVoxel(wrapper, savedPositions, selPos, air);
 			}
 		}
 		// Include the original selected positions in the dirty region so that

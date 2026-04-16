@@ -1287,6 +1287,45 @@ TEST_F(VolumeSculptTest, testReskinInvertSkin) {
 	EXPECT_TRUE(voxel::isAir(volume.voxel(1, 0, 0).getMaterial()));
 }
 
+TEST_F(VolumeSculptTest, testReskinInvertSkinReplace) {
+	// Replace + Invert: skin solid positions are removed, skin air positions keep existing voxels.
+	voxel::Region region(0, 5);
+	voxel::RawVolume volume(region);
+	const voxel::Voxel surface = voxel::createVoxel(voxel::VoxelType::Generic, 1);
+
+	for (int x = 0; x < 2; ++x) {
+		for (int z = 0; z < 2; ++z) {
+			volume.setVoxel(x, 0, z, surface);
+		}
+	}
+
+	// 2x2x1 skin: only (0,0,0) is solid
+	voxel::Region skinRegion(0, 0, 0, 1, 0, 1);
+	voxel::RawVolume skin(skinRegion);
+	skin.setVoxel(0, 0, 0, voxel::createVoxel(voxel::VoxelType::Generic, 10));
+
+	// Replace + Invert: skin solid → effectiveSolid=false → removed.
+	// Skin air → effectiveSolid=true → existing voxel preserved (no skin color to apply).
+	ReskinConfig config;
+	config.mode = ReskinMode::Replace;
+	config.tile = ReskinTile::Once;
+	config.follow = ReskinFollow::Voxel;
+	config.skinDepth = 1;
+	config.invertSkin = true;
+	config.preview = false;
+
+	sculptReskin(volume, region, skin, voxel::FaceNames::PositiveY, config);
+	// Position (0,0,0) had skin solid → inverted to air → Replace removes it
+	EXPECT_TRUE(voxel::isAir(volume.voxel(0, 0, 0).getMaterial()));
+	// Position (1,0,0) had skin air → inverted to solid → existing surface voxel preserved
+	EXPECT_TRUE(voxel::isBlocked(volume.voxel(1, 0, 0).getMaterial()));
+	EXPECT_EQ(1, volume.voxel(1, 0, 0).getColor());
+	// Position (0,0,1) had skin air → inverted to solid → existing surface voxel preserved
+	EXPECT_TRUE(voxel::isBlocked(volume.voxel(0, 0, 1).getMaterial()));
+	// Position (1,0,1) had skin air → inverted to solid → existing surface voxel preserved
+	EXPECT_TRUE(voxel::isBlocked(volume.voxel(1, 0, 1).getMaterial()));
+}
+
 TEST_F(VolumeSculptTest, testReskinNoClipboardNoChange) {
 	// Empty skin volume should cause no changes
 	voxel::Region region(0, 5);

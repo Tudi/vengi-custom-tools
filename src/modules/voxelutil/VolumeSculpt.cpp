@@ -3,6 +3,7 @@
  */
 
 #include "VolumeSculpt.h"
+#include "core/Log.h"
 #include "app/ForParallel.h"
 #include "core/GLM.h"
 #include "core/Trace.h"
@@ -1024,11 +1025,13 @@ void sculptSmoothGaussian(voxel::BitVolume &solid, voxel::SparseVolume &voxelMap
 // Templated to work with SparseVolume (full path) or RawVolume (fast path).
 template<typename ColorSource>
 static void fillSmoothWallVoxel(voxel::BitVolume &solid, ColorSource &colorSource,
-								const glm::ivec3 &pos, const voxel::Voxel &fillVoxel) {
+								const glm::ivec3 &pos, const voxel::Voxel &fillVoxel,
+								core::DynamicArray<glm::ivec3> &addedPositions) {
 	if (solid.hasValue(pos.x, pos.y, pos.z)) {
 		return;
 	}
 	solid.setVoxel(pos, true);
+	addedPositions.push_back(pos);
 	voxel::Voxel newVoxel = fillVoxel;
 	for (const glm::ivec3 &offset : voxel::arrayPathfinderFaces) {
 		const glm::ivec3 neighbor = pos + offset;
@@ -1044,7 +1047,8 @@ static void fillSmoothWallVoxel(voxel::BitVolume &solid, ColorSource &colorSourc
 template<typename ColorSource>
 static void sculptSmoothWallImpl(voxel::BitVolume &solid, ColorSource &colorSource, const voxel::BitVolume &anchors,
 					  voxel::FaceNames face, int iterations, const voxel::Voxel &fillVoxel,
-					  int removeAboveDepth, SmoothWallInterp interp, bool fillHoles) {
+					  int removeAboveDepth, SmoothWallInterp interp, bool fillHoles,
+					  core::DynamicArray<glm::ivec3> &addedPositions) {
 	core_trace_scoped(SculptSmoothWall);
 
 	const int axisIdx = math::getIndexForAxis(voxel::faceToAxis(face));
@@ -1068,6 +1072,7 @@ static void sculptSmoothWallImpl(voxel::BitVolume &solid, ColorSource &colorSour
 	}
 
 	const int numColumns = extentU * extentV;
+	addedPositions.reserve(numColumns);
 	static constexpr int EMPTY = INT_MIN;
 	const int axisLo = lo[axisIdx];
 	const int axisHi = hi[axisIdx];
@@ -1118,25 +1123,48 @@ static void sculptSmoothWallImpl(voxel::BitVolume &solid, ColorSource &colorSour
 					const int flatIdx = iu * extentV + iv;
 					const int coordU = baseU + iu;
 					const int coordV = baseV + iv;
+					// Scan from both ends to find top and bottom in O(depth) worst case
+					// but O(1) for thin selections (e.g. 1-voxel thick wall in 200-deep range).
+					// positiveUp: top = max height (scan from axisHi down), bottom = min height (scan from axisLo up)
+					// negativeUp: top = min height (scan from axisLo up), bottom = max height (scan from axisHi down)
 					int topVal = EMPTY;
 					int botVal = EMPTY;
-					for (int av = axisLo; av <= axisHi; ++av) {
-						glm::ivec3 pos;
-						pos[uAxis] = coordU;
-						pos[vAxis] = coordV;
-						pos[axisIdx] = av;
-						if (!solid.hasValue(pos.x, pos.y, pos.z)) {
-							continue;
+					glm::ivec3 pos;
+					pos[uAxis] = coordU;
+					pos[vAxis] = coordV;
+					if (positiveUp) {
+						for (int av = axisHi; av >= axisLo; --av) {
+							pos[axisIdx] = av;
+							if (solid.hasValue(pos.x, pos.y, pos.z)) {
+								topVal = av;
+								break;
+							}
 						}
-						if (topVal == EMPTY) {
-							topVal = av;
-							botVal = av;
-						} else if (positiveUp) {
-							topVal = glm::max(topVal, av);
-							botVal = glm::min(botVal, av);
-						} else {
-							topVal = glm::min(topVal, av);
-							botVal = glm::max(botVal, av);
+						if (topVal != EMPTY) {
+							for (int av = axisLo; av <= topVal; ++av) {
+								pos[axisIdx] = av;
+								if (solid.hasValue(pos.x, pos.y, pos.z)) {
+									botVal = av;
+									break;
+								}
+							}
+						}
+					} else {
+						for (int av = axisLo; av <= axisHi; ++av) {
+							pos[axisIdx] = av;
+							if (solid.hasValue(pos.x, pos.y, pos.z)) {
+								topVal = av;
+								break;
+							}
+						}
+						if (topVal != EMPTY) {
+							for (int av = axisHi; av >= topVal; --av) {
+								pos[axisIdx] = av;
+								if (solid.hasValue(pos.x, pos.y, pos.z)) {
+									botVal = av;
+									break;
+								}
+							}
 						}
 					}
 					colTopArr[flatIdx] = topVal;
@@ -1427,127 +1455,163 @@ static void sculptSmoothWallImpl(voxel::BitVolume &solid, ColorSource &colorSour
 						target = (int)glm::round(weightedHeight / totalWeight);
 					}
 
-					targetArr[flatIdx] = target;
+					targetArr[flatIdx] = glm::clamp(target, axisLo, axisHi);
 				}
 			}
 		});
 
-		// Step 3: Enforce the smooth surface for each interior column.
-		// - Make solid from column bottom up to target (fill gaps)
-		// - Remove all voxels above target up to removeAboveDepth
-		// - fillHoles=true: also fill interior-hole columns from region floor to target
-		// This eliminates floating layers and discontinuities.
-		for (int iu = 0; iu < extentU; ++iu) {
-			for (int iv = 0; iv < extentV; ++iv) {
-				const int flatIdx = iu * extentV + iv;
-				const int target = targetArr[flatIdx];
-				if (target == EMPTY) {
-					continue;
-				}
-				// For interior holes (fillHoles=true): fill from region floor/ceiling.
-				// For solid columns: fill from existing column bottom.
-				const bool isInteriorHole = fillHoles && (colTopArr[flatIdx] == EMPTY) && !isExteriorEmpty[flatIdx];
-				const int currentBottom = isInteriorHole ? (positiveUp ? axisLo : axisHi) : colBotArr[flatIdx];
-				if (currentBottom == EMPTY) {
-					continue;
-				}
-				const int coordU = baseU + iu;
-				const int coordV = baseV + iv;
+		// Step 3: Enforce the smooth surface for each interior column (parallel collect, sequential write).
+		struct VoxelOp {
+			glm::ivec3 pos;
+			voxel::Voxel color;
+			bool add;
+		};
+		core::DynamicArray<core::DynamicArray<VoxelOp>> perRowOps(extentU);
 
-				// Fill from column bottom up to target (close internal gaps).
-				// When target < currentBottom the loop range is empty (fillLo > fillHi
-				// for positiveUp) so no voxels are added -- no clamping needed.
-				const int fillLo = positiveUp ? currentBottom : target;
-				const int fillHi = positiveUp ? target : currentBottom;
-				for (int av = fillLo; av <= fillHi; ++av) {
+		app::for_parallel(0, extentU, [&](int startIu, int endIu) {
+			for (int iu = startIu; iu < endIu; ++iu) {
+				core::DynamicArray<VoxelOp> &ops = perRowOps[iu];
+				for (int iv = 0; iv < extentV; ++iv) {
+					const int flatIdx = iu * extentV + iv;
+					const int target = targetArr[flatIdx];
+					if (target == EMPTY) {
+						continue;
+					}
+					const bool isInteriorHole = fillHoles && (colTopArr[flatIdx] == EMPTY) && !isExteriorEmpty[flatIdx];
+					const int currentBottom = isInteriorHole ? (positiveUp ? axisLo : axisHi) : colBotArr[flatIdx];
+					if (currentBottom == EMPTY) {
+						continue;
+					}
+					const int coordU = baseU + iu;
+					const int coordV = baseV + iv;
 					glm::ivec3 pos;
 					pos[uAxis] = coordU;
 					pos[vAxis] = coordV;
-					pos[axisIdx] = av;
-					if (region.containsPoint(pos)) {
-						fillSmoothWallVoxel(solid, colorSource, pos, fillVoxel);
-					}
-				}
 
-				// Remove voxels above target up to removeAboveDepth (0 = skip clearing).
-				// Use target directly (no clamping): when target < currentBottom the
-				// entire column is above the target and should be cleared.
-				if (removeAboveDepth > 0) {
-					const int clearStart = positiveUp ? target + 1 : target - 1;
-					const int clearEnd = positiveUp
-						? glm::min(target + removeAboveDepth, axisHi)
-						: glm::max(target - removeAboveDepth, axisLo);
-					const int clearStep = positiveUp ? 1 : -1;
-					for (int av = clearStart; positiveUp ? (av <= clearEnd) : (av >= clearEnd); av += clearStep) {
-						glm::ivec3 pos;
-						pos[uAxis] = coordU;
-						pos[vAxis] = coordV;
-						pos[axisIdx] = av;
-						if (solid.hasValue(pos.x, pos.y, pos.z)) {
-							solid.setVoxel(pos, false);
-							colorSource.setVoxel(pos, voxel::Voxel());
+					if (isInteriorHole) {
+						pos[axisIdx] = target;
+						ops.push_back({pos, fillVoxel, true});
+					} else {
+						const int colTop = colTopArr[flatIdx];
+						const int fillLo = positiveUp ? colTop + 1 : target;
+						const int fillHi = positiveUp ? target : colTop - 1;
+						if (fillLo <= fillHi) {
+							pos[axisIdx] = colTop;
+							voxel::Voxel lastColor = fillVoxel;
+							const voxel::Voxel &edgeVoxel = colorSource.voxel(pos);
+							if (voxel::isBlocked(edgeVoxel.getMaterial())) {
+								lastColor = edgeVoxel;
+							}
+							for (int av = fillLo; av <= fillHi; ++av) {
+								pos[axisIdx] = av;
+								ops.push_back({pos, lastColor, true});
+							}
+						}
+					}
+
+					if (removeAboveDepth > 0 && !isInteriorHole) {
+						const int colTop = colTopArr[flatIdx];
+						const int clearStart = positiveUp ? target + 1 : target - 1;
+						const int clearEnd = positiveUp
+							? glm::min(glm::min(target + removeAboveDepth, axisHi), colTop)
+							: glm::max(glm::max(target - removeAboveDepth, axisLo), colTop);
+						const int clearStep = positiveUp ? 1 : -1;
+						for (int av = clearStart; positiveUp ? (av <= clearEnd) : (av >= clearEnd); av += clearStep) {
+							pos[axisIdx] = av;
+							ops.push_back({pos, voxel::Voxel(), false});
 						}
 					}
 				}
 			}
+		});
+		int totalOps = 0;
+		for (int iu = 0; iu < extentU; ++iu) {
+			totalOps += (int)perRowOps[iu].size();
 		}
 
-		// Step 4: Gap-fill pass. For each column, look at 8 UV neighbors and extend
-		// downward (for positiveUp) to the smallest neighbor target height. This closes
-		// gaps at corners where adjacent columns have very different target heights.
-		// We read from targetArr (computed in Step 2) and update colTopArr to reflect
-		// the new effective tops after Step 3.
+		// Reserve addedPositions to avoid catastrophic reallocation
+		// (DynamicArray grows by 32 elements, not doubling — without reserve,
+		// 676K pushes cause ~17K reallocations each copying the full array)
+		addedPositions.reserve(addedPositions.size() + totalOps);
+
 		for (int iu = 0; iu < extentU; ++iu) {
-			for (int iv = 0; iv < extentV; ++iv) {
-				const int flatIdx = iu * extentV + iv;
-				const int myTarget = targetArr[flatIdx];
-				if (myTarget == EMPTY) {
-					continue;
+			for (const VoxelOp &op : perRowOps[iu]) {
+				if (op.add) {
+					solid.setVoxel(op.pos, true);
+					addedPositions.push_back(op.pos);
+					colorSource.setVoxel(op.pos, op.color);
+				} else {
+					solid.setVoxel(op.pos, false);
+					colorSource.setVoxel(op.pos, voxel::Voxel());
 				}
-				const bool isInteriorHole = fillHoles && (colTopArr[flatIdx] == EMPTY) && !isExteriorEmpty[flatIdx];
-				const int currentBottom = isInteriorHole ? (positiveUp ? axisLo : axisHi) : colBotArr[flatIdx];
-				if (currentBottom == EMPTY) {
-					continue;
-				}
+			}
+		}
 
-				// Find the minimum (positiveUp) or maximum (negativeUp) neighbor target
-				int neighborExtreme = myTarget;
-				static constexpr int neighborOffsets[8][2] = {
-					{-1, -1}, {-1, 0}, {-1, 1}, {0, -1}, {0, 1}, {1, -1}, {1, 0}, {1, 1}
-				};
-				for (const auto &off : neighborOffsets) {
-					const int nu = iu + off[0];
-					const int nv = iv + off[1];
-					if (nu < 0 || nu >= extentU || nv < 0 || nv >= extentV) {
+		// Step 4: Gap-fill pass (parallel collect, sequential write).
+		// For each column, extend +/-3 toward neighbor heights to close seams.
+		core::DynamicArray<core::DynamicArray<glm::ivec3>> s4PerRowAdds(extentU);
+
+		app::for_parallel(0, extentU, [&](int startIu, int endIu) {
+			for (int iu = startIu; iu < endIu; ++iu) {
+				core::DynamicArray<glm::ivec3> &adds = s4PerRowAdds[iu];
+				for (int iv = 0; iv < extentV; ++iv) {
+					const int flatIdx = iu * extentV + iv;
+					const int myTarget = targetArr[flatIdx];
+					if (myTarget == EMPTY) {
 						continue;
 					}
-					const int nIdx = nu * extentV + nv;
-					// Use target if available (interior), otherwise use original top (edge)
-					const int nHeight = (targetArr[nIdx] != EMPTY) ? targetArr[nIdx] : colTopArr[nIdx];
-					if (nHeight == EMPTY) {
+					const bool isInteriorHole = fillHoles && (colTopArr[flatIdx] == EMPTY) && !isExteriorEmpty[flatIdx];
+					const int currentBottom = isInteriorHole ? (positiveUp ? axisLo : axisHi) : colBotArr[flatIdx];
+					if (currentBottom == EMPTY) {
 						continue;
 					}
-					if (positiveUp) {
-						neighborExtreme = glm::min(neighborExtreme, nHeight);
-					} else {
-						neighborExtreme = glm::max(neighborExtreme, nHeight);
-					}
-				}
 
-				// Fill from neighborExtreme to myTarget if there is a gap
-				const int fillLo = positiveUp ? neighborExtreme : myTarget;
-				const int fillHi = positiveUp ? myTarget : neighborExtreme;
-				const int coordU = baseU + iu;
-				const int coordV = baseV + iv;
-				for (int av = fillLo; av <= fillHi; ++av) {
+					int neighborMin = myTarget;
+					int neighborMax = myTarget;
+					static constexpr int neighborOffsets[8][2] = {
+						{-1, -1}, {-1, 0}, {-1, 1}, {0, -1}, {0, 1}, {1, -1}, {1, 0}, {1, 1}
+					};
+					for (const auto &off : neighborOffsets) {
+						const int nu = iu + off[0];
+						const int nv = iv + off[1];
+						if (nu < 0 || nu >= extentU || nv < 0 || nv >= extentV) {
+							continue;
+						}
+						const int nIdx = nu * extentV + nv;
+						const int nHeight = (targetArr[nIdx] != EMPTY) ? targetArr[nIdx] : colTopArr[nIdx];
+						if (nHeight == EMPTY) {
+							continue;
+						}
+						neighborMin = glm::min(neighborMin, nHeight);
+						neighborMax = glm::max(neighborMax, nHeight);
+					}
+
+					const int fillLo = glm::max(neighborMin, myTarget - 3);
+					const int fillHi = glm::min(neighborMax, myTarget + 3);
+					const int coordU = baseU + iu;
+					const int coordV = baseV + iv;
 					glm::ivec3 pos;
 					pos[uAxis] = coordU;
 					pos[vAxis] = coordV;
-					pos[axisIdx] = av;
-					if (region.containsPoint(pos)) {
-						fillSmoothWallVoxel(solid, colorSource, pos, fillVoxel);
+					for (int av = fillLo; av <= fillHi; ++av) {
+						pos[axisIdx] = av;
+						if (!solid.hasValue(pos.x, pos.y, pos.z)) {
+							adds.push_back(pos);
+						}
 					}
 				}
+			}
+		});
+
+		// Count and reserve before writing
+		int s4Total = 0;
+		for (int iu = 0; iu < extentU; ++iu) {
+			s4Total += (int)s4PerRowAdds[iu].size();
+		}
+		addedPositions.reserve(addedPositions.size() + s4Total);
+		for (int iu = 0; iu < extentU; ++iu) {
+			for (const glm::ivec3 &pos : s4PerRowAdds[iu]) {
+				fillSmoothWallVoxel(solid, colorSource, pos, fillVoxel, addedPositions);
 			}
 		}
 	}
@@ -1555,14 +1619,16 @@ static void sculptSmoothWallImpl(voxel::BitVolume &solid, ColorSource &colorSour
 
 void sculptSmoothWall(voxel::BitVolume &solid, voxel::SparseVolume &voxelMap, const voxel::BitVolume &anchors,
 					  voxel::FaceNames face, int iterations, const voxel::Voxel &fillVoxel,
-					  int removeAboveDepth, SmoothWallInterp interp, bool fillHoles) {
-	sculptSmoothWallImpl(solid, voxelMap, anchors, face, iterations, fillVoxel, removeAboveDepth, interp, fillHoles);
+					  int removeAboveDepth, SmoothWallInterp interp, bool fillHoles,
+					  core::DynamicArray<glm::ivec3> &addedPositions) {
+	sculptSmoothWallImpl(solid, voxelMap, anchors, face, iterations, fillVoxel, removeAboveDepth, interp, fillHoles, addedPositions);
 }
 
 void sculptSmoothWall(voxel::BitVolume &solid, voxel::RawVolume &colorVolume, const voxel::BitVolume &anchors,
 					  voxel::FaceNames face, int iterations, const voxel::Voxel &fillVoxel,
-					  int removeAboveDepth, SmoothWallInterp interp, bool fillHoles) {
-	sculptSmoothWallImpl(solid, colorVolume, anchors, face, iterations, fillVoxel, removeAboveDepth, interp, fillHoles);
+					  int removeAboveDepth, SmoothWallInterp interp, bool fillHoles,
+					  core::DynamicArray<glm::ivec3> &addedPositions) {
+	sculptSmoothWallImpl(solid, colorVolume, anchors, face, iterations, fillVoxel, removeAboveDepth, interp, fillHoles, addedPositions);
 }
 
 
@@ -1692,10 +1758,12 @@ void sculptReskin(voxel::BitVolume &solid, voxel::SparseVolume &voxelMap, const 
 		}
 	}
 
-	// Skin axes: skinDepthAxis is the outward/depth direction, the other two are tiling axes
-	const int skinUpIdx = math::getIndexForAxis(config.skinDepthAxis);
+	// Skin axes: skinFace encodes both the depth axis and reading direction.
+	// Positive face = read from hi toward lo, negative face = read from lo toward hi.
+	const int skinUpIdx = math::getIndexForAxis(voxel::faceToAxis(config.skinFace));
 	const int skinUIdx = (skinUpIdx + 1) % 3;
 	const int skinVIdx = (skinUpIdx + 2) % 3;
+	const bool skinPositive = voxel::isPositiveFace(config.skinFace);
 
 	const glm::ivec3 &skinLo = skinRegion.getLowerCorner();
 	const glm::ivec3 &skinHi = skinRegion.getUpperCorner();
@@ -1839,9 +1907,18 @@ void sculptReskin(voxel::BitVolume &solid, voxel::SparseVolume &voxelMap, const 
 			// Start height for skin application, with z offset
 			const int outwardStep = -inwardStep;
 
-			// Map (u,v) to skin coordinates (always MinMin anchor)
-			int localU = uIdx + config.offsetU;
-			int localV = vIdx + config.offsetV;
+			// Map (u,v) to skin coordinates. Anchor shifts the tiling origin
+			// to the chosen corner of the selection without mirroring.
+			int anchorOffsetU = 0;
+			int anchorOffsetV = 0;
+			if (config.anchor == ReskinAnchor::TopRight || config.anchor == ReskinAnchor::BottomRight) {
+				anchorOffsetU = -(effectiveSelW - 1);
+			}
+			if (config.anchor == ReskinAnchor::BottomLeft || config.anchor == ReskinAnchor::BottomRight) {
+				anchorOffsetV = -(effectiveSelH - 1);
+			}
+			int localU = uIdx + anchorOffsetU + config.offsetU;
+			int localV = vIdx + anchorOffsetV + config.offsetV;
 
 			// Apply offset (not for Stretch mode)
 			if (config.tile == ReskinTile::Stretch) {
@@ -1960,10 +2037,12 @@ void sculptReskin(voxel::BitVolume &solid, voxel::SparseVolume &voxelMap, const 
 				glm::ivec3 skinPos;
 				skinPos[skinUIdx] = skinLo[skinUIdx] + skinSU;
 				skinPos[skinVIdx] = skinLo[skinVIdx] + skinSV;
-				skinPos[skinUpIdx] = skinLo[skinUpIdx] + d;
+				skinPos[skinUpIdx] = skinPositive
+					? (skinHi[skinUpIdx] - d)
+					: (skinLo[skinUpIdx] + d);
 				const voxel::Voxel rawSkinVoxel = skin.voxel(skinPos.x, skinPos.y, skinPos.z);
 				const bool skinIsSolid = voxel::isBlocked(rawSkinVoxel.getMaterial());
-				const bool effectiveSolid = config.invertSkin ? !skinIsSolid : skinIsSolid;
+				const bool effectiveSolid = skinIsSolid;
 
 				// Remap skin color to target palette if available
 				const voxel::Voxel skinVoxel = (hasRemap && skinIsSolid)
@@ -1975,9 +2054,9 @@ void sculptReskin(voxel::BitVolume &solid, voxel::SparseVolume &voxelMap, const 
 				switch (config.mode) {
 				case ReskinMode::Replace:
 					if (effectiveSolid) {
+						solid.setVoxel(worldPos, true);
 						voxel::Voxel v = skinVoxel;
 						v.setFlags(voxel::FlagOutline);
-						solid.setVoxel(worldPos, true);
 						voxelMap.setVoxel(worldPos, v);
 					} else {
 						solid.setVoxel(worldPos, false);
@@ -2209,7 +2288,8 @@ int sculptSmoothWall(voxel::RawVolume &volume, const voxel::Region &region, voxe
 	anchorRegion.cropTo(volume.region());
 	voxel::BitVolume anchors(anchorRegion);
 	buildFromVolume(volume, region, solid, voxelMap, anchors);
-	sculptSmoothWall(solid, voxelMap, anchors, face, iterations, fillVoxel, removeAboveDepth, interp, fillHoles);
+	core::DynamicArray<glm::ivec3> addedPositions;
+	sculptSmoothWall(solid, voxelMap, anchors, face, iterations, fillVoxel, removeAboveDepth, interp, fillHoles, addedPositions);
 	return writeResultToVolume(volume, region, solid, voxelMap);
 }
 

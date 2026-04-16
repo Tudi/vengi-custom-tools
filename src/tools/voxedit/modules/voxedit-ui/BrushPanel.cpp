@@ -1168,24 +1168,28 @@ void BrushPanel::updateExtrudeBrushPanel(command::CommandExecutionListener &list
 	if (depth == 0 && !_sceneMgr->hasSelection(nodeId)) {
 		ImGui::TextColored(warningTextColor, "%s", _("No selection active - use the Select brush first"));
 	}
-	// All depth/offset changes are preview-only. The preview system creates a fresh
-	// volume copy each frame and generate() writes to it. Commit happens on brush switch.
+	// Parameter changes execute on the real volume with NoUndo (same pattern as
+	// SculptBrush/TransformBrush). generate() restores history before re-applying.
 	ImGui::TextUnformatted(_("Depth"));
 	if (ImGui::Button("-##extrude_depth")) {
 		brush.setDepth(depth - 1);
+		executeExtrudeBrush();
 	}
 	ImGui::SameLine();
 	if (ImGui::SliderInt("##extrude_depth_slider", &depth, -maxDepth, maxDepth)) {
 		brush.setDepth(depth);
+		executeExtrudeBrush();
 	}
 	ImGui::SameLine();
 	if (ImGui::Button("+##extrude_depth")) {
 		brush.setDepth(depth + 1);
+		executeExtrudeBrush();
 	}
 
 	bool fillWalls = brush.fillWalls();
 	if (ImGui::Checkbox(_("Fill walls"), &fillWalls)) {
 		brush.setFillWalls(fillWalls);
+		executeExtrudeBrush();
 	}
 
 	// Lateral offset sliders - only shown when depth is non-zero.
@@ -1200,28 +1204,34 @@ void BrushPanel::updateExtrudeBrushPanel(command::CommandExecutionListener &list
 		ImGui::Text(_("Offset %s"), AxisLabels[perp1]);
 		if (ImGui::Button("-##extrude_offsetU")) {
 			brush.setOffsetU(offsetU - 1);
+			executeExtrudeBrush();
 		}
 		ImGui::SameLine();
 		if (ImGui::SliderInt("##extrude_offsetU_slider", &offsetU, -maxDepth, maxDepth)) {
 			brush.setOffsetU(offsetU);
+			executeExtrudeBrush();
 		}
 		ImGui::SameLine();
 		if (ImGui::Button("+##extrude_offsetU")) {
 			brush.setOffsetU(offsetU + 1);
+			executeExtrudeBrush();
 		}
 
 		int offsetV = brush.offsetV();
 		ImGui::Text(_("Offset %s"), AxisLabels[perp2]);
 		if (ImGui::Button("-##extrude_offsetV")) {
 			brush.setOffsetV(offsetV - 1);
+			executeExtrudeBrush();
 		}
 		ImGui::SameLine();
 		if (ImGui::SliderInt("##extrude_offsetV_slider", &offsetV, -maxDepth, maxDepth)) {
 			brush.setOffsetV(offsetV);
+			executeExtrudeBrush();
 		}
 		ImGui::SameLine();
 		if (ImGui::Button("+##extrude_offsetV")) {
 			brush.setOffsetV(offsetV + 1);
+			executeExtrudeBrush();
 		}
 	}
 }
@@ -1658,17 +1668,33 @@ void BrushPanel::updateSculptBrushPanel(command::CommandExecutionListener &liste
 		}
 		ImGui::SetItemTooltipUnformatted(_("When checked, only a 2x2 tile area is applied for fast preview"));
 
-		// Skin depth axis cycle button
+		// Skin face cycle button (axis + direction)
 		{
-			static constexpr const char *axisLabels[] = {"X", "Y", "Z"};
-			const int axisIdx = math::getIndexForAxis(cfg.skinDepthAxis);
-			const core::String label = core::String::format("%s: %s", _("Skin face"), axisLabels[axisIdx]);
+			const core::String label = core::String::format("%s: %s##skin_axis", _("Skin face"), voxel::faceNameString(cfg.skinFace));
 			if (ImGui::Button(label.c_str())) {
-				brush.cycleReskinSkinDepthAxis();
+				brush.cycleReskinFace();
 				executeSculptBrush();
 			}
 			ImGui::SetItemTooltipUnformatted(
-				_("Which axis of the skin is the depth direction. Auto-detected from thinnest axis on load. Click to cycle."));
+				_("Which face of the skin points outward. Auto-detected on load. Click to cycle through all 6 directions."));
+		}
+
+		// Anchor position cycle button
+		{
+			static constexpr const char *anchorLabels[] = {
+				NC_("reskin", "Top-left"),
+				NC_("reskin", "Top-right"),
+				NC_("reskin", "Bottom-left"),
+				NC_("reskin", "Bottom-right"),
+			};
+			const core::String anchorLabel = core::String::format("%s: %s##anchor",
+				_("Anchor"), C_("reskin", anchorLabels[(int)cfg.anchor]));
+			if (ImGui::Button(anchorLabel.c_str())) {
+				brush.cycleReskinAnchor();
+				executeSculptBrush();
+			}
+			ImGui::SetItemTooltipUnformatted(
+				_("Which corner of the selection the skin origin maps to. Click to cycle."));
 		}
 
 		// Reskin mode combo
@@ -1824,12 +1850,6 @@ void BrushPanel::updateSculptBrushPanel(command::CommandExecutionListener &liste
 			executeSculptBrush();
 		}
 
-		// Invert checkbox
-		bool invertSkin = cfg.invertSkin;
-		if (ImGui::Checkbox(_("Invert skin"), &invertSkin)) {
-			brush.setReskinInvertSkin(invertSkin);
-			executeSculptBrush();
-		}
 	} else if (currentMode == SculptMode::ExtendPlane) {
 		int radius = brush.brushRadius();
 		ImGui::TextUnformatted(_("Brush radius"));

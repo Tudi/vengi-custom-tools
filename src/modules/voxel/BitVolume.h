@@ -182,6 +182,39 @@ public:
 	inline size_t bytes() const {
 		return _data.bytes();
 	}
+
+	/**
+	 * @brief Iterate positions that are set in this volume but not in @p other.
+	 * Both volumes must have the same region. Operates at word level for efficiency.
+	 * @param other The reference BitVolume to diff against
+	 * @param callback Called with (glm::ivec3 pos) for each added position
+	 */
+	template<typename FUNC>
+	void forEachAddedBit(const BitVolume &other, FUNC &&callback) const {
+		const size_t numWords = _data.words();
+		const core::DynamicBitSet::Type *thisBuffer = _data.buffer();
+		const core::DynamicBitSet::Type *otherBuffer = other._data.buffer();
+		const int w = _region.getWidthInVoxels();
+		const int h = _region.getHeightInVoxels();
+		const glm::ivec3 &lo = _region.getLowerCorner();
+		static constexpr size_t bitsPerWord = sizeof(core::DynamicBitSet::Type) * CHAR_BIT;
+		for (size_t wi = 0; wi < numWords; ++wi) {
+			core::DynamicBitSet::Type diff = thisBuffer[wi] & ~otherBuffer[wi];
+			if (diff == 0) {
+				continue;
+			}
+			const size_t baseIdx = wi * bitsPerWord;
+			while (diff != 0) {
+				const int bit = __builtin_ctzll(diff);
+				const size_t idx = baseIdx + bit;
+				const int x = static_cast<int>(idx % w);
+				const int y = static_cast<int>((idx / w) % h);
+				const int z = static_cast<int>(idx / (w * h));
+				callback(glm::ivec3(lo.x + x, lo.y + y, lo.z + z));
+				diff &= diff - 1; // clear lowest set bit
+			}
+		}
+	}
 };
 
 } // namespace voxel

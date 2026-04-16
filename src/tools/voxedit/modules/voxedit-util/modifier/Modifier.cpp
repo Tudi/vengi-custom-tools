@@ -750,9 +750,8 @@ bool Modifier::previewNeedsExistingVolume() const {
 	if (_brushType == BrushType::Plane) {
 		return isMode(ModifierType::Place);
 	}
-	if (_brushType == BrushType::Extrude) {
-		return true;
-	}
+	// ExtrudeBrush writes to the real volume with NoUndo via executeExtrudeBrush()
+	// in BrushPanel - no ghost preview volume needed.
 	if (_brushType == BrushType::Transform) {
 		return true;
 	}

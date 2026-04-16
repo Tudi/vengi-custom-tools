@@ -2651,13 +2651,13 @@ static int luaVoxel_sculpt_reskin(lua_State *s) {
 	// Auto-detect depth axis from thinnest dimension
 	const glm::ivec3 skinExtents = skinRegion.getUpperCorner() - skinRegion.getLowerCorner() + 1;
 	if (skinExtents.x <= skinExtents.y && skinExtents.x <= skinExtents.z) {
-		config.skinDepthAxis = math::Axis::X;
+		config.skinFace = voxel::FaceNames::PositiveX;
 	} else if (skinExtents.z <= skinExtents.x && skinExtents.z <= skinExtents.y) {
-		config.skinDepthAxis = math::Axis::Z;
+		config.skinFace = voxel::FaceNames::PositiveZ;
 	} else {
-		config.skinDepthAxis = math::Axis::Y;
+		config.skinFace = voxel::FaceNames::PositiveY;
 	}
-	const int depthIdx = math::getIndexForAxis(config.skinDepthAxis);
+	const int depthIdx = math::getIndexForAxis(voxel::faceToAxis(config.skinFace));
 	const int defaultDepth = skinExtents[depthIdx];
 	config.skinDepth = skinDepth > 0 ? skinDepth : defaultDepth;
 	config.zOffset = surfaceOffset;

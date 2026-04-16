@@ -66,6 +66,8 @@ bool SculptBrush::onDeactivated() {
 	_sceneModifiedFlags = SceneModifiedFlags::All;
 	// Force re-apply so generate() runs and creates a dirty region for the undo entry
 	_paramsDirty = true;
+	// Clear _active so commit()'s beginBrushFromPanel() can succeed
+	_active = false;
 	return hasPendingChanges();
 }
 
@@ -112,12 +114,17 @@ bool SculptBrush::beginBrush(const BrushContext &ctx) {
 	}
 	const bool needsFace = modeNeedsFace(_sculptMode);
 	if (needsFace && ctx.cursorFace != voxel::FaceNames::Max) {
-		_flattenFace = ctx.cursorFace;
-		if (_sculptMode == SculptMode::SquashToPlane) {
-			const int axisIdx = math::getIndexForAxis(voxel::faceToAxis(ctx.cursorFace));
-			_squashPlaneCoord = ctx.cursorPosition[axisIdx];
+		// Only capture face on first click (when no face is set yet).
+		// Subsequent clicks should not re-trigger the full sculpt calculation.
+		if (_flattenFace == voxel::FaceNames::Max) {
+			_flattenFace = ctx.cursorFace;
+			_paramsDirty = true;
 		}
-		_paramsDirty = true;
+		if (_sculptMode == SculptMode::SquashToPlane) {
+			const int axisIdx = math::getIndexForAxis(voxel::faceToAxis(_flattenFace));
+			_squashPlaneCoord = ctx.cursorPosition[axisIdx];
+			_paramsDirty = true;
+		}
 	}
 	_active = true;
 	return true;
@@ -334,7 +341,17 @@ void SculptBrush::applySculpt(ModifierVolumeWrapper &wrapper, const BrushContext
 	}
 
 	if (_sculptMode == SculptMode::Reskin && _skinVolume != nullptr && _flattenFace != voxel::FaceNames::Max) {
-		voxel::BitVolume workSolid(_cachedBitVolume);
+		// Expand the working BitVolume to accommodate skin layers that protrude
+		// beyond the selection. Without this, out-of-region setVoxel calls are
+		// silently dropped and protruding skin voxels never appear.
+		const int expand = glm::abs(_reskinConfig.zOffset) + _reskinConfig.skinDepth;
+		voxel::Region expandedRegion = _snapshotRegion;
+		expandedRegion.grow(expand);
+		voxel::BitVolume workSolid(expandedRegion);
+		// Copy snapshot bits into the expanded volume
+		for (const voxel::VoxelPosition &entry : _snapshotEntries) {
+			workSolid.setVoxel(entry.pos.x, entry.pos.y, entry.pos.z, true);
+		}
 		voxel::SparseVolume voxelMap;
 
 		const palette::Palette *skinPal = skinPalette();
@@ -394,75 +411,88 @@ void SculptBrush::applySculpt(ModifierVolumeWrapper &wrapper, const BrushContext
 		voxel::RawVolume *vol = wrapper.volume();
 		const voxel::Region &volRegion = vol->region();
 
-		// Build anchors
+		// Build anchors from snapshot entries (O(N) where N = selected voxels)
 		voxel::Region anchorRegion = _snapshotRegion;
 		anchorRegion.grow(1);
 		anchorRegion.cropTo(volRegion);
 		voxel::BitVolume anchorSolid(anchorRegion);
-		const glm::ivec3 &snapLo = _snapshotRegion.getLowerCorner();
-		const glm::ivec3 &snapHi = _snapshotRegion.getUpperCorner();
-		for (int z = snapLo.z; z <= snapHi.z; ++z) {
-			for (int y = snapLo.y; y <= snapHi.y; ++y) {
-				for (int x = snapLo.x; x <= snapHi.x; ++x) {
-					if (!currentSolid.hasValue(x, y, z)) {
-						continue;
-					}
-					for (const glm::ivec3 &offset : voxel::arrayPathfinderFaces) {
-						const glm::ivec3 neighbor = glm::ivec3(x, y, z) + offset;
-						if (currentSolid.hasValue(neighbor.x, neighbor.y, neighbor.z)) {
-							continue;
-						}
-						if (!volRegion.containsPoint(neighbor)) {
-							continue;
-						}
-						const voxel::Voxel &v = vol->voxel(neighbor);
-						if (voxel::isBlocked(v.getMaterial()) && !(v.getFlags() & voxel::FlagOutline)) {
-							anchorSolid.setVoxel(neighbor, true);
-						}
-					}
+		for (const voxel::VoxelPosition &entry : _snapshotEntries) {
+			for (const glm::ivec3 &offset : voxel::arrayPathfinderFaces) {
+				const glm::ivec3 neighbor = entry.pos + offset;
+				if (currentSolid.hasValue(neighbor.x, neighbor.y, neighbor.z)) {
+					continue;
+				}
+				if (!volRegion.containsPoint(neighbor)) {
+					continue;
+				}
+				const voxel::Voxel &v = vol->voxel(neighbor);
+				if (voxel::isBlocked(v.getMaterial()) && !(v.getFlags() & voxel::FlagOutline)) {
+					anchorSolid.setVoxel(neighbor, true);
 				}
 			}
 		}
-
-		// Build a temporary RawVolume for color data - flat array, no hashing
+		// RawVolume for color data inside the sculpt algorithm: fillSmoothWallVoxel
+		// does 6 neighbor lookups per voxel, O(1) array access vs O(1) amortized hash.
+		// The dense allocation is large but the random-access speed is critical for
+		// step 3 which can do 100M+ lookups.
 		voxel::RawVolume colorVolume(_snapshotRegion);
 		for (const voxel::VoxelPosition &entry : _snapshotEntries) {
 			colorVolume.setVoxel(entry.pos, entry.voxel);
 		}
-
 		voxel::Voxel fillVoxel = ctx.cursorVoxel;
 		fillVoxel.setFlags(voxel::FlagOutline);
 		static constexpr int smoothWallIterations = 1;
+		core::DynamicArray<glm::ivec3> addedPositions;
 		voxelutil::sculptSmoothWall(currentSolid, colorVolume, anchorSolid, _flattenFace, smoothWallIterations,
-									fillVoxel, _smoothWallClearDepth, _smoothWallInterp, _smoothWallFillHoles);
-
-		// Write-back: compare before/after BitVolumes, read colors from colorVolume
+									fillVoxel, _smoothWallClearDepth, _smoothWallInterp, _smoothWallFillHoles,
+									addedPositions);
 		const voxel::Voxel air;
+		voxel::Region dirtyRegion;
+		_historyEntries.reserve(_snapshotEntries.size() + addedPositions.size());
+
+		// Removed entries (was in snapshot, no longer in currentSolid)
 		for (const voxel::VoxelPosition &entry : _snapshotEntries) {
 			if (!currentSolid.hasValue(entry.pos.x, entry.pos.y, entry.pos.z)) {
-				writeVoxel(wrapper, entry.pos, air);
-			}
-		}
-		// Added entries: in currentSolid but not in snapshot
-		const glm::ivec3 &workLo = _snapshotRegion.getLowerCorner();
-		const glm::ivec3 &workHi = _snapshotRegion.getUpperCorner();
-		for (int z = workLo.z; z <= workHi.z; ++z) {
-			for (int y = workLo.y; y <= workHi.y; ++y) {
-				for (int x = workLo.x; x <= workHi.x; ++x) {
-					if (!currentSolid.hasValue(x, y, z)) {
-						continue;
-					}
-					if (_cachedBitVolume.hasValue(x, y, z)) {
-						continue;
-					}
-					const glm::ivec3 pos(x, y, z);
-					voxel::Voxel v = colorVolume.voxel(pos);
-					if (voxel::isBlocked(v.getMaterial())) {
-						v.setFlags(voxel::FlagOutline);
-						writeVoxel(wrapper, pos, v);
+				if (!volRegion.containsPoint(entry.pos)) {
+					continue;
+				}
+				saveToHistory(vol, entry.pos);
+				if (vol->setVoxel(entry.pos, air)) {
+					if (dirtyRegion.isValid()) {
+						dirtyRegion.accumulate(entry.pos);
+					} else {
+						dirtyRegion = voxel::Region(entry.pos, entry.pos);
 					}
 				}
 			}
+		}
+		// Added entries: collected during sculptSmoothWall
+		for (const glm::ivec3 &pos : addedPositions) {
+			if (!volRegion.containsPoint(pos)) {
+				continue;
+			}
+			if (!currentSolid.hasValue(pos.x, pos.y, pos.z)) {
+				continue;
+			}
+			const voxel::Voxel &cv = colorVolume.voxel(pos);
+			if (!voxel::isBlocked(cv.getMaterial())) {
+				continue;
+			}
+			voxel::Voxel v = cv;
+			v.setFlags(voxel::FlagOutline);
+			saveToHistory(vol, pos);
+			if (vol->setVoxel(pos, v)) {
+				if (dirtyRegion.isValid()) {
+					dirtyRegion.accumulate(pos);
+				} else {
+					dirtyRegion = voxel::Region(pos, pos);
+				}
+			}
+		}
+		// Single bulk dirty-region update (2 calls instead of N)
+		if (dirtyRegion.isValid()) {
+			wrapper.addToDirtyRegion(dirtyRegion.getLowerCorner());
+			wrapper.addToDirtyRegion(dirtyRegion.getUpperCorner());
 		}
 		return;
 	}
@@ -612,14 +642,43 @@ void SculptBrush::generate(scenegraph::SceneGraph &, ModifierVolumeWrapper &wrap
 
 	_paramsDirty = false;
 
+	// Fast path for commit: when MarkUndo is set, the volume already has the
+	// correct data from the NoUndo preview run. Just report the dirty region
+	// from _historyEntries so the undo system records the change.
+	if ((_sceneModifiedFlags & SceneModifiedFlags::MarkUndo) == SceneModifiedFlags::MarkUndo) {
+		if (!_historyEntries.empty()) {
+			for (const voxel::VoxelPosition &entry : _historyEntries) {
+				wrapper.addToDirtyRegion(entry.pos);
+			}
+		}
+		return;
+	}
+
 	// ExtendPlane uses additive painting - no history restore between strokes
 	if (_sculptMode == SculptMode::ExtendPlane) {
 		if (!_planeFitted && _flattenFace != voxel::FaceNames::Max) {
 			fitPlaneFromSnapshot();
+			if (_planeFitted) {
+				// Initialize history tracking for dedup in saveToHistory().
+				// Must happen before any painting so the first write to each position
+				// is recorded as the original value.
+				voxel::RawVolume *vol = wrapper.volume();
+				_historyRegion = _snapshotRegion;
+				_historyRegion.grow(_brushRadius + _removeAboveDepth + 2);
+				_historyRegion.cropTo(vol->region());
+				_historyBits = voxel::BitVolume(_historyRegion);
+			}
 		}
 		if (_planeFitted && _active) {
 			paintExtendPlane(wrapper, ctx);
 			_lastPaintPos = ctx.cursorPosition;
+			markDirty();
+		} else if (_planeFitted && !_active && !_historyEntries.empty()) {
+			// Commit path: _active is false, changes are already in the volume.
+			// Mark all modified positions as dirty so the undo system captures them.
+			for (const voxel::VoxelPosition &entry : _historyEntries) {
+				wrapper.addToDirtyRegion(entry.pos);
+			}
 			markDirty();
 		}
 		return;
@@ -745,7 +804,6 @@ void SculptBrush::paintExtendPlane(ModifierVolumeWrapper &wrapper, const BrushCo
 	voxel::RawVolume *vol = wrapper.volume();
 	const voxel::Region &volRegion = vol->region();
 	const bool fromPositive = voxel::isPositiveFace(_flattenFace);
-	const int step = fromPositive ? 1 : -1;
 
 	const int cursorU = ctx.cursorPosition[_planeUAxis];
 	const int cursorV = ctx.cursorPosition[_planeVAxis];
@@ -761,18 +819,7 @@ void SculptBrush::paintExtendPlane(ModifierVolumeWrapper &wrapper, const BrushCo
 	static constexpr int uvNeighborDV[] = {0, 0, -1, 1};
 	static constexpr int numUVNeighbors = 4;
 
-	// Precompute removal ray direction (perpendicular to fitted plane)
-	static constexpr float RayStep = 0.5f;
 	const voxel::Voxel air;
-	glm::vec3 removeNormal(0.0f);
-	const float removeLineLen = static_cast<float>(_removeAboveDepth);
-	if (_removeAboveDepth > 0) {
-		removeNormal[_planeUAxis] = -_planeGradU;
-		removeNormal[_planeVAxis] = -_planeGradV;
-		removeNormal[_planeHeightAxis] = 1.0f;
-		removeNormal *= static_cast<float>(step);
-		removeNormal = glm::normalize(removeNormal);
-	}
 
 	for (int u = cursorU - _brushRadius; u <= cursorU + _brushRadius; ++u) {
 		for (int v = cursorV - _brushRadius; v <= cursorV + _brushRadius; ++v) {
@@ -816,49 +863,28 @@ void SculptBrush::paintExtendPlane(ModifierVolumeWrapper &wrapper, const BrushCo
 				}
 			}
 
-			// Remove voxels along a thick 3D ray perpendicular to the plane.
-			// Only remove voxels that do NOT have FlagOutline (preserves selected
-			// and newly placed voxels).
+			// Remove voxels above the plane in this column. Iterate along the
+			// height axis from just above the fill span up to removeAboveDepth.
+			// Only removes non-outlined voxels so newly placed / selected voxels
+			// are preserved. Column-based removal avoids the lateral bleed that
+			// the old thick-ray approach caused.
 			if (_removeAboveDepth > 0) {
-				glm::vec3 origin;
-				origin[_planeUAxis] = static_cast<float>(u);
-				origin[_planeVAxis] = static_cast<float>(v);
-				origin[_planeHeightAxis] = static_cast<float>(hiH) + 0.5f * static_cast<float>(step);
-
-				glm::ivec3 prevPos(INT_MIN);
-				for (float t = 0.0f; t <= removeLineLen; t += RayStep) {
-					const glm::vec3 fp = origin + removeNormal * t;
-					const glm::ivec3 pos(static_cast<int>(glm::round(fp.x)),
-										 static_cast<int>(glm::round(fp.y)),
-										 static_cast<int>(glm::round(fp.z)));
-					if (pos == prevPos) {
+				const int clearStart = fromPositive ? hiH + 1 : loH - 1;
+				const int clearEnd = fromPositive
+					? hiH + _removeAboveDepth
+					: loH - _removeAboveDepth;
+				const int clearStep = fromPositive ? 1 : -1;
+				for (int h = clearStart; fromPositive ? (h <= clearEnd) : (h >= clearEnd); h += clearStep) {
+					glm::ivec3 pos;
+					pos[_planeUAxis] = u;
+					pos[_planeVAxis] = v;
+					pos[_planeHeightAxis] = h;
+					if (!volRegion.containsPoint(pos)) {
 						continue;
 					}
-					prevPos = pos;
-					// Clear center + 18 face/edge neighbors, but skip outlined voxels
-					if (volRegion.containsPoint(pos)) {
-						const voxel::Voxel &vx = vol->voxel(pos);
-						if (!voxel::isAir(vx.getMaterial()) && (vx.getFlags() & voxel::FlagOutline) == 0) {
-							writeVoxel(wrapper, pos, air);
-						}
-					}
-					for (const glm::ivec3 &offset : voxel::arrayPathfinderFaces) {
-						const glm::ivec3 nPos = pos + offset;
-						if (volRegion.containsPoint(nPos)) {
-							const voxel::Voxel &vx = vol->voxel(nPos);
-							if (!voxel::isAir(vx.getMaterial()) && (vx.getFlags() & voxel::FlagOutline) == 0) {
-								writeVoxel(wrapper, nPos, air);
-							}
-						}
-					}
-					for (const glm::ivec3 &offset : voxel::arrayPathfinderEdges) {
-						const glm::ivec3 nPos = pos + offset;
-						if (volRegion.containsPoint(nPos)) {
-							const voxel::Voxel &vx = vol->voxel(nPos);
-							if (!voxel::isAir(vx.getMaterial()) && (vx.getFlags() & voxel::FlagOutline) == 0) {
-								writeVoxel(wrapper, nPos, air);
-							}
-						}
+					const voxel::Voxel &vx = vol->voxel(pos);
+					if (!voxel::isAir(vx.getMaterial()) && (vx.getFlags() & voxel::FlagOutline) == 0) {
+						writeVoxel(wrapper, pos, air);
 					}
 				}
 			}
@@ -920,15 +946,15 @@ void SculptBrush::setSkinVolume(const voxel::RawVolume *skinVolume) {
 	if (skinVolume != nullptr) {
 		const voxel::Region &sr = skinVolume->region();
 		const glm::ivec3 extents = sr.getUpperCorner() - sr.getLowerCorner() + 1;
-		// Auto-detect depth axis from thinnest dimension
+		// Auto-detect depth axis from thinnest dimension (positive face = outward)
 		if (extents.x <= extents.y && extents.x <= extents.z) {
-			_reskinConfig.skinDepthAxis = math::Axis::X;
+			_reskinConfig.skinFace = voxel::FaceNames::PositiveX;
 		} else if (extents.z <= extents.x && extents.z <= extents.y) {
-			_reskinConfig.skinDepthAxis = math::Axis::Z;
+			_reskinConfig.skinFace = voxel::FaceNames::PositiveZ;
 		} else {
-			_reskinConfig.skinDepthAxis = math::Axis::Y;
+			_reskinConfig.skinFace = voxel::FaceNames::PositiveY;
 		}
-		const int upIdx = math::getIndexForAxis(_reskinConfig.skinDepthAxis);
+		const int upIdx = math::getIndexForAxis(voxel::faceToAxis(_reskinConfig.skinFace));
 		const int depthExtent = extents[upIdx];
 		_reskinConfig.skinDepth = glm::clamp(depthExtent, 1, MaxReskinDepth);
 	}
