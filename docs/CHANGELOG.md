@@ -45,6 +45,13 @@ General:
    - Added stipple line and bezier curve lua bindings
    - Greatly improved greedy texture mesher performance (14x+ faster)
    - Improved markdown rendering with multiline code block support
+   - Fixed Minecraft schematic loading (#802)
+   - Fixed Sandbox VXA/VXR/VXM format issues
+   - Resolved UUID collisions when importing scene nodes
+   - Added animation export/import to transfer animations between scenes
+   - Added pathfinder and SparseVolume lua bindings
+   - Removed volume count limit for very large scenes
+   - Improved rendering performance for scenes with thousands of nodes
 
 VoxEdit:
 
@@ -60,14 +67,14 @@ VoxEdit:
    - Added uniform scale checkbox for transform brush
    - Added sprint action button for game mode movement
    - Persist scene mode setting across sessions
-   - Added new brushes and lua script execution as MCP tools
+   - Added lua script execution as MCP tools
    - Fixed shading preview for selection brush (#783)
    - Improved performance with dirty tracking for AABB and bone mesh rebuilds
    - Improved performance by deferring hidden volume uploads
    - Added IKConstraint editing and inverse kinematic solver
    - Fixed scroll to active node in scene graph panel
    - Auto enable a newly created animation
-   - Fixed pivot change not taking local child transform into acount
+   - Fixed pivot change not taking local child transform into account
    - Improved locked axis handling
    - Fixed locked plane position change
    - Fixed mirror plane rendering
@@ -78,19 +85,29 @@ VoxEdit:
    - Fixed a few missing network messages on undo/redo
    - Converted options menu to options dialog
    - Added extrude brush for face-based extrusion and carving
-   - Added extended selection system
    - Added `globalcopy`/`globalpaste` commands for cross-instance clipboard sharing
    - Fixed potential crashes when using brushes in some circumstances
-   - Added new brushes
    - Added camera commands (`camera_mouselook`, `camera_reset`, `camera_mode`, `camera_projection`)
    - Added network chat feature
    - Split image/model asset panel and file panel into dedicated panels
    - Fixed loading a new scene not stopping a previously running animation
    - Added searchable combo box for script selection
+   - Added voxel-size input mode for transform scale brush
+   - Added rescale content for scene nodes
+   - Added resize option to scene graph context menu
+   - Added script browser for downloading, installing, and managing community scripts
+   - Added custom lua-based selection modes
+   - Added lua-based brush scripting (AABB brushes)
+   - Added `camera_target_reference` command
+   - Added `palette_addcolor` command
+   - Added thickness support to line brush
+   - Configurable sprint speed multiplier for game mode
+   - Added Teardown body height setting for game mode
 
 VoxConvert:
 
    - Extend `--json` options
+   - Fixed `--rotate` for multi-node chunked models
 
 ## 0.4.0 (2026-02-08)
 

@@ -4,6 +4,7 @@
 
 #include "SelectBrush.h"
 #include "LUASelectionMode.h"
+#include "voxedit-util/SceneManager.h"
 #include "core/collection/DynamicMap.h"
 #include "scenegraph/SceneGraph.h"
 #include "math/Axis.h"
@@ -185,6 +186,11 @@ void SelectBrush::setSelectMode(SelectMode mode) {
 void SelectBrush::setLuaSelectionMode(int index, LUASelectionMode *mode) {
 	_luaSelectionModeIndex = index;
 	_activeLuaSelectionMode = mode;
+	if (index >= 0 && mode != nullptr) {
+		_selectMode = SelectMode::Script;
+	} else if (_selectMode == SelectMode::Script) {
+		_selectMode = SelectMode::All;
+	}
 }
 
 bool SelectBrush::needsAdditionalAction(const BrushContext &ctx) const {
@@ -194,6 +200,7 @@ bool SelectBrush::needsAdditionalAction(const BrushContext &ctx) const {
 	if (_selectMode != SelectMode::All && _selectMode != SelectMode::Box3D) {
 		return false;
 	}
+	// TODO: this must be forwarded to the lua selection mode implementations instead of hardcoded here.
 	return Super::needsAdditionalAction(ctx);
 }
 
@@ -247,7 +254,7 @@ bool SelectBrush::beginBrush(const BrushContext &ctx) {
 }
 
 voxel::Region SelectBrush::calcRegion(const BrushContext &ctx) const {
-	if (isLuaSelectionModeActive()) {
+	if (_selectMode == SelectMode::Script) {
 		return ctx.targetVolumeRegion;
 	}
 	if (_selectMode == SelectMode::Circle && _aabbMode && _aabbFace != voxel::FaceNames::Max) {
@@ -303,8 +310,21 @@ voxel::Region SelectBrush::calcRegion(const BrushContext &ctx) const {
 void SelectBrush::generate(scenegraph::SceneGraph &sceneGraph, ModifierVolumeWrapper &wrapper, const BrushContext &ctx,
 						   const voxel::Region &region) {
 	// Delegate to lua selection mode if active
-	if (isLuaSelectionModeActive()) {
+	if (_selectMode == SelectMode::Script && _activeLuaSelectionMode != nullptr) {
 		_activeLuaSelectionMode->execute(sceneGraph, wrapper, ctx, region, _aabbFirstPos, _aabbFace);
+		if (_sceneManager) {
+			const voxelgenerator::LuaDirtyRegions &dirtyRegions = _activeLuaSelectionMode->dirtyRegions();
+			Log::debug("SelectBrush::generate: %i dirty regions after lua execution", (int)dirtyRegions.size());
+			for (const auto &entry : dirtyRegions) {
+				const int dirtyNodeId = entry->key;
+				const voxel::Region &dirtyRegion = entry->value;
+				if (dirtyRegion.isValid()) {
+					Log::debug("SelectBrush::generate: forwarding dirty region for node %i: %s",
+							   dirtyNodeId, dirtyRegion.toString().c_str());
+					_sceneManager->modified(dirtyNodeId, dirtyRegion);
+				}
+			}
+		}
 		return;
 	}
 
@@ -575,6 +595,7 @@ void SelectBrush::generate(scenegraph::SceneGraph &sceneGraph, ModifierVolumeWra
 		_paintDirtyRegion.accumulate(selectionRegion);
 		break;
 	}
+	case SelectMode::Script:
 	case SelectMode::Max:
 		return;
 	}

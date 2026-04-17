@@ -17,6 +17,7 @@ set(SRCS
 	modifier/brush/TransformBrush.cpp modifier/brush/TransformBrush.h
 	modifier/brush/RulerBrush.cpp modifier/brush/RulerBrush.h
 	modifier/brush/SculptBrush.cpp modifier/brush/SculptBrush.h
+	modifier/brush/SnapshotHelper.cpp modifier/brush/SnapshotHelper.h
 	modifier/brush/TextureBrush.cpp modifier/brush/TextureBrush.h
 
 	modifier/IModifierRenderer.h
@@ -25,6 +26,8 @@ set(SRCS
 	modifier/ModifierRenderer.h modifier/ModifierRenderer.cpp
 	modifier/ModifierType.h
 	modifier/ModifierVolumeWrapper.h
+	modifier/PreviewManager.h modifier/PreviewManager.cpp
+	modifier/ScriptManager.h modifier/ScriptManager.cpp
 	modifier/ShapeType.h
 	modifier/SceneModifiedFlags.h
 
@@ -118,9 +121,11 @@ set(TEST_SRCS
 	tests/ExtrudeBrushTest.cpp
 	tests/TransformBrushTest.cpp
 	tests/SculptBrushTest.cpp
+	tests/SnapshotHelperTest.cpp
 	tests/LineBrushTest.cpp
 	tests/ModifierTest.cpp
 	tests/ModifierVolumeWrapperTest.cpp
+	tests/PreviewManagerTest.cpp
 	tests/NormalBrushTest.cpp
 	tests/PaintBrushTest.cpp
 	tests/PlaneBrushTest.cpp
@@ -173,6 +178,7 @@ endif()
 if (USE_BENCHMARKS)
 	set(BENCHMARK_SRCS
 		benchmarks/ModifierVolumeWrapperBenchmark.cpp
+		benchmarks/SnapshotHelperBenchmark.cpp
 		benchmarks/SculptBrushBenchmark.cpp
 		benchmarks/TransformBrushBenchmark.cpp
 		benchmarks/ExtrudeBrushBenchmark.cpp

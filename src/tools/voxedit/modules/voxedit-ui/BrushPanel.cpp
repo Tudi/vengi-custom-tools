@@ -95,7 +95,8 @@ static constexpr const char *SelectModeIcons[] = {
 	ICON_LC_BOX,                 // Box3D
 	ICON_LC_CIRCLE,              // Circle
 	ICON_LC_LASSO,               // Lasso
-	ICON_LC_PAINTBRUSH           // Paint
+	ICON_LC_PAINTBRUSH,          // Paint
+	ICON_LC_CODE,                // Script
 };
 // clang-format on
 static_assert(lengthof(SelectModeIcons) == (int)SelectMode::Max, "SelectModeIcons size mismatch");
@@ -393,7 +394,7 @@ void BrushPanel::updateScriptBrushPanel(command::CommandExecutionListener &liste
 	ImGui::CommandButton(_("Rescan"), "brushscriptrescan", listener);
 	ImGui::TooltipTextUnformatted(_("Re-scan the brushes directory for new or changed scripts"));
 
-	LUABrush *activeBrush = modifier.activeLuaBrush();
+	LUABrush *activeBrush = modifier.scriptManager().activeLuaBrush();
 	if (activeBrush == nullptr) {
 		return;
 	}
@@ -682,14 +683,15 @@ void BrushPanel::updateSelectBrushPanel(command::CommandExecutionListener &liste
 	SelectBrush &brush = modifier.selectBrush();
 
 	const SelectMode currentSelectMode = brush.selectMode();
-	const bool luaModeActive = brush.isLuaSelectionModeActive();
-	const core::DynamicArray<LUASelectionMode *> &luaModes = modifier.luaSelectionModes();
+	const bool luaModeActive = currentSelectMode == SelectMode::Script;
+	const core::DynamicArray<LUASelectionMode *> &luaModes = modifier.scriptManager().luaSelectionModes();
 
 	const char *SelectModeStr[] = {
 		C_("SelectMode", "All"),		   C_("SelectMode", "Surface"),		C_("SelectMode", "Same Color"),
 		C_("SelectMode", "Fuzzy Color"),   C_("SelectMode", "Connected"),	C_("SelectMode", "Flat Surface"),
 		C_("SelectMode", "3D Box"),		   C_("SelectMode", "Circle"),
-		C_("SelectMode", "Lasso"),		   C_("SelectMode", "Paint")};
+		C_("SelectMode", "Lasso"),		   C_("SelectMode", "Paint"),
+		C_("SelectMode", "Script")};
 	static_assert(lengthof(SelectModeStr) == (int)SelectMode::Max, "Array size mismatch");
 
 	core::String currentSelectLabel;
@@ -703,6 +705,9 @@ void BrushPanel::updateSelectBrushPanel(command::CommandExecutionListener &liste
 	if (ImGui::BeginCombo(_("Select mode"), currentSelectLabel.c_str(), ImGuiComboFlags_None)) {
 		// Native modes
 		for (int i = 0; i < (int)SelectMode::Max; ++i) {
+			if ((SelectMode)i == SelectMode::Script) {
+				continue;
+			}
 			const bool selected = !luaModeActive && (int)currentSelectMode == i;
 			const core::String selectLabel = core::String::format("%s %s", SelectModeIcons[i], SelectModeStr[i]);
 			if (ImGui::Selectable(selectLabel.c_str(), selected)) {
@@ -743,31 +748,31 @@ void BrushPanel::updateSelectBrushPanel(command::CommandExecutionListener &liste
 	ImGui::CommandIconButton(ICON_LC_SCAN, _("Deselect Color"), "deselectcolor", listener);
 	ImGui::EndDisabled();
 
-	if (brush.selectMode() == SelectMode::FuzzyColor && !luaModeActive) {
+	if (brush.selectMode() == SelectMode::FuzzyColor) {
 		handleSelectFuzzyColor();
 	}
 
-	if (brush.selectMode() == SelectMode::FlatSurface && !luaModeActive) {
+	if (brush.selectMode() == SelectMode::FlatSurface) {
 		handleSelectFlatSurface();
 	}
 
-	if (brush.selectMode() == SelectMode::Lasso && !luaModeActive) {
+	if (brush.selectMode() == SelectMode::Lasso) {
 		handleSelectLasso(listener);
 	}
 
-	if (brush.selectMode() == SelectMode::Paint && !luaModeActive) {
+	if (brush.selectMode() == SelectMode::Paint) {
 		handleSelectPaint(nodeId);
 	}
 
-	if (brush.selectMode() == SelectMode::Circle && !luaModeActive && brush.ellipseValid() && _sceneMgr->hasSelection(nodeId)) {
+	if (brush.selectMode() == SelectMode::Circle && brush.ellipseValid() && _sceneMgr->hasSelection(nodeId)) {
 		handleSelectCircle(nodeId);
 	}
 
-	if (brush.selectMode() == SelectMode::Box3D && !luaModeActive) {
+	if (brush.selectMode() == SelectMode::Box3D) {
 		handleSelectBox3D(nodeId);
 	}
 
-	if (luaModeActive) {
+	if (brush.selectMode() == SelectMode::Script) {
 		LUASelectionMode *luaMode = brush.activeLuaSelectionMode();
 		if (!luaMode->scriptDescription().empty()) {
 			ImGui::TextWrappedUnformatted(luaMode->scriptDescription().c_str());
@@ -1992,8 +1997,9 @@ void BrushPanel::addModifiers(command::CommandExecutionListener &listener) {
 	}
 
 	// Render per-script brush buttons
-	const core::DynamicArray<LUABrush *> &luaBrushes = modifier.luaBrushes();
-	const int activeLuaIdx = modifier.activeLuaBrushIndex();
+	ScriptManager &scriptMgr = modifier.scriptManager();
+	const core::DynamicArray<LUABrush *> &luaBrushes = scriptMgr.luaBrushes();
+	const int activeLuaIdx = scriptMgr.activeLuaBrushIndex();
 	for (int i = 0; i < (int)luaBrushes.size(); ++i) {
 		const LUABrush *lb = luaBrushes[i];
 		const bool isActive = brushType == BrushType::Script && activeLuaIdx == i;
@@ -2002,9 +2008,9 @@ void BrushPanel::addModifiers(command::CommandExecutionListener &listener) {
 			styleButton.setButtonColor(style::color(style::ColorActiveBrush));
 		}
 		const int idx = i;
-		auto func = [&modifier, idx]() {
+		auto func = [&modifier, &scriptMgr, idx]() {
 			modifier.setBrushType(BrushType::Script);
-			modifier.setActiveLuaBrushIndex(idx);
+			scriptMgr.setActiveLuaBrushIndex(idx);
 		};
 		toolbarBrush.button(lb->iconString(), lb->scriptName().c_str(), func, !isActive);
 	}
