@@ -319,11 +319,7 @@ void ExtrudeBrush::writeVoxel(ModifierVolumeWrapper &wrapper, PositionSet &saved
 		_history.push_back({pos, vol->voxel(pos)});
 		savedPositions.insert(pos);
 	}
-	voxel::Voxel v = newVoxel;
-	if (voxel::isBlocked(v.getMaterial())) {
-		v.setFlags(voxel::FlagOutline);
-	}
-	vol->setVoxel(pos, v);
+	vol->setVoxel(pos, newVoxel);
 	wrapper.addToDirtyRegion(pos);
 }
 

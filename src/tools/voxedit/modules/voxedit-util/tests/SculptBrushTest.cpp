@@ -48,6 +48,7 @@ TEST_F(SculptBrushTest, testErodeRemovesProtrusion) {
 
 	SculptBrush brush;
 	ASSERT_TRUE(brush.init());
+	brush.onActivated();
 	brush.setSculptMode(SculptMode::Erode);
 	// strength=0.5 -> removeThreshold=2: removes voxels with 0-1 solid face-neighbors
 	brush.setStrength(0.5f);
@@ -92,6 +93,7 @@ TEST_F(SculptBrushTest, testErodePreservesFlatSurface) {
 
 	SculptBrush brush;
 	ASSERT_TRUE(brush.init());
+	brush.onActivated();
 	brush.setSculptMode(SculptMode::Erode);
 	brush.setStrength(0.4f);
 	brush.setIterations(10);
@@ -130,6 +132,7 @@ TEST_F(SculptBrushTest, testErodeReversible) {
 
 	SculptBrush brush;
 	ASSERT_TRUE(brush.init());
+	brush.onActivated();
 	brush.setSculptMode(SculptMode::Erode);
 
 	BrushContext ctx;
@@ -175,6 +178,7 @@ TEST_F(SculptBrushTest, testErodePreservesUnselected) {
 
 	SculptBrush brush;
 	ASSERT_TRUE(brush.init());
+	brush.onActivated();
 	brush.setSculptMode(SculptMode::Erode);
 	brush.setStrength(1.0f);
 	brush.setIterations(3);
@@ -215,6 +219,7 @@ TEST_F(SculptBrushTest, testGrowFillsGap) {
 
 	SculptBrush brush;
 	ASSERT_TRUE(brush.init());
+	brush.onActivated();
 	brush.setSculptMode(SculptMode::Grow);
 	// strength=1.0 -> addThreshold=1 (any air touching a solid voxel)
 	brush.setStrength(1.0f);
@@ -251,6 +256,7 @@ TEST_F(SculptBrushTest, testFlattenRemovesLayers) {
 
 	SculptBrush brush;
 	ASSERT_TRUE(brush.init());
+	brush.onActivated();
 	brush.setSculptMode(SculptMode::Flatten);
 	brush.setIterations(1);
 
@@ -294,6 +300,7 @@ TEST_F(SculptBrushTest, testFlattenReversible) {
 
 	SculptBrush brush;
 	ASSERT_TRUE(brush.init());
+	brush.onActivated();
 	brush.setSculptMode(SculptMode::Flatten);
 	brush.setIterations(2);
 
@@ -336,6 +343,7 @@ TEST_F(SculptBrushTest, testExtendPlaneFlatSurface) {
 
 	SculptBrush brush;
 	ASSERT_TRUE(brush.init());
+	brush.onActivated();
 	brush.setSculptMode(SculptMode::ExtendPlane);
 	brush.setBrushRadius(2);
 
@@ -380,6 +388,7 @@ TEST_F(SculptBrushTest, testExtendPlaneSlopedSurface) {
 
 	SculptBrush brush;
 	ASSERT_TRUE(brush.init());
+	brush.onActivated();
 	brush.setSculptMode(SculptMode::ExtendPlane);
 	brush.setBrushRadius(0);
 	brush.setExtendOnly(false);
@@ -428,6 +437,7 @@ TEST_F(SculptBrushTest, testExtendPlaneRemoveAbove) {
 
 	SculptBrush brush;
 	ASSERT_TRUE(brush.init());
+	brush.onActivated();
 	brush.setSculptMode(SculptMode::ExtendPlane);
 	brush.setBrushRadius(1);
 	brush.setRemoveAboveDepth(2);
@@ -481,6 +491,7 @@ TEST_F(SculptBrushTest, testExtendPlaneNoPlaneFitted) {
 
 	SculptBrush brush;
 	ASSERT_TRUE(brush.init());
+	brush.onActivated();
 	brush.setSculptMode(SculptMode::ExtendPlane);
 	brush.setBrushRadius(2);
 
@@ -517,6 +528,7 @@ TEST_F(SculptBrushTest, testExtendPlaneExtendOnly) {
 
 	SculptBrush brush;
 	ASSERT_TRUE(brush.init());
+	brush.onActivated();
 	brush.setSculptMode(SculptMode::ExtendPlane);
 	brush.setBrushRadius(0);
 	ASSERT_TRUE(brush.extendOnly());
