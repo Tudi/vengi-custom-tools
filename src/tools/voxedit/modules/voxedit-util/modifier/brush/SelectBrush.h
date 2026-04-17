@@ -6,11 +6,13 @@
 
 #include "AABBBrush.h"
 #include "color/Distance.h"
+#include "core/GLM.h"
 #include "core/collection/DynamicArray.h"
+#include "core/collection/DynamicMap.h"
 #include "voxedit-util/modifier/ModifierType.h"
-#include "voxel/DynamicVoxelArray.h"
 #include "voxel/Face.h"
 #include "voxel/Region.h"
+#include "voxel/Voxel.h"
 #include <glm/common.hpp>
 #include <glm/vec3.hpp>
 
@@ -64,6 +66,14 @@ public:
 	static constexpr int LassoPathInitialReserve = 32;
 	/** Sentinel value for _lastLassoCursorPos to force a refresh on first update() */
 	static constexpr int LassoInvalidCursorCoord = -100000;
+	/** Hash bucket count for lasso history maps. Prime, sized for typical polygon
+	 *  edge + rubber-band voxel counts so lookups stay O(1) expected on long lassos. */
+	static constexpr size_t LassoHistoryBuckets = 1031;
+	/** Stores original voxel state at positions we temporarily overwrote with
+	 *  FlagOutline marks. Replaces a linear DynamicVoxelArray so duplicate-position
+	 *  checks are hash lookups, not O(N) scans. */
+	using LassoHistoryMap =
+		core::DynamicMap<glm::ivec3, voxel::Voxel, LassoHistoryBuckets, glm::hash<glm::ivec3>>;
 
 private:
 	using Super = AABBBrush;
@@ -92,7 +102,7 @@ private:
 	/** Lasso polygon vertices accumulated across multiple clicks */
 	core::DynamicArray<glm::ivec3> _lassoPath;
 	/** Original voxels at edge mark positions - used to revert edge flags on cancel */
-	voxel::DynamicVoxelArray _lassoEdgeHistory;
+	LassoHistoryMap _lassoEdgeHistory;
 	/** True while the user is still building the lasso polygon (not yet closed) */
 	bool _lassoAccumulating = false;
 	/** U and V axis indices for projection onto the clicked face plane */
@@ -104,6 +114,12 @@ private:
 	voxel::FaceNames _lassoFace = voxel::FaceNames::Max;
 	/** Last cursor position seen by update(), used to detect movement between clicks */
 	glm::ivec3 _lastLassoCursorPos{LassoInvalidCursorCoord};
+
+	/** Original voxels at the current rubber-band segment positions on the real
+	 *  volume. Reverted and rewritten on every cursor move during accumulation so
+	 *  we never need a preview volume copy for the line - the 32^3 preview
+	 *  allocation cap never applies. */
+	LassoHistoryMap _lassoRubberBandHistory;
 
 	/** True while paint-select drag is active (between beginBrush and endBrush) */
 	bool _paintAccumulating = false;

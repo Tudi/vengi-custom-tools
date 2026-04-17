@@ -995,6 +995,71 @@ TEST_F(SelectBrushTest, testLassoSelectSquareSurface) {
 	brush.shutdown();
 }
 
+TEST_F(SelectBrushTest, testLassoEdgeOnVaryingHeightTerrain) {
+	// Regression test for the "invisible box hides part of the line" visual bug:
+	// when terrain height between lasso vertices is taller than the clicked Y,
+	// drawLassoEdgeSurface must scan the full face-normal axis of the volume,
+	// not a narrow band between the two click positions. Otherwise the edge mark
+	// lands on a hidden interior voxel (under the hill) and the line appears to
+	// have gaps where the visible surface is.
+	voxel::RawVolume volume(voxel::Region(glm::ivec3(-1, -1, -1), glm::ivec3(10, 10, 10)));
+	// Flat floor at y=0 spanning x=[0..8], z=[0..8].
+	for (int z = 0; z <= 8; ++z) {
+		for (int x = 0; x <= 8; ++x) {
+			volume.setVoxel(x, 0, z, voxel::createVoxel(voxel::VoxelType::Generic, 1));
+		}
+	}
+	// Tall column at (4,*,4) rising to y=5 - visible surface top there is y=5.
+	for (int y = 1; y <= 5; ++y) {
+		volume.setVoxel(4, y, 4, voxel::createVoxel(voxel::VoxelType::Generic, 1));
+	}
+
+	scenegraph::SceneGraphNode node(scenegraph::SceneGraphNodeType::Model);
+	node.setUnownedVolume(&volume);
+
+	SelectBrush brush(nullptr);
+	ASSERT_TRUE(brush.init());
+	brush.setSelectMode(SelectMode::Lasso);
+
+	BrushContext ctx;
+	ctx.targetVolumeRegion = volume.region();
+	ctx.gridResolution = 1;
+	ctx.cursorFace = voxel::FaceNames::PositiveY;
+
+	// V1 at (2,0,2), V2 at (6,0,6). Bresenham UV line passes through (4,*,4),
+	// where the topmost surface voxel is at y=5 (the column top), not at y=0.
+	ctx.cursorPosition = glm::ivec3(2, 0, 2);
+	EXPECT_TRUE(brush.beginBrush(ctx));
+	{
+		scenegraph::SceneGraph sceneGraph;
+		ModifierVolumeWrapper wrapper(node, ModifierType::Override);
+		brush.preExecute(ctx, wrapper.volume());
+		brush.execute(sceneGraph, wrapper, ctx);
+	}
+	brush.endBrush(ctx);
+
+	ctx.cursorPosition = glm::ivec3(6, 0, 6);
+	EXPECT_TRUE(brush.beginBrush(ctx));
+	{
+		scenegraph::SceneGraph sceneGraph;
+		ModifierVolumeWrapper wrapper(node, ModifierType::Override);
+		brush.preExecute(ctx, wrapper.volume());
+		brush.execute(sceneGraph, wrapper, ctx);
+	}
+	brush.endBrush(ctx);
+
+	// The visible surface at (4,5,4) must be marked - scanning from wHi downward
+	// finds the column top first.
+	EXPECT_NE(volume.voxel(4, 5, 4).getFlags() & voxel::FlagOutline, 0)
+		<< "Column top (4,5,4) should be marked - surface scan must cover full Y range";
+	// The hidden floor voxel under the column must NOT be marked (scan stops at the
+	// first solid voxel from the face direction).
+	EXPECT_EQ(volume.voxel(4, 0, 4).getFlags() & voxel::FlagOutline, 0)
+		<< "Hidden floor voxel (4,0,4) under the column should not be marked";
+
+	brush.shutdown();
+}
+
 TEST_F(SelectBrushTest, testLassoCancel_edgeMarksReverted) {
 	// Draw two vertices (producing an edge), cancel, verify no FlagOutline remains
 	voxel::RawVolume volume({-1, 10});

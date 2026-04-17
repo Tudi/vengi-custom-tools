@@ -74,6 +74,7 @@ void SelectBrush::reset() {
 	Super::reset();
 	_lassoPath.clear();
 	_lassoEdgeHistory.clear();
+	_lassoRubberBandHistory.clear();
 	_lassoAccumulating = false;
 	_paintAccumulating = false;
 	_paintHadSelection = false;
@@ -87,6 +88,7 @@ void SelectBrush::onSceneChange() {
 	Super::onSceneChange();
 	_lassoPath.clear();
 	_lassoEdgeHistory.clear();
+	_lassoRubberBandHistory.clear();
 	_lassoAccumulating = false;
 	_paintAccumulating = false;
 	_paintHadSelection = false;
@@ -111,7 +113,11 @@ void SelectBrush::abort(BrushContext &ctx) {
 }
 
 bool SelectBrush::hasPendingChanges() const {
-	if (_lassoAccumulating && !_lassoEdgeHistory.empty()) {
+	// Whenever we're accumulating a lasso polygon, we draw edges and the rubber-band
+	// line directly on the real volume (no preview copy). Returning true here makes
+	// PreviewManager skip allocation so Modifier::render() calls executeBrush on the
+	// real node every frame - the 32^3 preview allocation cap never applies.
+	if (_lassoAccumulating) {
 		return true;
 	}
 	if (_paintAccumulating && _paintDirtyRegion.isValid()) {
@@ -122,9 +128,16 @@ bool SelectBrush::hasPendingChanges() const {
 
 voxel::Region SelectBrush::revertChanges(voxel::RawVolume *volume) {
 	voxel::Region dirtyRegion = voxel::Region::InvalidRegion;
-	for (const voxel::VoxelPosition &entry : _lassoEdgeHistory) {
-		volume->setVoxel(entry.pos, entry.voxel);
-		dirtyRegion.accumulate(entry.pos);
+	// Revert rubber-band first. Its entries may have captured edge-marked voxels at
+	// overlap points; reverting edges afterwards restores the true original state.
+	for (auto *entry : _lassoRubberBandHistory) {
+		volume->setVoxel(entry->key, entry->value);
+		dirtyRegion.accumulate(entry->key);
+	}
+	_lassoRubberBandHistory.clear();
+	for (auto *entry : _lassoEdgeHistory) {
+		volume->setVoxel(entry->key, entry->value);
+		dirtyRegion.accumulate(entry->key);
 	}
 	_lassoEdgeHistory.clear();
 	return dirtyRegion;
@@ -173,6 +186,7 @@ void SelectBrush::setSelectMode(SelectMode mode) {
 		// Edge history voxels on the real volume become orphaned here.
 		// The user can undo to recover them; clearing avoids stale state.
 		_lassoEdgeHistory.clear();
+		_lassoRubberBandHistory.clear();
 		if (mode == SelectMode::Paint) {
 			setSingleMode();
 			if (_radius == 0) {
@@ -229,6 +243,7 @@ bool SelectBrush::beginBrush(const BrushContext &ctx) {
 		// Start a new lasso polygon
 		_lassoPath.clear();
 		_lassoEdgeHistory.clear();
+		_lassoRubberBandHistory.clear();
 		_lassoPath.reserve(LassoPathInitialReserve);
 		_lassoPath.push_back(applyGridResolution(ctx.cursorPosition, ctx.gridResolution));
 		_lassoFace = ctx.cursorFace;
@@ -288,13 +303,18 @@ voxel::Region SelectBrush::calcRegion(const BrushContext &ctx) const {
 		circleRegion.cropTo(ctx.targetVolumeRegion);
 		return circleRegion;
 	}
-	// For lasso accumulation, return a tight bbox of the rubber-band segment
-	// (last vertex to cursor) so the preview system can show it as a ghost.
+	// For lasso accumulation, the rubber-band is drawn directly on the real volume
+	// (no preview copy). hasPendingChanges() returns true so PreviewManager bails out
+	// and Modifier::render() calls executeBrush on the real node. The region returned
+	// here is just the bbox passed into drawLassoEdgeSurface for column scanning, so
+	// it must span the full volume W-range to find surface voxels at any height.
 	if (_selectMode == SelectMode::Lasso && _lassoAccumulating && !_lassoPath.empty()) {
 		const glm::ivec3 &lastPt = _lassoPath.back();
 		const glm::ivec3 &cursor = ctx.cursorPosition;
-		const glm::ivec3 mins = glm::min(lastPt, cursor);
-		const glm::ivec3 maxs = glm::max(lastPt, cursor);
+		glm::ivec3 mins = glm::min(lastPt, cursor);
+		glm::ivec3 maxs = glm::max(lastPt, cursor);
+		mins[_lassoFaceAxisIdx] = ctx.targetVolumeRegion.getLowerCorner()[_lassoFaceAxisIdx];
+		maxs[_lassoFaceAxisIdx] = ctx.targetVolumeRegion.getUpperCorner()[_lassoFaceAxisIdx];
 		voxel::Region rubberBandRegion(mins, maxs);
 		rubberBandRegion.cropTo(ctx.targetVolumeRegion);
 		return rubberBandRegion;
@@ -487,45 +507,71 @@ void SelectBrush::generate(scenegraph::SceneGraph &sceneGraph, ModifierVolumeWra
 		const int wAxis = _lassoFaceAxisIdx;
 		const bool positiveNormal = voxel::isPositiveFace(_lassoFace);
 
-		// Restore all edge history voxels into the wrapper, adding them to the dirty
-		// region so the NoUndo edge marks are included in any subsequent undo entry.
-		auto restoreEdgeHistory = [&]() {
-			for (const voxel::VoxelPosition &entry : _lassoEdgeHistory) {
-				wrapper.volume()->setVoxel(entry.pos, entry.voxel);
-				wrapper.addToDirtyRegion(entry.pos);
+		// Restore history voxels into the wrapper and add them to the dirty region so
+		// the NoUndo marks are included in any subsequent undo entry.
+		auto restoreHistory = [&](LassoHistoryMap &history) {
+			for (auto *entry : history) {
+				wrapper.volume()->setVoxel(entry->key, entry->value);
+				wrapper.addToDirtyRegion(entry->key);
 			}
-			_lassoEdgeHistory.clear();
+			history.clear();
+		};
+		// Bresenham step count for one UV segment - exactly the number of voxels
+		// drawLassoEdgeSurface will push into a history map for that segment.
+		auto bresenhamLength = [uAxis, vAxis](const glm::ivec3 &startPt, const glm::ivec3 &endPt) {
+			return (size_t)(glm::max(glm::abs(endPt[uAxis] - startPt[uAxis]),
+									 glm::abs(endPt[vAxis] - startPt[vAxis])) + 1);
+		};
+		auto captureFunc = [&](LassoHistoryMap &history) {
+			return [&history, &func](int x, int y, int z, const voxel::Voxel &v) {
+				const glm::ivec3 pos(x, y, z);
+				// Store original voxel only on first encounter so overlapping segments
+				// don't overwrite the true original with an already-marked voxel.
+				if (history.find(pos) == history.end()) {
+					history.put(pos, v);
+				}
+				func(x, y, z, v);
+			};
 		};
 
 		if (_lassoAccumulating) {
 			const int vertexCount = (int)_lassoPath.size();
-			if (_previewMode) {
-				// Preview copy already contains edge marks from the real volume.
-				// Draw only the rubber-band from last vertex to current cursor.
-				if (ctx.cursorFace != voxel::FaceNames::Max && vertexCount >= 1) {
-					voxelutil::drawLassoEdgeSurface([&](const glm::ivec3 &pos) { return wrapper.voxel(pos); },
-													_lassoPath[vertexCount - 1], ctx.cursorPosition, uAxis, vAxis,
-													wAxis, positiveNormal, selectionRegion, func);
-				}
-			} else {
-				// Draw committed edges on the real volume (NoUndo - no undo entry per click).
-				// Restore previous marks first so stale selections don't linger.
-				restoreEdgeHistory();
-				// Only store the original voxel on first encounter - if two edge segments
-				// share a position, the first visit has the unmodified voxel state.
-				auto edgeFunc = [&](int x, int y, int z, const voxel::Voxel &v) {
-					if (!_lassoEdgeHistory.hasVoxel(glm::ivec3(x, y, z))) {
-						_lassoEdgeHistory.setVoxel(x, y, z, v);
-					}
-					func(x, y, z, v);
-				};
-				for (int edgeIdx = 1; edgeIdx < vertexCount; ++edgeIdx) {
-					voxelutil::drawLassoEdgeSurface([&](const glm::ivec3 &pos) { return wrapper.voxel(pos); },
-													_lassoPath[edgeIdx - 1], _lassoPath[edgeIdx], uAxis, vAxis, wAxis,
-													positiveNormal, selectionRegion, edgeFunc);
-				}
-				_sceneModifiedFlags = SceneModifiedFlags::NoUndo;
+			// Rubber-band + edges draw directly on the real volume (no preview copy).
+			// hasPendingChanges() returns true while accumulating, so PreviewManager
+			// skips allocation and this branch runs on the real node volume every frame
+			// - sidestepping the 32^3 preview cap that would otherwise hide the line on
+			// long diagonals. Revert rubber-band first (may have captured edge-marked
+			// voxels at overlaps), then edges, so the volume is back to its original
+			// state before we redraw both layers.
+			restoreHistory(_lassoRubberBandHistory);
+			restoreHistory(_lassoEdgeHistory);
+			// Reserve both histories up front so the DynamicMap pre-allocates one
+			// node block for the expected count instead of allocating on first insert.
+			size_t edgeReserve = 0u;
+			for (int edgeIdx = 1; edgeIdx < vertexCount; ++edgeIdx) {
+				edgeReserve += bresenhamLength(_lassoPath[edgeIdx - 1], _lassoPath[edgeIdx]);
 			}
+			_lassoEdgeHistory.reserve(edgeReserve);
+			auto edgeFunc = captureFunc(_lassoEdgeHistory);
+			// W-axis scan spans the full target volume so surface voxels at any height
+			// are covered across all committed edges.
+			for (int edgeIdx = 1; edgeIdx < vertexCount; ++edgeIdx) {
+				voxelutil::drawLassoEdgeSurface([&](const glm::ivec3 &pos) { return wrapper.voxel(pos); },
+												_lassoPath[edgeIdx - 1], _lassoPath[edgeIdx], uAxis, vAxis, wAxis,
+												positiveNormal, ctx.targetVolumeRegion, edgeFunc);
+			}
+			// Rubber-band captures whatever the volume looks like after the edge pass;
+			// on overlap points, reverting it restores the edge-marked state, and
+			// reverting the edge history afterwards restores the true original.
+			if (ctx.cursorFace != voxel::FaceNames::Max && vertexCount >= 1) {
+				const glm::ivec3 &lastVertex = _lassoPath[vertexCount - 1];
+				_lassoRubberBandHistory.reserve(bresenhamLength(lastVertex, ctx.cursorPosition));
+				auto rubberBandFunc = captureFunc(_lassoRubberBandHistory);
+				voxelutil::drawLassoEdgeSurface([&](const glm::ivec3 &pos) { return wrapper.voxel(pos); },
+												lastVertex, ctx.cursorPosition, uAxis, vAxis, wAxis,
+												positiveNormal, ctx.targetVolumeRegion, rubberBandFunc);
+			}
+			_sceneModifiedFlags = SceneModifiedFlags::NoUndo;
 			return;
 		}
 
@@ -535,10 +581,13 @@ void SelectBrush::generate(scenegraph::SceneGraph &sceneGraph, ModifierVolumeWra
 			return;
 		}
 		if (!_previewMode) {
-			// Restore edge history voxels BEFORE applying selection so their positions
-			// are included in the dirty region. This ensures the undo entry covers ALL
-			// edge marks (including those outside the polygon) and undo reverts cleanly.
-			restoreEdgeHistory();
+			// Restore rubber-band + edge history voxels BEFORE applying selection so
+			// their positions are included in the dirty region. This ensures the undo
+			// entry covers ALL transient marks (inside and outside the polygon) and
+			// undo reverts cleanly. Rubber-band first so edge-marked overlap points
+			// get restored to the true original by the edge revert that follows.
+			restoreHistory(_lassoRubberBandHistory);
+			restoreHistory(_lassoEdgeHistory);
 		}
 		auto lassoFunc = [&](int x, int y, int z, const voxel::Voxel &v) {
 			const glm::ivec3 pos(x, y, z);
@@ -611,10 +660,18 @@ void SelectBrush::redrawEdgesOnVolume(voxel::RawVolume *volume, const voxel::Reg
 	const int wAxis = _lassoFaceAxisIdx;
 	const bool positiveNormal = voxel::isPositiveFace(_lassoFace);
 
+	size_t edgeReserve = 0u;
+	for (int edgeIdx = 1; edgeIdx < vertexCount; ++edgeIdx) {
+		const glm::ivec3 &startPt = _lassoPath[edgeIdx - 1];
+		const glm::ivec3 &endPt = _lassoPath[edgeIdx];
+		edgeReserve += (size_t)(glm::max(glm::abs(endPt[uAxis] - startPt[uAxis]),
+										 glm::abs(endPt[vAxis] - startPt[vAxis])) + 1);
+	}
+	_lassoEdgeHistory.reserve(edgeReserve);
 	auto edgeFunc = [&](int x, int y, int z, const voxel::Voxel &v) {
 		const glm::ivec3 pos(x, y, z);
-		if (!_lassoEdgeHistory.hasVoxel(pos)) {
-			_lassoEdgeHistory.setVoxel(x, y, z, v);
+		if (_lassoEdgeHistory.find(pos) == _lassoEdgeHistory.end()) {
+			_lassoEdgeHistory.put(pos, v);
 		}
 		voxel::Voxel flagged = v;
 		flagged.setFlags(flagged.getFlags() | voxel::FlagOutline);
@@ -632,6 +689,7 @@ void SelectBrush::invalidateLasso() {
 	_lassoAccumulating = false;
 	_lassoPath.clear();
 	_lassoEdgeHistory.clear();
+	_lassoRubberBandHistory.clear();
 }
 
 void SelectBrush::popLastLassoPathEntry() {
