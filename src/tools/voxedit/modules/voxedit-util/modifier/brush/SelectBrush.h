@@ -183,11 +183,14 @@ public:
 	voxel::Region revertChanges(voxel::RawVolume *volume) override;
 	voxel::Region consumePendingUndoRegion() override;
 	void abort(BrushContext &ctx) override;
+	bool onDeactivated() override;
 
 	bool paintGrowRegion() const;
 	void setPaintGrowRegion(bool v);
 	int lassoUAxis() const;
 	int lassoVAxis() const;
+	int lassoFaceAxisIdx() const;
+	voxel::FaceNames lassoFace() const;
 
 	/** Discard the in-progress lasso polygon (caller must clean up edge history voxels in the volume) */
 	void invalidateLasso();
@@ -296,6 +299,14 @@ inline int SelectBrush::lassoUAxis() const {
 
 inline int SelectBrush::lassoVAxis() const {
 	return _lassoVAxis;
+}
+
+inline int SelectBrush::lassoFaceAxisIdx() const {
+	return _lassoFaceAxisIdx;
+}
+
+inline voxel::FaceNames SelectBrush::lassoFace() const {
+	return _lassoFace;
 }
 
 inline bool SelectBrush::ellipseValid() const {

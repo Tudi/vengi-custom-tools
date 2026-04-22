@@ -2319,4 +2319,354 @@ TEST_F(SceneManagerTest, testUndoAfterSelectAndEditDoesNotBlockEditing) {
 		<< "Editing should work after undoing an edit that was done within a selection";
 }
 
+// Regression: undoing an additive overlapping selection should restore the pre-selection
+// state, i.e. the original selection A plus nothing more. Overlapping second selection
+// with a partially-overlapping region should leave only A selected after undo, but an
+// "invisible box" area may stay selected due to memento capture boundaries.
+TEST_F(SceneManagerTest, testUndoOverlappingSelection) {
+	const voxel::Region region{0, 9};
+	ASSERT_TRUE(_sceneMgr->newScene(true, "overlapsel_test", region));
+	const int nodeId = _sceneMgr->sceneGraph().activeNode();
+	voxel::RawVolume *v = _sceneMgr->volume(nodeId);
+	ASSERT_NE(nullptr, v);
+
+	// Fill with solid voxels so FlagOutline changes are observable
+	for (int z = 0; z <= 9; ++z) {
+		for (int y = 0; y <= 9; ++y) {
+			for (int x = 0; x <= 9; ++x) {
+				v->setVoxel(x, y, z, voxel::createVoxel(voxel::VoxelType::Generic, 1));
+			}
+		}
+	}
+
+	scenegraph::SceneGraphNode *node = _sceneMgr->sceneGraphModelNode(nodeId);
+	ASSERT_NE(nullptr, node);
+
+	// Zone A: x in [0..4] - creates memento state 1
+	const voxel::Region zoneA{glm::ivec3(0, 0, 0), glm::ivec3(4, 9, 9)};
+	node->select(zoneA);
+	_sceneMgr->modified(nodeId, zoneA, SceneModifiedFlags::All);
+
+	// Zone B (overlapping): x in [2..6] - creates memento state 2
+	const voxel::Region zoneB{glm::ivec3(2, 0, 0), glm::ivec3(6, 9, 9)};
+	node->select(zoneB);
+	_sceneMgr->modified(nodeId, zoneB, SceneModifiedFlags::All);
+
+	// Verify pre-undo state: union A ∪ B is selected
+	for (int x = 0; x <= 9; ++x) {
+		const bool expected = (x <= 6);
+		const bool actual = (v->voxel(x, 0, 0).getFlags() & voxel::FlagOutline) != 0;
+		EXPECT_EQ(expected, actual) << "pre-undo x=" << x;
+	}
+
+	// Undo zone B
+	ASSERT_TRUE(_sceneMgr->undo());
+
+	// After undo, only zone A should be selected
+	for (int x = 0; x <= 9; ++x) {
+		const bool expected = (x <= 4);
+		const bool actual = (v->voxel(x, 0, 0).getFlags() & voxel::FlagOutline) != 0;
+		EXPECT_EQ(expected, actual) << "post-undo x=" << x << " (expected zone A only)";
+	}
+}
+
+// Regression: lasso selection + undo on top of an existing zone selection must revert only
+// the voxels the lasso added, leaving zone A untouched. User-reported bug: "invisible box"
+// where polygon-bbox voxels retained the selection flag after undo.
+TEST_F(SceneManagerTest, testUndoLassoOverlappingSelection) {
+	// Flat XZ panel at y=0 so visitSurfaceVolume covers every panel voxel
+	const voxel::Region region{0, 9};
+	ASSERT_TRUE(_sceneMgr->newScene(true, "lasso_overlap", region));
+	const int nodeId = _sceneMgr->sceneGraph().activeNode();
+	voxel::RawVolume *v = _sceneMgr->volume(nodeId);
+	ASSERT_NE(nullptr, v);
+	for (int z = 0; z <= 9; ++z) {
+		for (int x = 0; x <= 9; ++x) {
+			v->setVoxel(x, 0, z, voxel::createVoxel(voxel::VoxelType::Generic, 1));
+		}
+	}
+
+	scenegraph::SceneGraphNode *node = _sceneMgr->sceneGraphModelNode(nodeId);
+	ASSERT_NE(nullptr, node);
+
+	// Zone A: x in [0..4], z in [0..9] - creates memento state 1
+	const voxel::Region zoneA{glm::ivec3(0, 0, 0), glm::ivec3(4, 0, 9)};
+	node->select(zoneA);
+	_sceneMgr->modified(nodeId, zoneA, SceneModifiedFlags::All);
+
+	// Set up lasso: drive beginBrush() to push vertices onto _lassoPath
+	Modifier &modifier = _sceneMgr->modifier();
+	modifier.setBrushType(BrushType::Select);
+	SelectBrush &selBrush = modifier.selectBrush();
+	selBrush.setSelectMode(SelectMode::Lasso);
+
+	// Square polygon over x in [2..6], z in [2..6] - overlaps zone A (x in [2..4])
+	auto clickVertex = [&](const glm::ivec3 &pos) {
+		modifier.setCursorPosition(pos, voxel::FaceNames::PositiveY);
+		modifier.beginBrush();
+	};
+	clickVertex(glm::ivec3(2, 0, 2));
+	clickVertex(glm::ivec3(6, 0, 2));
+	clickVertex(glm::ivec3(6, 0, 6));
+	clickVertex(glm::ivec3(2, 0, 6));
+
+	ASSERT_TRUE(selBrush.lassoAccumulating());
+	ASSERT_EQ((int)selBrush.lassoPath().size(), 4);
+
+	// Finalize the polygon -> creates memento state 2 with All flag
+	_sceneMgr->selectionFinalizeLasso(nodeId);
+
+	// Sanity: after finalize, zone A (x<=4) plus polygon interior (x in [2..6], z in [2..6]) selected
+	// Check panel voxels at z=4 (inside polygon for x in [3..5], edge-inclusive depends on lassoContains)
+	// Voxels on row z=0 should reflect zone A only (not inside polygon at z=0)
+	for (int x = 0; x <= 9; ++x) {
+		const bool expected = (x <= 4); // only zone A (polygon doesn't overlap z=0)
+		const bool actual = (v->voxel(x, 0, 0).getFlags() & voxel::FlagOutline) != 0;
+		EXPECT_EQ(expected, actual) << "pre-undo row z=0 x=" << x;
+	}
+
+	// Undo the lasso
+	ASSERT_TRUE(_sceneMgr->undo());
+
+	// After undo: only zone A must remain. The critical row is z in [2..6] where
+	// polygon voxels OUTSIDE zone A (x in [5..6]) must be cleared AND voxels
+	// INSIDE zone A (x in [2..4]) must still be selected
+	for (int z = 0; z <= 9; ++z) {
+		for (int x = 0; x <= 9; ++x) {
+			const bool expected = (x <= 4); // zone A only
+			const bool actual = (v->voxel(x, 0, z).getFlags() & voxel::FlagOutline) != 0;
+			EXPECT_EQ(expected, actual) << "post-undo x=" << x << " z=" << z;
+		}
+	}
+}
+
+// Large-volume variant: user reported the bug on a panel >= 128x128. Exercise the lasso
+// undo on a 200x200x2 panel to see if any size-dependent path (parallel visitor, memento
+// chunking, selection region cache threshold) triggers the "invisible box" regression.
+TEST_F(SceneManagerTest, testUndoLassoOverlappingSelectionLargeVolume) {
+	const voxel::Region region{glm::ivec3(0, 0, 0), glm::ivec3(199, 1, 199)};
+	ASSERT_TRUE(_sceneMgr->newScene(true, "lasso_overlap_big", region));
+	const int nodeId = _sceneMgr->sceneGraph().activeNode();
+	voxel::RawVolume *v = _sceneMgr->volume(nodeId);
+	ASSERT_NE(nullptr, v);
+
+	// Flat XZ panel at y=0, spanning x,z in [0..199]
+	for (int z = 0; z <= 199; ++z) {
+		for (int x = 0; x <= 199; ++x) {
+			v->setVoxel(x, 0, z, voxel::createVoxel(voxel::VoxelType::Generic, 1));
+		}
+	}
+
+	scenegraph::SceneGraphNode *node = _sceneMgr->sceneGraphModelNode(nodeId);
+	ASSERT_NE(nullptr, node);
+
+	// Zone A: x in [0..100]
+	const voxel::Region zoneA{glm::ivec3(0, 0, 0), glm::ivec3(100, 0, 199)};
+	node->select(zoneA);
+	_sceneMgr->modified(nodeId, zoneA, SceneModifiedFlags::All);
+
+	// Lasso polygon overlapping zone A: square at x in [50..150], z in [50..150]
+	Modifier &modifier = _sceneMgr->modifier();
+	modifier.setBrushType(BrushType::Select);
+	SelectBrush &selBrush = modifier.selectBrush();
+	selBrush.setSelectMode(SelectMode::Lasso);
+
+	auto clickVertex = [&](const glm::ivec3 &pos) {
+		modifier.setCursorPosition(pos, voxel::FaceNames::PositiveY);
+		modifier.beginBrush();
+	};
+	clickVertex(glm::ivec3(50, 0, 50));
+	clickVertex(glm::ivec3(150, 0, 50));
+	clickVertex(glm::ivec3(150, 0, 150));
+	clickVertex(glm::ivec3(50, 0, 150));
+
+	ASSERT_TRUE(selBrush.lassoAccumulating());
+	ASSERT_EQ((int)selBrush.lassoPath().size(), 4);
+
+	_sceneMgr->selectionFinalizeLasso(nodeId);
+
+	// Undo the lasso
+	ASSERT_TRUE(_sceneMgr->undo());
+
+	// After undo: only zone A must remain selected. Sample the critical row at z=100
+	// which intersects both zone A (x<=100) and polygon (x in [50..150]).
+	int unexpectedSelected = 0;
+	glm::ivec3 firstBad(-1);
+	for (int z = 0; z <= 199; ++z) {
+		for (int x = 0; x <= 199; ++x) {
+			const bool expected = (x <= 100); // zone A only
+			const bool actual = (v->voxel(x, 0, z).getFlags() & voxel::FlagOutline) != 0;
+			if (expected != actual) {
+				if (unexpectedSelected == 0) {
+					firstBad = glm::ivec3(x, 0, z);
+				}
+				++unexpectedSelected;
+			}
+		}
+	}
+	EXPECT_EQ(unexpectedSelected, 0)
+		<< "post-undo mismatches: " << unexpectedSelected
+		<< " first at " << firstBad.x << "," << firstBad.y << "," << firstBad.z;
+}
+
+// Same scenario but drive via the real executeBrush flow (Path A - polygon close via
+// beginBrush triggers visitSurfaceVolume through the ModifierVolumeWrapper) rather than
+// the finalizelasso command (Path B - direct selectionFinalizeLasso). This matches the
+// click-to-close UI path the user exercises.
+TEST_F(SceneManagerTest, testUndoLassoOverlappingSelectionViaExecuteBrush) {
+	const voxel::Region region{glm::ivec3(0, 0, 0), glm::ivec3(199, 1, 199)};
+	ASSERT_TRUE(_sceneMgr->newScene(true, "lasso_overlap_exec", region));
+	const int nodeId = _sceneMgr->sceneGraph().activeNode();
+	voxel::RawVolume *v = _sceneMgr->volume(nodeId);
+	ASSERT_NE(nullptr, v);
+
+	for (int z = 0; z <= 199; ++z) {
+		for (int x = 0; x <= 199; ++x) {
+			v->setVoxel(x, 0, z, voxel::createVoxel(voxel::VoxelType::Generic, 1));
+		}
+	}
+
+	scenegraph::SceneGraphNode *node = _sceneMgr->sceneGraphModelNode(nodeId);
+	ASSERT_NE(nullptr, node);
+
+	// Zone A via node->select (simulate a pre-existing selection)
+	const voxel::Region zoneA{glm::ivec3(0, 0, 0), glm::ivec3(100, 0, 199)};
+	node->select(zoneA);
+	_sceneMgr->modified(nodeId, zoneA, SceneModifiedFlags::All);
+
+	// Drive the real brush flow: beginBrush + execute for each click
+	Modifier &modifier = _sceneMgr->modifier();
+	modifier.setBrushType(BrushType::Select);
+	SelectBrush &selBrush = modifier.selectBrush();
+	selBrush.setSelectMode(SelectMode::Lasso);
+
+	scenegraph::SceneGraph &sg = _sceneMgr->sceneGraph();
+	auto clickAndExecute = [&](const glm::ivec3 &pos) {
+		modifier.setCursorPosition(pos, voxel::FaceNames::PositiveY);
+		EXPECT_TRUE(modifier.beginBrush());
+		auto cb = [&](const voxel::Region &modRegion, ModifierType, SceneModifiedFlags flags) {
+			_sceneMgr->modified(nodeId, modRegion, flags);
+		};
+		EXPECT_TRUE(modifier.execute(sg, *node, cb));
+	};
+
+	// 4 vertices + 5th click at first vertex to close polygon (triggers Path A)
+	clickAndExecute(glm::ivec3(50, 0, 50));
+	clickAndExecute(glm::ivec3(150, 0, 50));
+	clickAndExecute(glm::ivec3(150, 0, 150));
+	clickAndExecute(glm::ivec3(50, 0, 150));
+	clickAndExecute(glm::ivec3(50, 0, 50)); // close
+
+	// After polygon close execute runs visitSurfaceVolume -> wrapper.setFlagAt over polygon
+	// interior. Pre-undo sanity: expect selected = (x<=100) OR inside polygon bbox surface
+	// Undo must revert to zone A only.
+	ASSERT_TRUE(_sceneMgr->undo());
+
+	int unexpectedSelected = 0;
+	glm::ivec3 firstBad(-1);
+	for (int z = 0; z <= 199; ++z) {
+		for (int x = 0; x <= 199; ++x) {
+			const bool expected = (x <= 100);
+			const bool actual = (v->voxel(x, 0, z).getFlags() & voxel::FlagOutline) != 0;
+			if (expected != actual) {
+				if (unexpectedSelected == 0) {
+					firstBad = glm::ivec3(x, 0, z);
+				}
+				++unexpectedSelected;
+			}
+		}
+	}
+	EXPECT_EQ(unexpectedSelected, 0)
+		<< "post-undo mismatches: " << unexpectedSelected
+		<< " first at " << firstBad.x << "," << firstBad.y << "," << firstBad.z;
+}
+
+// Matches the exact user scenario: Select brush in "All" mode with an AABB rectangle
+// (the "pole"), then Lasso drawing a crossing polygon, then undo. User reports that
+// only part of the crossing pole gets reverted.
+TEST_F(SceneManagerTest, testUndoLassoAfterSelectAllRectangle) {
+	const voxel::Region fullRegion{glm::ivec3(0, 0, 0), glm::ivec3(199, 1, 199)};
+	ASSERT_TRUE(_sceneMgr->newScene(true, "lasso_crossing", fullRegion));
+	const int nodeId = _sceneMgr->sceneGraph().activeNode();
+	voxel::RawVolume *v = _sceneMgr->volume(nodeId);
+	ASSERT_NE(nullptr, v);
+
+	for (int z = 0; z <= 199; ++z) {
+		for (int x = 0; x <= 199; ++x) {
+			v->setVoxel(x, 0, z, voxel::createVoxel(voxel::VoxelType::Generic, 1));
+		}
+	}
+
+	scenegraph::SceneGraphNode *node = _sceneMgr->sceneGraphModelNode(nodeId);
+	ASSERT_NE(nullptr, node);
+
+	Modifier &modifier = _sceneMgr->modifier();
+	SelectBrush &selBrush = modifier.selectBrush();
+	scenegraph::SceneGraph &sg = _sceneMgr->sceneGraph();
+
+	auto runSelectCallback = [&](const voxel::Region &region, ModifierType, SceneModifiedFlags flags) {
+		_sceneMgr->modified(nodeId, region, flags);
+	};
+
+	// Zone A: vertical pole via Select/All AABB. Select brush defaults to SelectMode::All
+	modifier.setBrushType(BrushType::Select);
+	selBrush.setSelectMode(SelectMode::All);
+	modifier.setCursorPosition(glm::ivec3(80, 0, 0), voxel::FaceNames::PositiveY);
+	ASSERT_TRUE(modifier.beginBrush());
+	modifier.setCursorPosition(glm::ivec3(120, 0, 199), voxel::FaceNames::PositiveY);
+	modifier.executeAdditionalAction();
+	ASSERT_TRUE(modifier.execute(sg, *node, runSelectCallback));
+	modifier.endBrush();
+
+	// Sanity: pole selected at (100, 0, 100)
+	ASSERT_NE(v->voxel(100, 0, 100).getFlags() & voxel::FlagOutline, 0)
+		<< "Zone A pole should be selected before lasso";
+	// Voxels outside pole should not be selected
+	ASSERT_EQ(v->voxel(10, 0, 100).getFlags() & voxel::FlagOutline, 0);
+	ASSERT_EQ(v->voxel(180, 0, 100).getFlags() & voxel::FlagOutline, 0);
+
+	// Lasso: crossing HORIZONTAL pole (z in [80..120], x in [0..199])
+	selBrush.setSelectMode(SelectMode::Lasso);
+	auto clickAndExecute = [&](const glm::ivec3 &pos) {
+		modifier.setCursorPosition(pos, voxel::FaceNames::PositiveY);
+		EXPECT_TRUE(modifier.beginBrush());
+		EXPECT_TRUE(modifier.execute(sg, *node, runSelectCallback));
+	};
+	clickAndExecute(glm::ivec3(0, 0, 80));
+	clickAndExecute(glm::ivec3(199, 0, 80));
+	clickAndExecute(glm::ivec3(199, 0, 120));
+	clickAndExecute(glm::ivec3(0, 0, 120));
+	clickAndExecute(glm::ivec3(0, 0, 80)); // close
+
+	// After close: union of vertical pole + horizontal pole should be selected. Spot-check.
+	ASSERT_NE(v->voxel(10, 0, 100).getFlags() & voxel::FlagOutline, 0)
+		<< "Horizontal pole (from lasso) should be selected at (10,0,100)";
+	ASSERT_NE(v->voxel(180, 0, 100).getFlags() & voxel::FlagOutline, 0)
+		<< "Horizontal pole (from lasso) should be selected at (180,0,100)";
+	ASSERT_NE(v->voxel(100, 0, 100).getFlags() & voxel::FlagOutline, 0)
+		<< "Intersection should stay selected";
+
+	// Undo: must revert entire lasso (both sides of vertical pole) and leave only Zone A
+	ASSERT_TRUE(_sceneMgr->undo());
+
+	int unexpectedSelected = 0;
+	glm::ivec3 firstBad(-1);
+	for (int z = 0; z <= 199; ++z) {
+		for (int x = 0; x <= 199; ++x) {
+			const bool inZoneA = (x >= 80 && x <= 120);
+			const bool expected = inZoneA;
+			const bool actual = (v->voxel(x, 0, z).getFlags() & voxel::FlagOutline) != 0;
+			if (expected != actual) {
+				if (unexpectedSelected == 0) {
+					firstBad = glm::ivec3(x, 0, z);
+				}
+				++unexpectedSelected;
+			}
+		}
+	}
+	EXPECT_EQ(unexpectedSelected, 0)
+		<< "post-undo mismatches: " << unexpectedSelected
+		<< " first at " << firstBad.x << "," << firstBad.y << "," << firstBad.z;
+}
+
 } // namespace voxedit

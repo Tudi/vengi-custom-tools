@@ -2673,6 +2673,8 @@ void SceneManager::selectionFinalizeLasso(int nodeId) {
 	const core::DynamicArray<glm::ivec3> path = brush.lassoPath();
 	const int uAxis = brush.lassoUAxis();
 	const int vAxis = brush.lassoVAxis();
+	const int wAxis = brush.lassoFaceAxisIdx();
+	const bool positiveNormal = voxel::isPositiveFace(brush.lassoFace());
 
 	voxel::RawVolume *volume = node->volume();
 	voxel::Region dirtyRegion = voxel::Region::InvalidRegion;
@@ -2686,15 +2688,17 @@ void SceneManager::selectionFinalizeLasso(int nodeId) {
 
 	auto selectFunc = [&](int x, int y, int z, const voxel::Voxel &v) {
 		const glm::ivec3 pos(x, y, z);
-		if (!voxelutil::lassoContains(path, pos[uAxis], pos[vAxis], uAxis, vAxis)) {
-			return;
-		}
 		voxel::Voxel modified = v;
 		modified.setFlags(modified.getFlags() | voxel::FlagOutline);
 		volume->setVoxel(pos, modified);
 		dirtyRegion.accumulate(pos);
 	};
-	voxelutil::visitSurfaceVolume(*volume, selectFunc);
+	// Flood-fill from seeds rasterized along every polygon edge, walking 26-connected
+	// surface voxels that project inside the polygon. Unlike a raw visitSurfaceVolume +
+	// 2D point-in-polygon filter, this cannot pick up a disjoint structure that merely
+	// shares the (u, v) silhouette - e.g. a tower behind the rooftop the user lassoed.
+	voxelutil::lassoFloodFillSurface(*volume, path, uAxis, vAxis, wAxis, positiveNormal,
+									 volume->region(), selectFunc);
 
 	if (dirtyRegion.isValid()) {
 		modified(nodeId, dirtyRegion, SceneModifiedFlags::All);

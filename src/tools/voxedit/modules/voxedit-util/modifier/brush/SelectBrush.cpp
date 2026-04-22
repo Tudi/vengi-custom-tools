@@ -159,6 +159,16 @@ voxel::Region SelectBrush::consumePendingUndoRegion() {
 	return region;
 }
 
+bool SelectBrush::onDeactivated() {
+	// A mid-accumulation lasso has FlagOutline marks on the real volume (edge and
+	// rubber-band lines). Revert them instead of letting commit() execute a partial
+	// polygon - otherwise the orphaned marks stay as a "selection" after brush switch.
+	if (_lassoAccumulating && _sceneManager != nullptr) {
+		_sceneManager->selectionCancelLasso(_sceneManager->sceneGraph().activeNode());
+	}
+	return Super::onDeactivated();
+}
+
 void SelectBrush::update(const BrushContext &ctx, double nowSeconds) {
 	Super::update(ctx, nowSeconds);
 	// Between clicks in lasso polygon mode, _aabbMode is false but the brush stays
@@ -174,6 +184,12 @@ void SelectBrush::update(const BrushContext &ctx, double nowSeconds) {
 
 void SelectBrush::setSelectMode(SelectMode mode) {
 	if (_selectMode != mode) {
+		// Revert any in-progress lasso edge/rubber-band marks on the real volume
+		// before switching modes. Without this, FlagOutline on those voxels stays
+		// as an orphaned selection after the mode change.
+		if (_selectMode == SelectMode::Lasso && _lassoAccumulating && _sceneManager != nullptr) {
+			_sceneManager->selectionCancelLasso(_sceneManager->sceneGraph().activeNode());
+		}
 		if (_selectMode == SelectMode::Paint) {
 			setAABBMode();
 			_paintAccumulating = false;
@@ -183,8 +199,6 @@ void SelectBrush::setSelectMode(SelectMode mode) {
 		_ellipseValid = false;
 		_lassoAccumulating = false;
 		_lassoPath.clear();
-		// Edge history voxels on the real volume become orphaned here.
-		// The user can undo to recover them; clearing avoids stale state.
 		_lassoEdgeHistory.clear();
 		_lassoRubberBandHistory.clear();
 		if (mode == SelectMode::Paint) {
@@ -589,13 +603,12 @@ void SelectBrush::generate(scenegraph::SceneGraph &sceneGraph, ModifierVolumeWra
 			restoreHistory(_lassoRubberBandHistory);
 			restoreHistory(_lassoEdgeHistory);
 		}
-		auto lassoFunc = [&](int x, int y, int z, const voxel::Voxel &v) {
-			const glm::ivec3 pos(x, y, z);
-			if (voxelutil::lassoContains(_lassoPath, pos[uAxis], pos[vAxis], uAxis, vAxis)) {
-				func(x, y, z, v);
-			}
-		};
-		voxelutil::visitSurfaceVolume(wrapper, lassoFunc);
+		// Flood-fill from seeds rasterized along every polygon edge, walking 26-connected
+		// surface voxels that project inside the polygon. Disjoint structures sharing
+		// the (u, v) silhouette (e.g. a tower behind the rooftop) are no longer swept
+		// in by the 2D point-in-polygon filter alone.
+		voxelutil::lassoFloodFillSurface(wrapper, _lassoPath, uAxis, vAxis, wAxis, positiveNormal,
+										 ctx.targetVolumeRegion, func);
 		if (!_previewMode) {
 			_lassoPath.clear();
 		}
