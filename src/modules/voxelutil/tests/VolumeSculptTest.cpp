@@ -1395,6 +1395,232 @@ TEST_F(VolumeSculptTest, testReskinStretchMode) {
 	EXPECT_NE(v00.getColor(), v33.getColor());
 }
 
+TEST_F(VolumeSculptTest, testReskinFollowMedianSharedCorners) {
+	// 8x8 bumpy surface with a tall outlier column. Median follow should smooth the
+	// outlier into a plane rather than spike one column up like Voxel follow would.
+	// PositiveY face: perp1=Z(U), perp2=X(V).
+	voxel::Region region(0, 10);
+	voxel::RawVolume volume(region);
+	const voxel::Voxel surface = voxel::createVoxel(voxel::VoxelType::Generic, 1);
+
+	// Flat 8x8 surface at y=0
+	for (int x = 0; x < 8; ++x) {
+		for (int z = 0; z < 8; ++z) {
+			volume.setVoxel(x, 0, z, surface);
+		}
+	}
+	// Single outlier column much higher
+	volume.setVoxel(0, 1, 0, surface);
+	volume.setVoxel(0, 2, 0, surface);
+	volume.setVoxel(0, 3, 0, surface);
+
+	// 4x4 skin, 1 layer deep, single color
+	voxel::Region skinRegion(0, 0, 0, 3, 0, 3);
+	voxel::RawVolume skin(skinRegion);
+	for (int x = 0; x < 4; ++x) {
+		for (int z = 0; z < 4; ++z) {
+			skin.setVoxel(x, 0, z, voxel::createVoxel(voxel::VoxelType::Generic, 50));
+		}
+	}
+
+	ReskinConfig config;
+	config.mode = ReskinMode::Replace;
+	config.tile = ReskinTile::Repeat;
+	config.follow = ReskinFollow::Median;
+	config.skinDepth = 1;
+	config.preview = false;
+
+	voxel::Region selRegion(0, 0, 0, 7, 3, 7);
+	sculptReskin(volume, selRegion, skin, voxel::FaceNames::PositiveY, config);
+
+	// The outlier column contributes one sample (out of tileW*tileH=16) to the corner
+	// medians around (0,0), so the median there stays at y=0. The skin should land at
+	// y=0 for most columns, NOT be pulled up to y=3 by the outlier.
+	int skinAtY0 = 0;
+	for (int x = 0; x < 8; ++x) {
+		for (int z = 0; z < 8; ++z) {
+			if (volume.voxel(x, 0, z).getColor() == 50) {
+				++skinAtY0;
+			}
+		}
+	}
+	// Most non-outlier columns should have skin at y=0 (on the median plane).
+	// (There are 63 non-outlier columns out of 64; the outlier column at (0,0) has
+	// surface at y=3 so it clamps upward and won't appear at y=0.)
+	EXPECT_GT(skinAtY0, 50);
+
+	// Adjacent tiles share corners: at the boundary between tile origin (0,0) and
+	// tile origin (0,4) in V (X direction), both tiles sample the same corner at v=4.
+	// So the interpolated height at v=3 (end of tile 0) and v=4 (start of tile 1)
+	// should be very close - no seam.
+	int heightV3 = -1;
+	int heightV4 = -1;
+	for (int y = 0; y < 10; ++y) {
+		if (volume.voxel(3, y, 2).getColor() == 50) {
+			heightV3 = y;
+		}
+		if (volume.voxel(4, y, 2).getColor() == 50) {
+			heightV4 = y;
+		}
+	}
+	EXPECT_GE(heightV3, 0);
+	EXPECT_GE(heightV4, 0);
+	EXPECT_LE(glm::abs(heightV3 - heightV4), 1);
+}
+
+TEST_F(VolumeSculptTest, testReskinAnchorTopRightCorner) {
+	// TopRight anchor + Once tile must place skin(0,0) at the max-U, min-V corner of the
+	// selection in the SAME world position whether in preview or final mode.
+	// Regression: the anchor offset formerly used effectiveSelW-1 which differs between preview
+	// and final, causing the texture to shift between modes.
+	// PositiveY face: perp1=Z(U), perp2=X(V). Selection Z=[0..19] is U axis, X=[0..3] is V axis.
+	voxel::Region region(0, 21);
+	voxel::RawVolume volume(region);
+	const voxel::Voxel surface = voxel::createVoxel(voxel::VoxelType::Generic, 1);
+
+	for (int z = 0; z < 20; ++z) {
+		for (int x = 0; x < 4; ++x) {
+			volume.setVoxel(x, 0, z, surface);
+		}
+	}
+
+	// 4x4x1 skin. Rows in skin's U axis (Z) carry distinct colors.
+	voxel::Region skinRegion(0, 0, 0, 3, 0, 3);
+	voxel::RawVolume skin(skinRegion);
+	for (int x = 0; x < 4; ++x) {
+		skin.setVoxel(x, 0, 0, voxel::createVoxel(voxel::VoxelType::Generic, 10));
+		skin.setVoxel(x, 0, 1, voxel::createVoxel(voxel::VoxelType::Generic, 11));
+		skin.setVoxel(x, 0, 2, voxel::createVoxel(voxel::VoxelType::Generic, 12));
+		skin.setVoxel(x, 0, 3, voxel::createVoxel(voxel::VoxelType::Generic, 13));
+	}
+
+	ReskinConfig config;
+	config.mode = ReskinMode::Replace;
+	config.tile = ReskinTile::Once;
+	config.follow = ReskinFollow::Voxel;
+	config.anchor = ReskinAnchor::TopRight;
+	config.skinDepth = 1;
+	config.preview = false;
+
+	voxel::Region selRegion(0, 0, 0, 3, 0, 19);
+	sculptReskin(volume, selRegion, skin, voxel::FaceNames::PositiveY, config);
+
+	// TopRight anchor: skin(0,0) lands at uIdx=selW-1=19 (Z=19), vIdx=0 (X=0).
+	// Skin covers Z=[16..19]. skin col 0 at Z=19, col 3 at Z=16.
+	EXPECT_EQ(volume.voxel(0, 0, 19).getColor(), 10);
+	EXPECT_EQ(volume.voxel(0, 0, 18).getColor(), 11);
+	EXPECT_EQ(volume.voxel(0, 0, 17).getColor(), 12);
+	EXPECT_EQ(volume.voxel(0, 0, 16).getColor(), 13);
+	// Outside the tile footprint (Z<16), surface stays untouched
+	EXPECT_EQ(volume.voxel(0, 0, 0).getColor(), 1);
+	EXPECT_EQ(volume.voxel(0, 0, 15).getColor(), 1);
+
+	// Now repeat in preview mode and verify preview puts skin at the SAME world positions.
+	voxel::RawVolume volume2(region);
+	for (int z = 0; z < 20; ++z) {
+		for (int x = 0; x < 4; ++x) {
+			volume2.setVoxel(x, 0, z, surface);
+		}
+	}
+	config.preview = true;
+	sculptReskin(volume2, selRegion, skin, voxel::FaceNames::PositiveY, config);
+	EXPECT_EQ(volume2.voxel(0, 0, 19).getColor(), 10);
+	EXPECT_EQ(volume2.voxel(0, 0, 18).getColor(), 11);
+	EXPECT_EQ(volume2.voxel(0, 0, 17).getColor(), 12);
+	EXPECT_EQ(volume2.voxel(0, 0, 16).getColor(), 13);
+}
+
+TEST_F(VolumeSculptTest, testReskinCornerOutsideSelectionStaysOnSurface) {
+	// Regression: tile corners that fall outside the selection used to return an absolute-zero
+	// fallback from cornerAvgAt/cornerMedianAt. For a selection at non-zero world Y, that zero
+	// pulled the bilinear interpolation off the surface, making the skin visibly float above
+	// (or below) the actual wall.
+	// Setup: flat surface at y=-5 (so absolute 0 disagrees with the real surface by 5 voxels),
+	// selection width 11 is not a multiple of tileW=4, and offsetU=3 pushes the last tile's
+	// far corner well past the selection edge so the sample neighborhood is entirely OOB.
+	// PositiveY face: perp1=Z(U), perp2=X(V).
+	voxel::Region region(-1, -10, -1, 12, 5, 12);
+	voxel::RawVolume volume(region);
+	const voxel::Voxel surfaceVoxel = voxel::createVoxel(voxel::VoxelType::Generic, 1);
+
+	for (int x = 0; x <= 10; ++x) {
+		for (int z = 0; z <= 10; ++z) {
+			volume.setVoxel(x, -5, z, surfaceVoxel);
+		}
+	}
+
+	voxel::Region skinRegion(0, 0, 0, 3, 0, 3);
+	voxel::RawVolume skin(skinRegion);
+	const voxel::Voxel skinVoxel = voxel::createVoxel(voxel::VoxelType::Generic, 50);
+	for (int x = 0; x < 4; ++x) {
+		for (int z = 0; z < 4; ++z) {
+			skin.setVoxel(x, 0, z, skinVoxel);
+		}
+	}
+
+	ReskinConfig config;
+	config.mode = ReskinMode::Replace;
+	config.tile = ReskinTile::Repeat;
+	config.follow = ReskinFollow::CornerAverage;
+	config.anchor = ReskinAnchor::TopLeft;
+	config.offsetU = 3;
+	config.skinDepth = 1;
+	config.zOffset = 0;
+	config.preview = false;
+
+	voxel::Region selRegion(0, -10, 0, 10, 5, 10);
+	sculptReskin(volume, selRegion, skin, voxel::FaceNames::PositiveY, config);
+
+	// The surface is flat at y=-5, so every skin voxel must land exactly there. Before the fix,
+	// columns where the far tile corner was entirely outside the selection saw an interpolated
+	// height pulled toward y=0 and the skin floated above the wall.
+	int skinAtSurface = 0;
+	int skinFloating = 0;
+	for (int x = 0; x <= 10; ++x) {
+		for (int z = 0; z <= 10; ++z) {
+			for (int y = -10; y <= 5; ++y) {
+				if (volume.voxel(x, y, z).getColor() == 50) {
+					if (y == -5) {
+						++skinAtSurface;
+					} else {
+						++skinFloating;
+					}
+				}
+			}
+		}
+	}
+	EXPECT_GT(skinAtSurface, 0);
+	EXPECT_EQ(skinFloating, 0);
+
+	// Same scenario but with Median follow: wider neighborhood, same OOB failure mode.
+	voxel::RawVolume volume2(region);
+	for (int x = 0; x <= 10; ++x) {
+		for (int z = 0; z <= 10; ++z) {
+			volume2.setVoxel(x, -5, z, surfaceVoxel);
+		}
+	}
+	config.follow = ReskinFollow::Median;
+	sculptReskin(volume2, selRegion, skin, voxel::FaceNames::PositiveY, config);
+
+	int medianAtSurface = 0;
+	int medianFloating = 0;
+	for (int x = 0; x <= 10; ++x) {
+		for (int z = 0; z <= 10; ++z) {
+			for (int y = -10; y <= 5; ++y) {
+				if (volume2.voxel(x, y, z).getColor() == 50) {
+					if (y == -5) {
+						++medianAtSurface;
+					} else {
+						++medianFloating;
+					}
+				}
+			}
+		}
+	}
+	EXPECT_GT(medianAtSurface, 0);
+	EXPECT_EQ(medianFloating, 0);
+}
+
 // ---- SmoothWall tests ----
 
 TEST_F(VolumeSculptTest, testSmoothWallFlatWallUnchanged) {

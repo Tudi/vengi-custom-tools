@@ -1838,44 +1838,115 @@ void sculptReskin(voxel::BitVolume &solid, voxel::SparseVolume &voxelMap, const 
 		}
 	}
 
-	// Compute reference height for None/Median modes
+	// Compute reference height for None mode (flat plane at max/min). Median mode samples
+	// the per-tile footprint locally in the column loop below so each tile sits at its
+	// own local surface median rather than one global plane.
 	int referenceHeight = 0;
-	if (config.follow == ReskinFollow::None || config.follow == ReskinFollow::Median) {
-		core::DynamicArray<int> heights;
-		heights.reserve(numCols);
+	if (config.follow == ReskinFollow::None) {
+		bool anyValid = false;
 		for (int i = 0; i < numCols; ++i) {
-			if (surfaceHeight[i] != EMPTY) {
-				heights.push_back(surfaceHeight[i]);
+			if (surfaceHeight[i] == EMPTY) {
+				continue;
+			}
+			if (!anyValid) {
+				referenceHeight = surfaceHeight[i];
+				anyValid = true;
+			} else if (positiveUp) {
+				referenceHeight = glm::max(referenceHeight, surfaceHeight[i]);
+			} else {
+				referenceHeight = glm::min(referenceHeight, surfaceHeight[i]);
 			}
 		}
-		if (heights.empty()) {
+		if (!anyValid) {
 			return;
-		}
-
-		if (config.follow == ReskinFollow::None) {
-			referenceHeight = heights[0];
-			for (size_t i = 1; i < heights.size(); ++i) {
-				if (positiveUp) {
-					referenceHeight = glm::max(referenceHeight, heights[i]);
-				} else {
-					referenceHeight = glm::min(referenceHeight, heights[i]);
-				}
-			}
-		} else {
-			core::sort(heights.begin(), heights.end(), [](int a, int b) { return a < b; });
-			referenceHeight = heights[heights.size() / 2];
 		}
 	}
 
-	// Helper to compute average surface height in a small neighborhood around a selection position
+	// Corner median: sample the surface depth map in a tile-sized neighborhood centered
+	// on (uCenter, vCenter) and return its median. Used at tile corners - adjacent tiles
+	// share the same (clamped) corner position and thus the same median, so tile edges
+	// meet at the same height. A tile-sized window gives many samples for robust smoothing,
+	// far more than cornerAvgAt's 5x5 neighborhood. Returns false when every sample in the
+	// neighborhood is empty so the caller can substitute a per-column fallback.
+	core::DynamicArray<int> medianScratch;
+	auto cornerMedianAt = [&](int uCenter, int vCenter, float &out) -> bool {
+		medianScratch.clear();
+		const int halfU = tileW / 2;
+		const int halfV = tileH / 2;
+		medianScratch.reserve((2 * halfU + 1) * (2 * halfV + 1));
+		for (int du = -halfU; du <= halfU; ++du) {
+			const int u = uCenter + du;
+			if (u < 0 || u >= selW) {
+				continue;
+			}
+			for (int dv = -halfV; dv <= halfV; ++dv) {
+				const int v = vCenter + dv;
+				if (v < 0 || v >= selH) {
+					continue;
+				}
+				const int idx = u * selH + v;
+				if (surfaceHeight[idx] != EMPTY) {
+					medianScratch.push_back(surfaceHeight[idx]);
+				}
+			}
+		}
+		if (medianScratch.empty()) {
+			return false;
+		}
+		core::sort(medianScratch.begin(), medianScratch.end(), [](int a, int b) { return a < b; });
+		out = (float)medianScratch[medianScratch.size() / 2];
+		return true;
+	};
+
+	// Cache corner medians so the 4 corners of N tiles are each computed once.
+	// Key encodes the clamped (uCenter, vCenter) into 64 bits so that two tiles whose
+	// unclamped corners sit at different out-of-bounds positions but clamp to the same
+	// edge share a cache entry. Values can be negative. Only sample-derived medians are
+	// cached; if the neighborhood is empty the per-column fallback is applied at the
+	// caller so we don't leak one column's surface height to another.
+	using CornerMedianMap = core::DynamicMap<int64_t, float, 257, std::hash<int64_t>>;
+	CornerMedianMap cornerMedianCache;
+	auto cornerKey = [](int uCenter, int vCenter) -> int64_t {
+		return ((int64_t)(uint32_t)uCenter << 32) | (int64_t)(uint32_t)vCenter;
+	};
+	auto cornerMedianCached = [&](int uCenter, int vCenter, int fallbackHeight) -> float {
+		const int clampedU = glm::clamp(uCenter, 0, selW - 1);
+		const int clampedV = glm::clamp(vCenter, 0, selH - 1);
+		const int64_t key = cornerKey(clampedU, clampedV);
+		auto iter = cornerMedianCache.find(key);
+		if (iter != cornerMedianCache.end()) {
+			return iter->value;
+		}
+		float m;
+		if (!cornerMedianAt(clampedU, clampedV, m)) {
+			return (float)fallbackHeight;
+		}
+		cornerMedianCache.put(key, m);
+		return m;
+	};
+
+	// Helper to compute average surface height in a small neighborhood around a selection position.
+	// Corners at tile boundaries (including the tile at the far edge) can sit outside the selection.
+	// Individual out-of-bounds samples are skipped rather than clamped so a single tall edge outlier
+	// doesn't get over-weighted. The center itself is clamped into the selection so a corner that
+	// sits fully outside still anchors to the edge the skin actually lands on; if that neighborhood
+	// is still empty (sparse selection), fall back to the caller-supplied per-column surface height.
 	static constexpr int CornerSampleRadius = 2;
-	auto cornerAvgAt = [&](int uCenter, int vCenter) -> float {
+	auto cornerAvgAt = [&](int uCenter, int vCenter, int fallbackHeight) -> float {
+		uCenter = glm::clamp(uCenter, 0, selW - 1);
+		vCenter = glm::clamp(vCenter, 0, selH - 1);
 		int sum = 0;
 		int count = 0;
 		for (int du = -CornerSampleRadius; du <= CornerSampleRadius; ++du) {
+			const int u = uCenter + du;
+			if (u < 0 || u >= selW) {
+				continue;
+			}
 			for (int dv = -CornerSampleRadius; dv <= CornerSampleRadius; ++dv) {
-				const int u = glm::clamp(uCenter + du, 0, selW - 1);
-				const int v = glm::clamp(vCenter + dv, 0, selH - 1);
+				const int v = vCenter + dv;
+				if (v < 0 || v >= selH) {
+					continue;
+				}
 				const int idx = u * selH + v;
 				if (surfaceHeight[idx] != EMPTY) {
 					sum += surfaceHeight[idx];
@@ -1884,7 +1955,7 @@ void sculptReskin(voxel::BitVolume &solid, voxel::SparseVolume &voxelMap, const 
 			}
 		}
 		if (count == 0) {
-			return 0.0f;
+			return (float)fallbackHeight;
 		}
 		return (float)sum / (float)count;
 	};
@@ -1893,8 +1964,23 @@ void sculptReskin(voxel::BitVolume &solid, voxel::SparseVolume &voxelMap, const 
 	const int maxDepth = glm::min(config.skinDepth, skinDExtent);
 	const voxel::Voxel air;
 
-	for (int uIdx = 0; uIdx < effectiveSelW; ++uIdx) {
-		for (int vIdx = 0; vIdx < effectiveSelH; ++vIdx) {
+	// Anchor re-orients the local tile coordinate so that skin(0,0) lands at the chosen
+	// corner of the selection and the tile reads inward from there. distU/distV are the
+	// distance from the anchored corner, based on the true selection size (selW/selH) so
+	// preview and final output agree on where the skin lands.
+	const bool anchorRight =
+		(config.anchor == ReskinAnchor::TopRight || config.anchor == ReskinAnchor::BottomRight);
+	const bool anchorBottom =
+		(config.anchor == ReskinAnchor::BottomLeft || config.anchor == ReskinAnchor::BottomRight);
+	// Shift the preview window toward the anchored corner so the user sees the part of
+	// the selection where the skin actually lands, not a blank area far from the anchor.
+	const int uStart = anchorRight ? (selW - effectiveSelW) : 0;
+	const int vStart = anchorBottom ? (selH - effectiveSelH) : 0;
+	const int uEnd = uStart + effectiveSelW;
+	const int vEnd = vStart + effectiveSelH;
+
+	for (int uIdx = uStart; uIdx < uEnd; ++uIdx) {
+		for (int vIdx = vStart; vIdx < vEnd; ++vIdx) {
 			const int colIdx = uIdx * selH + vIdx;
 			if (surfaceHeight[colIdx] == EMPTY) {
 				continue;
@@ -1907,18 +1993,10 @@ void sculptReskin(voxel::BitVolume &solid, voxel::SparseVolume &voxelMap, const 
 			// Start height for skin application, with z offset
 			const int outwardStep = -inwardStep;
 
-			// Map (u,v) to skin coordinates. Anchor shifts the tiling origin
-			// to the chosen corner of the selection without mirroring.
-			int anchorOffsetU = 0;
-			int anchorOffsetV = 0;
-			if (config.anchor == ReskinAnchor::TopRight || config.anchor == ReskinAnchor::BottomRight) {
-				anchorOffsetU = -(effectiveSelW - 1);
-			}
-			if (config.anchor == ReskinAnchor::BottomLeft || config.anchor == ReskinAnchor::BottomRight) {
-				anchorOffsetV = -(effectiveSelH - 1);
-			}
-			int localU = uIdx + anchorOffsetU + config.offsetU;
-			int localV = vIdx + anchorOffsetV + config.offsetV;
+			const int distU = anchorRight ? (selW - 1 - uIdx) : uIdx;
+			const int distV = anchorBottom ? (selH - 1 - vIdx) : vIdx;
+			int localU = distU + config.offsetU;
+			int localV = distV + config.offsetV;
 
 			// Apply offset (not for Stretch mode)
 			if (config.tile == ReskinTile::Stretch) {
@@ -1974,27 +2052,52 @@ void sculptReskin(voxel::BitVolume &solid, voxel::SparseVolume &voxelMap, const 
 				continue;
 			}
 
+			// Tile corner positions in uIdx/vIdx space. uNear/vNear are the anchor-side
+			// edges (where fu=0 / fv=0), uFar/vFar the opposite edges (shared with the next
+			// tile inward). Adjacent tiles share these corner positions so heights match.
+			const int uNear = anchorRight ? (uIdx + tU) : (uIdx - tU);
+			const int uFar = anchorRight ? (uNear - tileW) : (uNear + tileW);
+			const int vNear = anchorBottom ? (vIdx + tV) : (vIdx - tV);
+			const int vFar = anchorBottom ? (vNear - tileH) : (vNear + tileH);
+			const float fu = (tileW > 1) ? (float)tU / (float)(tileW - 1) : 0.5f;
+			const float fv = (tileH > 1) ? (float)tV / (float)(tileH - 1) : 0.5f;
+
 			// Compute start height based on follow mode
 			int startHeight;
 			if (config.follow == ReskinFollow::Voxel) {
 				startHeight = surface + config.zOffset * outwardStep;
 			} else if (config.follow == ReskinFollow::CornerAverage) {
 				// Per-tile bilinear interpolation: sample surface height at this tile's 4 corners
-				// Adjacent tiles share corners, so they connect seamlessly
-				const int tileOriginU = uIdx - tU;
-				const int tileOriginV = vIdx - tV;
-				const float h00 = cornerAvgAt(tileOriginU, tileOriginV);
-				const float h10 = cornerAvgAt(tileOriginU + tileW, tileOriginV);
-				const float h01 = cornerAvgAt(tileOriginU, tileOriginV + tileH);
-				const float h11 = cornerAvgAt(tileOriginU + tileW, tileOriginV + tileH);
-				const float fu = (tileW > 1) ? (float)tU / (float)(tileW - 1) : 0.5f;
-				const float fv = (tileH > 1) ? (float)tV / (float)(tileH - 1) : 0.5f;
+				// Adjacent tiles share corners, so they connect seamlessly. Pass the column's own
+				// surface as the fallback so an all-empty corner neighborhood resolves to a sane
+				// height instead of absolute 0.
+				const float h00 = cornerAvgAt(uNear, vNear, surface);
+				const float h10 = cornerAvgAt(uFar, vNear, surface);
+				const float h01 = cornerAvgAt(uNear, vFar, surface);
+				const float h11 = cornerAvgAt(uFar, vFar, surface);
 				const float interpH = h00 * (1.0f - fu) * (1.0f - fv) +
 									  h10 * fu * (1.0f - fv) +
 									  h01 * (1.0f - fu) * fv +
 									  h11 * fu * fv;
 				const int planeH = (int)glm::round(interpH);
 				// Clamp so texture never starts inside the wall
+				startHeight = (positiveUp ? glm::max(planeH, surface) : glm::min(planeH, surface))
+							  + config.zOffset * outwardStep;
+			} else if (config.follow == ReskinFollow::Median) {
+				// Hybrid: sample a tile-sized neighborhood median at each of the 4 tile
+				// corners, then bilinearly interpolate between them. Adjacent tiles share
+				// corners, so heights line up at tile edges; the wide median sampling
+				// smooths over uneven surfaces that would confuse a 4-voxel corner average.
+				// Column surface is the fallback when a corner neighborhood is empty.
+				const float h00 = cornerMedianCached(uNear, vNear, surface);
+				const float h10 = cornerMedianCached(uFar, vNear, surface);
+				const float h01 = cornerMedianCached(uNear, vFar, surface);
+				const float h11 = cornerMedianCached(uFar, vFar, surface);
+				const float interpH = h00 * (1.0f - fu) * (1.0f - fv) +
+									  h10 * fu * (1.0f - fv) +
+									  h01 * (1.0f - fu) * fv +
+									  h11 * fu * fv;
+				const int planeH = (int)glm::round(interpH);
 				startHeight = (positiveUp ? glm::max(planeH, surface) : glm::min(planeH, surface))
 							  + config.zOffset * outwardStep;
 			} else {
