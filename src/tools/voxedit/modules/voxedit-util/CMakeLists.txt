@@ -96,6 +96,11 @@ set(SRCS
 	Config.h
 	CommandCompleter.h
 
+	3dprint/FaceClassify.h 3dprint/FaceClassify.cpp
+	3dprint/PrintCommands.h 3dprint/PrintCommands.cpp
+	3dprint/Progress.h 3dprint/Progress.cpp
+	3dprint/Regrid.h 3dprint/Regrid.cpp
+
 	LUAApiListener.h LUAApiListener.cpp
 
 	ISceneRenderer.h
@@ -132,6 +137,7 @@ set(TEST_SRCS
 	tests/RulerBrushTest.cpp
 	tests/ProtocolMessageFactoryTest.cpp
 	tests/SceneManagerTest.cpp
+	tests/RegridTest.cpp
 	tests/SceneRendererTest.cpp
 	tests/SelectBrushTest.cpp
 	tests/ShapeBrushTest.cpp

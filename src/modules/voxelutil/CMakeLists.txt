@@ -19,6 +19,7 @@ set(SRCS
 	VolumeVisitor.h
 	VolumeSelect.h VolumeSelect.cpp
 	VolumeSculpt.h VolumeSculpt.cpp
+	FillHoles.h FillHoles.cpp
 	VoxelUtil.h VoxelUtil.cpp
 )
 engine_add_module(TARGET ${LIB} SRCS ${SRCS} DEPENDENCIES voxel)
@@ -39,6 +40,7 @@ set(TEST_SRCS
 	tests/VolumeVisitorTest.cpp
 	tests/VolumeSculptTest.cpp
 	tests/VolumeSelectTest.cpp
+	tests/FillHolesTest.cpp
 	tests/VoxelUtilTest.cpp
 )
 
