@@ -417,7 +417,6 @@ void ExtrudeBrush::generate(scenegraph::SceneGraph &, ModifierVolumeWrapper &wra
 		for (const glm::ivec3 &pos : _cachedSelectedPositions) {
 			selectedSet.insert(pos);
 		}
-		voxel::RawVolume *vol = wrapper.volume();
 		const voxel::Region &volRegion = vol->region();
 		for (const glm::ivec3 &selPos : _cachedSelectedPositions) {
 			bool isBrim = false;

@@ -5,6 +5,7 @@
 #include "voxedit-util/SceneManager.h"
 #include "voxedit-util/Config.h"
 #include "AbstractSceneManagerTest.h"
+#include "command/Command.h"
 #include "image/Image.h"
 #include "io/FilesystemArchive.h"
 #include "math/tests/TestMathHelper.h"
@@ -1043,6 +1044,163 @@ TEST_F(SceneManagerTest, testFillHollow) {
 	sceneMgr()->testFillHollow();
 	const int voxelsAfter = voxelutil::countVoxels(*v);
 	EXPECT_GT(voxelsAfter, voxelsBefore) << "fillHollow should have filled the interior";
+}
+
+TEST_F(SceneManagerTest, test3dPrintFillHoles) {
+	const voxel::Region region{0, 6};
+	ASSERT_TRUE(_sceneMgr->newScene(true, "3dprint_fillholes_test", region));
+	const int nodeId = _sceneMgr->sceneGraph().activeNode();
+	voxel::RawVolume *v = _sceneMgr->volume(nodeId);
+	ASSERT_NE(nullptr, v);
+
+	// 7x7x7 hollow shell with a 1-voxel hole in the front face at (3,3,0).
+	for (int x = 0; x <= 6; ++x) {
+		for (int y = 0; y <= 6; ++y) {
+			for (int z = 0; z <= 6; ++z) {
+				const bool onShell = (x == 0 || x == 6 || y == 0 || y == 6 || z == 0 || z == 6);
+				if (onShell) {
+					v->setVoxel(x, y, z, voxel::createVoxel(voxel::VoxelType::Generic, 1));
+				}
+			}
+		}
+	}
+	// Poke a hole in the front face.
+	v->setVoxel(3, 3, 0, voxel::Voxel());
+	ASSERT_TRUE(voxel::isAir(v->voxel(3, 3, 0).getMaterial())) << "hole must start empty";
+
+	ASSERT_EQ(1, command::Command::execute("3dprint fillholes"));
+
+	EXPECT_FALSE(voxel::isAir(v->voxel(3, 3, 0).getMaterial()))
+		<< "3dprint fillholes should have filled the 1-voxel hole at (3,3,0)";
+}
+
+TEST_F(SceneManagerTest, test3dPrintFillHolesDebugColor) {
+	const voxel::Region region{0, 6};
+	ASSERT_TRUE(_sceneMgr->newScene(true, "3dprint_fillholes_debug_test", region));
+	const int nodeId = _sceneMgr->sceneGraph().activeNode();
+	voxel::RawVolume *v = _sceneMgr->volume(nodeId);
+	ASSERT_NE(nullptr, v);
+
+	for (int x = 0; x <= 6; ++x) {
+		for (int y = 0; y <= 6; ++y) {
+			for (int z = 0; z <= 6; ++z) {
+				const bool onShell = (x == 0 || x == 6 || y == 0 || y == 6 || z == 0 || z == 6);
+				if (onShell) {
+					v->setVoxel(x, y, z, voxel::createVoxel(voxel::VoxelType::Generic, 1));
+				}
+			}
+		}
+	}
+	v->setVoxel(3, 3, 0, voxel::Voxel());
+
+	// debugColor=7: all fill voxels should come out with palette index 7
+	ASSERT_EQ(1, command::Command::execute("3dprint fillholes 1000 3 7"));
+
+	const voxel::Voxel &filled = v->voxel(3, 3, 0);
+	ASSERT_FALSE(voxel::isAir(filled.getMaterial())) << "hole should be filled";
+	EXPECT_EQ(7, (int)filled.getColor()) << "debug color override should force palette index 7";
+}
+
+TEST_F(SceneManagerTest, test3dPrintSealGaps) {
+	const voxel::Region region{0, 3};
+	ASSERT_TRUE(_sceneMgr->newScene(true, "3dprint_sealgaps_test", region));
+	const int nodeId = _sceneMgr->sceneGraph().activeNode();
+	voxel::RawVolume *v = _sceneMgr->volume(nodeId);
+	ASSERT_NE(nullptr, v);
+
+	// Edge-connected pair: (0,0,0) and (1,0,1). Elbows at (1,0,0) and (0,0,1) are air.
+	v->setVoxel(0, 0, 0, voxel::createVoxel(voxel::VoxelType::Generic, 1));
+	v->setVoxel(1, 0, 1, voxel::createVoxel(voxel::VoxelType::Generic, 1));
+	ASSERT_TRUE(voxel::isAir(v->voxel(1, 0, 0).getMaterial()));
+	ASSERT_TRUE(voxel::isAir(v->voxel(0, 0, 1).getMaterial()));
+
+	ASSERT_EQ(1, command::Command::execute("3dprint sealgaps"));
+
+	const bool e1 = !voxel::isAir(v->voxel(1, 0, 0).getMaterial());
+	const bool e2 = !voxel::isAir(v->voxel(0, 0, 1).getMaterial());
+	EXPECT_TRUE(e1 || e2) << "sealgaps should have filled one elbow between (0,0,0) and (1,0,1)";
+	EXPECT_FALSE(e1 && e2) << "sealgaps should fill exactly one elbow, not both";
+}
+
+TEST_F(SceneManagerTest, test3dPrintSeamFill) {
+	const voxel::Region region{0, 2};
+	ASSERT_TRUE(_sceneMgr->newScene(true, "3dprint_seamfill_test", region));
+
+	// Node 1: solid 3x3x3 at world (0..2).
+	const int node1Id = _sceneMgr->sceneGraph().activeNode();
+	voxel::RawVolume *v1 = _sceneMgr->volume(node1Id);
+	ASSERT_NE(nullptr, v1);
+	for (int x = 0; x <= 2; ++x) {
+		for (int y = 0; y <= 2; ++y) {
+			for (int z = 0; z <= 2; ++z) {
+				v1->setVoxel(x, y, z, voxel::createVoxel(voxel::VoxelType::Generic, 1));
+			}
+		}
+	}
+	_sceneMgr->modified(node1Id, v1->region());
+
+	// Node 2: solid 3x3x3 at local (0..2), translated by (+4, 0, 0) so world (4..6). Gap at world x=3.
+	const int rootId = _sceneMgr->sceneGraph().root().id();
+	scenegraph::SceneGraphNode node2(scenegraph::SceneGraphNodeType::Model);
+	node2.createVolume(region);
+	node2.setName("seamfill_node2");
+	scenegraph::SceneGraphTransform xform;
+	xform.setWorldTranslation(glm::vec3(4.0f, 0.0f, 0.0f));
+	node2.keyFrame(0).setTransform(xform);
+	const int node2Id = _sceneMgr->moveNodeToSceneGraph(node2, rootId);
+	ASSERT_NE(InvalidNodeId, node2Id);
+	_sceneMgr->sceneGraph().updateTransforms();
+	voxel::RawVolume *v2 = _sceneMgr->volume(node2Id);
+	ASSERT_NE(nullptr, v2);
+	for (int x = 0; x <= 2; ++x) {
+		for (int y = 0; y <= 2; ++y) {
+			for (int z = 0; z <= 2; ++z) {
+				v2->setVoxel(x, y, z, voxel::createVoxel(voxel::VoxelType::Generic, 1));
+			}
+		}
+	}
+	_sceneMgr->modified(node2Id, v2->region());
+
+	// minSolidNeighbors=2 so the 1-voxel gap plane is detected (east+west neighbors only).
+	ASSERT_EQ(1, command::Command::execute("3dprint seamfill 1000 2"));
+
+	// Tie on distance-to-center: first-match wins, so node1 owns the fills. It was resized to include x=3.
+	const scenegraph::SceneGraphNode *resultNode1 = _sceneMgr->sceneGraphNode(node1Id);
+	ASSERT_NE(nullptr, resultNode1);
+	const voxel::RawVolume *rvr1 = resultNode1->volume();
+	ASSERT_NE(nullptr, rvr1);
+	ASSERT_TRUE(rvr1->region().containsPoint(3, 1, 1)) << "node1 volume should have grown to cover x=3";
+
+	// Expect the entire 3x3 seam plane at world x=3 filled with a consistent cyan-ish color.
+	int filled = 0;
+	int consistent = 0;
+	int cyanish = 0;
+	int seamColor = -1;
+	const palette::Palette &pal1 = resultNode1->palette();
+	for (int y = 0; y <= 2; ++y) {
+		for (int z = 0; z <= 2; ++z) {
+			const voxel::Voxel &vox = rvr1->voxel(3, y, z);
+			if (voxel::isAir(vox.getMaterial())) {
+				continue;
+			}
+			++filled;
+			if (seamColor < 0) {
+				seamColor = (int)vox.getColor();
+			}
+			if ((int)vox.getColor() == seamColor) {
+				++consistent;
+			}
+			const color::RGBA rgba = pal1.color(vox.getColor());
+			if (rgba.r < 96 && rgba.g > 160 && rgba.b > 160) {
+				++cyanish;
+			}
+		}
+	}
+	EXPECT_EQ(9, filled) << "seamfill should fill the entire 3x3 seam plane at world x=3";
+	EXPECT_EQ(9, consistent) << "all seam fills should share the same palette entry";
+	EXPECT_EQ(9, cyanish) << "seam fills should resolve to a cyan-ish palette color (got r/g/b="
+						  << (int)pal1.color((uint8_t)seamColor).r << "/" << (int)pal1.color((uint8_t)seamColor).g
+						  << "/" << (int)pal1.color((uint8_t)seamColor).b << ")";
 }
 
 TEST_F(SceneManagerTest, testFill) {

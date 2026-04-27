@@ -75,6 +75,72 @@ static uint8_t resolveMarkerColor(palette::Palette &pal, int debugColor) {
 	return idx;
 }
 
+// packedRGB: 0x00RRGGBB integer. Each node gets the color added to its own palette via tryAdd.
+static void runRecolor(SceneManager *sceneMgr, int packedRGB) {
+	const uint8_t r = (uint8_t)((packedRGB >> 16) & 0xFF);
+	const uint8_t g = (uint8_t)((packedRGB >>  8) & 0xFF);
+	const uint8_t b = (uint8_t)( packedRGB        & 0xFF);
+	const color::RGBA targetColor(r, g, b, 255);
+
+	scenegraph::SceneGraph &graph = sceneMgr->sceneGraph();
+	const core::DynamicArray<NodeTask> tasks = collectNodeTasks(graph);
+	const int totalNodes = (int)tasks.size();
+	ProgressTimer timer("recolor", totalNodes);
+	std::atomic<int> processed{0};
+	int totalRecolored = 0;
+	int nodesTouched = 0;
+	for (const NodeTask &task : tasks) {
+		scenegraph::SceneGraphNode &node = graph.node(task.nodeId);
+		palette::Palette &pal = node.palette();
+
+		// Find the first solid voxel's current color to protect its palette slot from eviction.
+		// Without this, tryAdd may replace the very slot all voxels use, making setVoxel a no-op.
+		int skipColorIdx = palette::PaletteColorNotFound;
+		{
+			const voxel::Region &region = task.rv->region();
+			bool found = false;
+			for (int z = region.getLowerZ(); z <= region.getUpperZ() && !found; ++z) {
+				for (int y = region.getLowerY(); y <= region.getUpperY() && !found; ++y) {
+					for (int x = region.getLowerX(); x <= region.getUpperX() && !found; ++x) {
+						const voxel::Voxel &v = task.rv->voxel(x, y, z);
+						if (!voxel::isAir(v.getMaterial())) {
+							skipColorIdx = (int)v.getColor();
+							found = true;
+						}
+					}
+				}
+			}
+		}
+
+		uint8_t colorIdx = 0;
+		const bool paletteChanged = pal.tryAdd(targetColor, true, &colorIdx, true, skipColorIdx);
+
+		voxel::RawVolumeWrapper wrapper(task.rv);
+		const voxel::Region &region = task.rv->region();
+		for (int z = region.getLowerZ(); z <= region.getUpperZ(); ++z) {
+			for (int y = region.getLowerY(); y <= region.getUpperY(); ++y) {
+				for (int x = region.getLowerX(); x <= region.getUpperX(); ++x) {
+					const voxel::Voxel &v = task.rv->voxel(x, y, z);
+					if (voxel::isAir(v.getMaterial())) continue;
+					wrapper.setVoxel(x, y, z, voxel::createVoxel(v.getMaterial(), colorIdx,
+																   v.getNormal(), v.getFlags(), v.getBoneIdx()));
+					++totalRecolored;
+				}
+			}
+		}
+		if (wrapper.dirtyRegion().isValid() || paletteChanged) {
+			const voxel::Region dirtyRgn = wrapper.dirtyRegion().isValid()
+				? wrapper.dirtyRegion() : task.rv->region();
+			sceneMgr->modified(task.nodeId, dirtyRgn);
+			++nodesTouched;
+		}
+		timer.addVoxels((int64_t)totalRecolored);
+		timer.tick(++processed);
+	}
+	Log::info("3dprint recolor: recolored %d voxel(s) across %d node(s) to #%06X",
+			  totalRecolored, nodesTouched, (unsigned)packedRGB);
+}
+
 static void runSealGaps(SceneManager *sceneMgr, int debugColor) {
 	scenegraph::SceneGraph &graph = sceneMgr->sceneGraph();
 	const core::DynamicArray<NodeTask> tasks = collectNodeTasks(graph);
@@ -341,7 +407,7 @@ static void runSeamFill(SceneManager *sceneMgr, int maxHoleSize, int minSolidNei
 
 static void dispatch(SceneManager *sceneMgr, const command::CommandArgs &args) {
 	if (!args.has("subcommand")) {
-		Log::info("3dprint: usage: 3dprint <hello|sealgaps|fillholes|seamfill|regrid|faceclassify> [maxHoleSize|cellSize] [minSolidNeighbors] [debugColor]");
+		Log::info("3dprint: usage: 3dprint <hello|sealgaps|fillholes|seamfill|regrid|faceclassify|holemap|recolor> [maxHoleSize|cellSize|colorIndex] [minSolidNeighbors] [debugColor]");
 		Log::info("         debugColor: palette index (0-255) for newly placed voxels, or -1 for cyan marker (default -1)");
 		Log::info("         all three commands mark new voxels with cyan by default so additions are visually inspectable");
 		Log::info("         regrid: rebucket all model nodes into world-aligned cellSize^3 cells (default 128)");
@@ -355,10 +421,14 @@ static void dispatch(SceneManager *sceneMgr, const command::CommandArgs &args) {
 		return;
 	}
 	if (sub == "sealgaps") {
+		Log::warn("3dprint sealgaps: WARNING -- this command is not reliable and may produce incorrect results. "
+				  "Use 3dprint faceclassify to identify thin walls and gaps instead.");
 		runSealGaps(sceneMgr, debugColor);
 		return;
 	}
 	if (sub == "fillholes") {
+		Log::warn("3dprint fillholes: WARNING -- this command is not reliable and may produce incorrect results. "
+				  "Use 3dprint faceclassify to identify interior voxels instead.");
 		int maxHoleSize = args.intVal("maxHoleSize", 1000);
 		if (maxHoleSize <= 0) {
 			maxHoleSize = 1000;
@@ -386,7 +456,26 @@ static void dispatch(SceneManager *sceneMgr, const command::CommandArgs &args) {
 		return;
 	}
 	if (sub == "faceclassify") {
-		runFaceClassify(sceneMgr);
+		// maxHoleSize arg slot reused as minCellSize (0 = coarse only)
+		const int minCellSize = args.intVal("maxHoleSize", 0);
+		runFaceClassify(sceneMgr, minCellSize);
+		return;
+	}
+	if (sub == "holemap") {
+		// maxHoleSize arg slot reused as minCellSize (0 = auto: coarse/2)
+		const int minCellSize = args.intVal("maxHoleSize", 0);
+		runHoleMap(sceneMgr, minCellSize);
+		return;
+	}
+	if (sub == "holefill") {
+		const int minCellSize = args.intVal("maxHoleSize", 0);
+		runHoleFill(sceneMgr, minCellSize);
+		return;
+	}
+	if (sub == "recolor") {
+		// maxHoleSize arg slot reused as packed 0xRRGGBB color (default 0xB4B4B4 = neutral gray)
+		const int packedRGB = args.intVal("maxHoleSize", 0xB4B4B4);
+		runRecolor(sceneMgr, packedRGB);
 		return;
 	}
 	Log::warn("3dprint: unknown subcommand '%s'", sub.c_str());
@@ -396,7 +485,7 @@ static void dispatch(SceneManager *sceneMgr, const command::CommandArgs &args) {
 
 void registerCommands(SceneManager *sceneMgr) {
 	command::Command::registerCommand("3dprint")
-		.addArg({"subcommand", command::ArgType::String, false, "", "hello|sealgaps|fillholes|seamfill|regrid|faceclassify"})
+		.addArg({"subcommand", command::ArgType::String, false, "", "hello|sealgaps|fillholes|seamfill|regrid|faceclassify|holemap|holefill|recolor"})
 		.addArg({"maxHoleSize", command::ArgType::Int, true, "1000", "Max voxel count per hole (fillholes/seamfill); also cellSize for regrid (default 128)"})
 		.addArg({"minSolidNeighbors", command::ArgType::Int, true, "3",
 				 "Min solid 6-neighbors for a hole seed (fillholes only)"})
