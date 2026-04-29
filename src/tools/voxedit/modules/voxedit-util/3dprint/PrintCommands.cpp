@@ -191,59 +191,6 @@ static void runSealGaps(SceneManager *sceneMgr, int debugColor) {
 	Log::info("3dprint sealgaps: sealed %d voxels across %d node(s)", totalSealed, nodesTouched);
 }
 
-static void runFillHoles(SceneManager *sceneMgr, int maxHoleSize, int minSolidNeighbors, int debugColor) {
-	scenegraph::SceneGraph &graph = sceneMgr->sceneGraph();
-	const core::DynamicArray<NodeTask> tasks = collectNodeTasks(graph);
-	const int totalNodes = (int)tasks.size();
-	ProgressTimer timer("fillholes", totalNodes);
-
-	core::DynamicArray<core::DynamicArray<voxelutil::HoleInfo>> results;
-	results.resize(tasks.size());
-	std::atomic<int> processed{0};
-	app::for_parallel(0, totalNodes, [&](int start, int end) {
-		for (int i = start; i < end; ++i) {
-			voxel::SparseVolume sparse;
-			sparse.copyFrom(*tasks[i].rv);
-			voxelutil::detectHoles(sparse, results[i], maxHoleSize, minSolidNeighbors);
-			int64_t nodeHoleVoxels = 0;
-			for (const voxelutil::HoleInfo &h : results[i]) {
-				nodeHoleVoxels += (int64_t)h.voxels.size();
-			}
-			timer.addVoxels(nodeHoleVoxels);
-			timer.tick(++processed);
-		}
-	});
-
-	int totalFilled = 0;
-	int totalHoles = 0;
-	int nodesTouched = 0;
-	for (int i = 0; i < totalNodes; ++i) {
-		const core::DynamicArray<voxelutil::HoleInfo> &holes = results[i];
-		if (holes.empty()) {
-			continue;
-		}
-		scenegraph::SceneGraphNode &node = graph.node(tasks[i].nodeId);
-		const int markerColor = (int)resolveMarkerColor(node.palette(), debugColor);
-		voxel::RawVolumeWrapper wrapper(tasks[i].rv);
-		int filledInNode = 0;
-		for (const voxelutil::HoleInfo &hole : holes) {
-			for (const voxelutil::HoleVoxel &hv : hole.voxels) {
-				if (wrapper.setVoxel(hv.worldPos, maybeRecolor(hv.voxel, markerColor))) {
-					++filledInNode;
-				}
-			}
-		}
-		if (wrapper.dirtyRegion().isValid()) {
-			sceneMgr->modified(tasks[i].nodeId, wrapper.dirtyRegion());
-			++nodesTouched;
-		}
-		totalHoles += (int)holes.size();
-		totalFilled += filledInNode;
-	}
-	Log::info("3dprint fillholes: detected %d hole(s), filled %d voxel(s) across %d node(s)", totalHoles, totalFilled,
-			  nodesTouched);
-}
-
 static glm::ivec3 transformPoint(const glm::mat4 &m, const glm::ivec3 &p) {
 	const glm::vec4 w = m * glm::vec4((float)p.x, (float)p.y, (float)p.z, 1.0f);
 	return glm::ivec3((int)glm::round(w.x), (int)glm::round(w.y), (int)glm::round(w.z));
@@ -407,7 +354,7 @@ static void runSeamFill(SceneManager *sceneMgr, int maxHoleSize, int minSolidNei
 
 static void dispatch(SceneManager *sceneMgr, const command::CommandArgs &args) {
 	if (!args.has("subcommand")) {
-		Log::info("3dprint: usage: 3dprint <hello|sealgaps|fillholes|seamfill|regrid|faceclassify|holemap|recolor> [maxHoleSize|cellSize|colorIndex] [minSolidNeighbors] [debugColor]");
+		Log::info("3dprint: usage: 3dprint <hello|sealgaps|fillholes|seamfill|regrid|faceclassify|holemap|debugfrontier|recolor> [cellSize|maxHoleSize|colorIndex] [minSolidNeighbors] [debugColor]");
 		Log::info("         debugColor: palette index (0-255) for newly placed voxels, or -1 for cyan marker (default -1)");
 		Log::info("         all three commands mark new voxels with cyan by default so additions are visually inspectable");
 		Log::info("         regrid: rebucket all model nodes into world-aligned cellSize^3 cells (default 128)");
@@ -427,14 +374,8 @@ static void dispatch(SceneManager *sceneMgr, const command::CommandArgs &args) {
 		return;
 	}
 	if (sub == "fillholes") {
-		Log::warn("3dprint fillholes: WARNING -- this command is not reliable and may produce incorrect results. "
-				  "Use 3dprint faceclassify to identify interior voxels instead.");
-		int maxHoleSize = args.intVal("maxHoleSize", 1000);
-		if (maxHoleSize <= 0) {
-			maxHoleSize = 1000;
-		}
-		const int minSolidNeighbors = args.intVal("minSolidNeighbors", 3);
-		runFillHoles(sceneMgr, maxHoleSize, minSolidNeighbors, debugColor);
+		const int minCellSize = args.intVal("maxHoleSize", 0);
+		runHoleFill(sceneMgr, minCellSize);
 		return;
 	}
 	if (sub == "seamfill") {
@@ -467,9 +408,9 @@ static void dispatch(SceneManager *sceneMgr, const command::CommandArgs &args) {
 		runHoleMap(sceneMgr, minCellSize);
 		return;
 	}
-	if (sub == "holefill") {
+	if (sub == "debugfrontier") {
 		const int minCellSize = args.intVal("maxHoleSize", 0);
-		runHoleFill(sceneMgr, minCellSize);
+		runDebugFrontier(sceneMgr, minCellSize);
 		return;
 	}
 	if (sub == "recolor") {
@@ -485,7 +426,7 @@ static void dispatch(SceneManager *sceneMgr, const command::CommandArgs &args) {
 
 void registerCommands(SceneManager *sceneMgr) {
 	command::Command::registerCommand("3dprint")
-		.addArg({"subcommand", command::ArgType::String, false, "", "hello|sealgaps|fillholes|seamfill|regrid|faceclassify|holemap|holefill|recolor"})
+		.addArg({"subcommand", command::ArgType::String, false, "", "hello|sealgaps|fillholes|seamfill|regrid|faceclassify|holemap|debugfrontier|recolor"})
 		.addArg({"maxHoleSize", command::ArgType::Int, true, "1000", "Max voxel count per hole (fillholes/seamfill); also cellSize for regrid (default 128)"})
 		.addArg({"minSolidNeighbors", command::ArgType::Int, true, "3",
 				 "Min solid 6-neighbors for a hole seed (fillholes only)"})

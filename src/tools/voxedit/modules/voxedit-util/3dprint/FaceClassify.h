@@ -25,5 +25,10 @@ void runHoleMap(SceneManager *sceneMgr, int minCellSize = 0);
 // Positions outside all node regions are skipped and logged.
 void runHoleFill(SceneManager *sceneMgr, int minCellSize = 0);
 
+// Debug: paint the BFS frontier shell at a given cellSize. Single-level BFS:
+// orange = exterior frontier, blue = interior frontier. cellSize controls the
+// resolution of the wrap; pass 0 for "auto = modal regridded width" (typically 128).
+void runDebugFrontier(SceneManager *sceneMgr, int cellSize = 0);
+
 } // namespace printing
 } // namespace voxedit
