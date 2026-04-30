@@ -12,14 +12,20 @@
 namespace voxedit {
 namespace printing {
 
-ProgressTimer::ProgressTimer(const char *tag, int total)
-	: _tag(tag), _total(total), _startMs(core::TimeProvider::systemMillis()) {
+ProgressTimer::ProgressTimer(const char *tag, int total, bool verbose)
+	: _tag(tag), _total(total), _startMs(core::TimeProvider::systemMillis()), _verbose(verbose) {
+	if (!_verbose) {
+		return;
+	}
 	fprintf(stderr, "3dprint %s: starting (%d items)\n", _tag, _total);
 	fflush(stderr);
 	Log::info("3dprint %s: starting (%d items)", _tag, _total);
 }
 
 ProgressTimer::~ProgressTimer() {
+	if (!_verbose) {
+		return;
+	}
 	const uint64_t now = core::TimeProvider::systemMillis();
 	const double elapsedSec = (double)(now - _startMs) / 1000.0;
 	const int64_t voxels = _voxelStat.load(std::memory_order_relaxed);
@@ -62,7 +68,7 @@ void ProgressTimer::emit(int processed, int pct, double elapsedSec, double etaSe
 }
 
 void ProgressTimer::tick(int processed) {
-	if (_total <= 0) {
+	if (_total <= 0 || !_verbose) {
 		return;
 	}
 	const int pct = (int)((int64_t)processed * 100 / _total);
