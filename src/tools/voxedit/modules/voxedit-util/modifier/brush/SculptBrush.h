@@ -5,9 +5,13 @@
 #pragma once
 
 #include "Brush.h"
+#include "SnapshotHelper.h"
+#include "app/I18N.h"
+#include "core/ArrayLength.h"
 #include "core/GLM.h"
 #include "core/Optional.h"
 #include "core/ScopedPtr.h"
+#include "ui/IconsLucide.h"
 #include "core/String.h"
 #include "palette/Palette.h"
 #include "voxel/BitVolume.h"
@@ -41,6 +45,23 @@ enum class SculptMode : uint8_t {
 
 	Max
 };
+
+// clang-format off
+static constexpr const char *SculptModeStr[] = {
+	NC_("Sculpt Modes", "Erode"),         NC_("Sculpt Modes", "Grow"),
+	NC_("Sculpt Modes", "Flatten"),       NC_("Sculpt Modes", "Smooth Additive"),
+	NC_("Sculpt Modes", "Smooth Erode"),  NC_("Sculpt Modes", "Smooth Gaussian"),
+	NC_("Sculpt Modes", "Smooth Wall"),   NC_("Sculpt Modes", "Bridge Gap"),
+	NC_("Sculpt Modes", "Squash to Plane"), NC_("Sculpt Modes", "Extend Plane"),
+	NC_("Sculpt Modes", "Reskin")};
+static_assert(lengthof(SculptModeStr) == (int)SculptMode::Max, "SculptModeStr size mismatch");
+
+static constexpr const char *SculptModeIcons[] = {ICON_LC_ERASER,    ICON_LC_SPROUT,     ICON_LC_LAND_PLOT,
+                                                  ICON_LC_WAVES,     ICON_LC_WAVES,      ICON_LC_BLEND,
+                                                  ICON_LC_BRICK_WALL, ICON_LC_LINK,      ICON_LC_MINIMIZE_2,
+                                                  ICON_LC_EXPAND,    ICON_LC_PALETTE};
+static_assert(lengthof(SculptModeIcons) == (int)SculptMode::Max, "SculptModeIcons size mismatch");
+// clang-format on
 
 /**
  * @brief Sculpts selected voxels by smoothing surface irregularities

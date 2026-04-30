@@ -17,6 +17,7 @@
 #include "io/FileStream.h"
 #include "io/Filesystem.h"
 #include "math/Axis.h"
+#include "palette/Palette.h"
 #include "scenegraph/SceneGraphAnimation.h"
 #include "scenegraph/SceneGraphKeyFrame.h"
 #include "scenegraph/SceneGraphNode.h"
@@ -40,6 +41,7 @@
 #include "voxel/RawVolume.h"
 #include "voxel/Region.h"
 #include "voxel/Voxel.h"
+#include "voxelui/DragAndDropPayload.h"
 
 #include <glm/ext/quaternion_common.hpp>
 #include <glm/ext/scalar_constants.hpp>
@@ -96,6 +98,9 @@ bool Viewport::init() {
 	if (!_renderContext.init(_app->frameBufferDimension())) {
 		return false;
 	}
+	if (!_modifierRenderContext.init(_app->frameBufferDimension())) {
+		return false;
+	}
 
 	_camera.setRotationType(video::CameraRotationType::Target);
 	if (viewModeAllViewports(_viewMode->intVal())) {
@@ -138,6 +143,7 @@ void Viewport::resize(const glm::ivec2 &contentSize) {
 	const glm::vec2 scale = dpiScale();
 	const glm::ivec2 pixelSize((float)contentSize.x * scale.x, (float)contentSize.y * scale.y);
 	_renderContext.resize(pixelSize);
+	_modifierRenderContext.resize(pixelSize);
 }
 
 bool Viewport::isFixedCamera() const {
@@ -330,8 +336,11 @@ void Viewport::renderViewport() {
 	ImVec2 cursorPos = ImGui::GetCursorPos();
 	const float headerSize = cursorPos.y;
 	if (setupFrameBuffer(contentSize)) {
-		if (_animationPlaying->boolVal() && _sceneMgr->activeCameraNode()) {
-			_camera = voxelrender::toCamera(_camera.size(), _sceneMgr->sceneGraph(), *_sceneMgr->activeCameraNode(), _sceneMgr->currentFrame());
+		const scenegraph::FrameIndex currentFrame = _sceneMgr->currentFrame();
+		const bool frameChanged = currentFrame != _lastFrameIdx;
+		_lastFrameIdx = currentFrame;
+		if ((_animationPlaying->boolVal() || frameChanged) && _sceneMgr->activeCameraNode()) {
+			_camera = voxelrender::toCamera(_camera.size(), _sceneMgr->sceneGraph(), *_sceneMgr->activeCameraNode(), currentFrame);
 		}
 		_camera.update(_app->deltaFrameSeconds());
 
@@ -479,6 +488,67 @@ void Viewport::menuBarMementoOptions(command::CommandExecutionListener *listener
 	ImGui::CommandIconMenuItem(ICON_LC_REDO, _("Redo"), "redo", mementoHandler.canRedo(), listener);
 }
 
+void Viewport::menuBarRecentColors() {
+	if (isSceneMode()) {
+		return;
+	}
+	// TODO: UI: don't allow to overlap any of the toolbar menu items on the left side. collapse the colors into a single menu entry and show the
+	// colors in a popup or something liek that.
+	const int nodeId = _sceneMgr->sceneGraph().activeNode();
+	const scenegraph::SceneGraphNode *node = _sceneMgr->sceneGraphModelNode(nodeId);
+	if (node == nullptr) {
+		return;
+	}
+
+	const uint8_t currentIdx = _sceneMgr->modifier().cursorVoxel().getColor();
+	const color::RGBA currentColor = node->palette().color(currentIdx);
+	if (currentColor != _lastTrackedColor || _recentColors.empty()) {
+		_lastTrackedColor = currentColor;
+		_recentColors.push(currentColor);
+	}
+
+	if (_recentColors.empty()) {
+		return;
+	}
+
+	const palette::Palette &palette = node->palette();
+	const float height = ImGui::GetFrameHeight();
+	const float spacing = ImGui::GetStyle().ItemSpacing.x;
+	const float elementWidth = height + spacing;
+	const float totalWidth = (float)_recentColors.size() * elementWidth;
+	const float availWidth = ImGui::GetContentRegionAvail().x;
+	if (availWidth < elementWidth) {
+		return;
+	}
+
+	const size_t maxColors = (size_t)(availWidth / elementWidth);
+	const size_t count = _recentColors.size() < maxColors ? _recentColors.size() : maxColors;
+	if (count <= 0) {
+		return;
+	}
+	ImGui::SameLine(ImGui::GetWindowWidth() - (count * elementWidth));
+
+	for (size_t i = 0; i < count; ++i) {
+		const color::RGBA color = _recentColors[i];
+		const core::String id = core::String::format("##recentcol%i", (int)i);
+		if (ImGui::ColorButton(id.c_str(), ImColor(color.rgba), ImGuiColorEditFlags_NoTooltip | ImGuiColorEditFlags_NoPicker, ImVec2(height, height))) {
+			const int palIdx = palette.getClosestMatch(color);
+			if (palIdx != palette::PaletteColorNotFound) {
+				_sceneMgr->modifier().setCursorVoxel(voxel::createVoxel(palette, palIdx));
+			}
+		}
+		if (ImGui::BeginDragDropSource(ImGuiDragDropFlags_SourceAllowNullID)) {
+			ImVec4 col_rgb = ImColor(color.rgba);
+			ImGui::SetDragDropPayload(voxelui::dragdrop::RGBAPayload, &col_rgb, sizeof(float) * 4, ImGuiCond_Once);
+			const ImVec2 rectMins = ImGui::GetCursorScreenPos();
+			const ImVec2 rectMaxs(rectMins.x + height, rectMins.y + height);
+			ImGui::GetWindowDrawList()->AddRectFilled(rectMins, rectMaxs, ImColor(color.rgba));
+			ImGui::Dummy(ImVec2(height, height));
+			ImGui::EndDragDropSource();
+		}
+	}
+}
+
 void Viewport::renderMenuBar(command::CommandExecutionListener *listener) {
 	core_trace_scoped(Menubar);
 	if (ImGui::BeginMenuBar()) {
@@ -488,6 +558,7 @@ void Viewport::renderMenuBar(command::CommandExecutionListener *listener) {
 		CameraPanel::cameraModeCombo(listener, _camMode);
 		menuBarRenderModeToggle();
 		menuBarView(listener);
+		menuBarRecentColors();
 
 		ImGui::EndMenuBar();
 	}
@@ -541,10 +612,11 @@ void Viewport::update(double nowSeconds, command::CommandExecutionListener *list
 void Viewport::shutdown() {
 	_captureTool.abort();
 	_renderContext.shutdown();
+	_modifierRenderContext.shutdown();
 }
 
 image::ImagePtr Viewport::renderToImage(const char *imageName) {
-	_sceneMgr->render(_renderContext, camera(), SceneManager::RenderScene);
+	_sceneMgr->render(_renderContext, _modifierRenderContext, camera(), SceneManager::RenderScene);
 
 	// If multisampling is enabled, resolve first, then get image from resolve framebuffer
 	if (_renderContext.enableMultisampling) {
@@ -819,18 +891,19 @@ static glm::mat4 parentWorldMatrix(const scenegraph::SceneGraph &sceneGraph, con
 	return glm::mat4(1.0f);
 }
 
-// TODO: doesn't yet work for rotated keyframes - unrotate the delta translation here?
-//       https://github.com/vengi-voxel/vengi/issues/611
-//       The issue can also be in SceneManager::nodeSetPivot() and how to compensate the local matrix
-//       translation to keep the node visually at the same position
+// https://github.com/vengi-voxel/vengi/issues/611
 void Viewport::manipulatePivot(scenegraph::SceneGraphNode &node, const glm::mat4 &deltaMatrix) {
 	const voxel::Region &region = _sceneMgr->sceneGraph().resolveRegion(node);
 	const glm::vec3 size = region.getDimensionsInVoxels();
-	// TODO: extracting just the translation part here is not correct if we have rotation in the deltaMatrix
-	const glm::vec3 deltaTranslation(deltaMatrix[3]);
-	const glm::vec3 pivot = deltaTranslation / size;
-	// here we also compensate the pivot change in the local matrix by translating the local matrix
-	// in the opposite direction - otherwise the node would jump around when we modify the pivot
+	const glm::vec3 worldDelta(deltaMatrix[3]);
+	// The delta from ImGuizmo is in world space. The pivot is in the node's local
+	// (unrotated) space, so we need to undo the node's rotation to get the correct
+	// axis-aligned delta for the pivot adjustment.
+	const scenegraph::KeyFrameIndex keyFrameIdx = node.keyFrameForFrame(_sceneMgr->currentFrame());
+	const glm::mat4 &worldMat = node.transform(keyFrameIdx).worldMatrix();
+	const glm::mat3 rotation(worldMat);
+	const glm::vec3 localDelta = glm::inverse(rotation) * worldDelta;
+	const glm::vec3 pivot = localDelta / size;
 	_sceneMgr->nodeUpdatePivot(node.id(), node.pivot() + pivot);
 }
 
@@ -1107,7 +1180,7 @@ bool Viewport::renderGizmo(video::Camera &camera, float headerSize, const ImVec2
 void Viewport::renderToFrameBuffer() {
 	core_trace_scoped(RenderFramebuffer);
 	video::clearColor(color::Clear());
-	_sceneMgr->render(_renderContext, camera());
+	_sceneMgr->render(_renderContext, _modifierRenderContext, camera());
 }
 
 } // namespace voxedit

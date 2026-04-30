@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include "image/Image.h"
 #include "ui/IMGUIApp.h"
 #include "video/Camera.h"
 #include "render/Axis.h"
@@ -24,6 +25,9 @@ protected:
 	util::Movement _movement;
 	core::VarPtr _rotationSpeed;
 	float _cameraSpeed = 50.0f;
+	int _screenshotFrames = -1;
+	int _frameCounter = 0;
+	core::String _screenshotType = "png";
 
 	virtual void doRender() = 0;
 
@@ -60,6 +64,10 @@ public:
 	virtual void beforeUI() override;
 	virtual void onRenderUI() override;
 	virtual app::AppState onCleanup() override;
+
+	image::ImagePtr screenShot();
+	bool saveScreenshot(const core::String &filename);
+	bool saveScreenshotText(const core::String &filename);
 	virtual bool onMouseWheel(void *windowHandle, float x, float y, int32_t mouseId) override;
 	virtual void onWindowResize(void *windowHandle, int windowWidth, int windowHeight) override;
 };

@@ -3,7 +3,6 @@
  */
 
 #include "Archive.h"
-#include "core/Algorithm.h"
 #include "core/Path.h"
 #include "core/ScopedPtr.h"
 #include "core/StringUtil.h"
@@ -16,27 +15,10 @@ bool Archive::init(const core::String &path, io::SeekableReadStream *stream) {
 }
 
 void Archive::shutdown() {
-	_files.clear();
 }
 
 bool Archive::exists(const core::Path &file) const {
-	return exists(file.lexicallyNormal());
-}
-
-bool Archive::exists(const core::String &file) const {
-	return core::find_if(_files.begin(), _files.end(), [&](const auto &e1) { return e1.fullPath == file; }) !=
-		   _files.end();
-}
-
-void Archive::list(const core::String &basePath, ArchiveFiles &out, const core::String &filter) const {
-	for (const auto &entry : _files) {
-		if (!basePath.empty() && !core::string::startsWith(entry.fullPath, basePath)) {
-			continue;
-		}
-		if (core::string::fileMatchesMultiple(entry.name.c_str(), filter.c_str())) {
-			out.push_back(entry);
-		}
-	}
+	return exists(file.toString());
 }
 
 void Archive::list(const core::String &filter, ArchiveFiles &out) const {

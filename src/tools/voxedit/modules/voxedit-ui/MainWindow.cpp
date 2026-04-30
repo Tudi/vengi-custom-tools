@@ -119,7 +119,7 @@ MainWindow::MainWindow(ui::IMGUIApp *app, const SceneManagerPtr &sceneMgr, const
 	  _imageAssetPanel(app, _sceneMgr, texturePool, filesystem), _mementoPanel(app, _sceneMgr),
 	  _nodeInspectorPanel(app, _sceneMgr), _nodePropertiesPanel(app, _sceneMgr),
 	  _palettePanel(app, _sceneMgr, paletteCache), _normalPalettePanel(app, _sceneMgr),
-	  _optionsPanel(app), _scriptBrowserPanel(app), _menuBar(app, _sceneMgr, &_optionsPanel, &_scriptBrowserPanel),
+	  _optionsPanel(app), _scriptBrowserPanel(app), _voxBoxBrowserPanel(app, _sceneMgr, texturePool), _menuBar(app, _sceneMgr, &_optionsPanel, &_scriptBrowserPanel, &_voxBoxBrowserPanel),
 	  _networkPanel(app, _sceneMgr), _gameModePanel(app, this, _sceneMgr), _statusBar(app, _sceneMgr),
 	  _scriptPanel(app, _sceneMgr, &_scriptBrowserPanel), _animationTimeline(app, _sceneMgr),
 	  _animationPanel(app, _sceneMgr), _cameraPanel(app, _sceneMgr),
@@ -462,6 +462,7 @@ void MainWindow::configureMainTopWidgetDock(ImGuiID dockId) {
 	}
 	ImGui::DockBuilderDockWindow(TITLE_OPTIONS, dockId);
 	ImGui::DockBuilderDockWindow(TITLE_SCRIPT_BROWSER, dockId);
+	ImGui::DockBuilderDockWindow(TITLE_VOXBOX_BROWSER, dockId);
 }
 
 void MainWindow::configureMainBottomWidgetDock(ImGuiID dockId) {
@@ -496,6 +497,7 @@ void MainWindow::mainWidget(double nowSeconds) {
 #endif
 	_optionsPanel.update(TITLE_OPTIONS);
 	_scriptBrowserPanel.update(TITLE_SCRIPT_BROWSER, &listener);
+	_voxBoxBrowserPanel.update(TITLE_VOXBOX_BROWSER, &listener);
 
 	// bottom
 	_scriptPanel.updateEditor(TITLE_SCRIPT_EDITOR);
@@ -696,6 +698,11 @@ void MainWindow::popupWelcome() {
 		ImGui::Separator();
 		if (ImGui::IconButton(ICON_LC_DOWNLOAD, _("Download scripts..."))) {
 			_scriptBrowserPanel.open();
+			ImGui::CloseCurrentPopup();
+		}
+		ImGui::SameLine();
+		if (ImGui::IconButton(ICON_LC_CLOUD_DOWNLOAD, _("VoxBox Browser..."))) {
+			_voxBoxBrowserPanel.open();
 			ImGui::CloseCurrentPopup();
 		}
 		ImGui::SameLine();
@@ -1248,6 +1255,10 @@ void MainWindow::updateViewMode() {
 		core::getVar(cfg::NormalPalette)->setVal(palette::NormalPalette::builtIn[0]);
 	} else if (ViewMode::TiberianSun == vMode) {
 		core::getVar(cfg::NormalPalette)->setVal(palette::NormalPalette::builtIn[1]);
+	}
+
+	if (!viewModeNormalPalette(_viewMode->intVal()) && _sceneMgr->modifier().brushType() == BrushType::Normal) {
+		_sceneMgr->modifier().setBrushType(BrushType::Shape);
 	}
 }
 

@@ -5,11 +5,13 @@ set(EXTERNAL_SRCS
 	external/tiny_obj_loader.h
 	external/tiny_gltf.h
 	external/ufbx.h external/ufbx.c
+	external/ufbx_write.h external/ufbx_write.c
 	external/libvxl.h external/libvxl.c
 )
 add_library(${LIB}-external ${EXTERNAL_SRCS})
 if (USE_SANITIZERS)
 	target_compile_options(${LIB}-external PRIVATE -DUFBX_UBSAN=1)
+	set_property(SOURCE external/ufbx_write.c APPEND_STRING PROPERTY COMPILE_FLAGS " -fno-sanitize=all")
 endif()
 check_c_compiler_flag("-Wno-shadow" C_NO_SHADOW)
 if (C_NO_SHADOW)
@@ -23,6 +25,46 @@ if (C_NO_UNUSED_VARIABLE)
 		set_property(SOURCE ${src} APPEND_STRING PROPERTY COMPILE_FLAGS " -Wno-unused-variable")
 	endforeach()
 endif()
+
+## ufbx_write.c specific flags
+check_c_compiler_flag("-Wno-missing-field-initializers" C_NO_MISSING_FIELD_INITIALIZERS)
+if (C_NO_MISSING_FIELD_INITIALIZERS)
+	foreach (src ${EXTERNAL_SRCS})
+		set_property(SOURCE ${src} APPEND_STRING PROPERTY COMPILE_FLAGS " -Wno-missing-field-initializers")
+	endforeach()
+endif()
+check_c_compiler_flag("-Wno-unused-function" C_NO_UNUSED_FUNCTION)
+if (C_NO_UNUSED_FUNCTION)
+	foreach (src ${EXTERNAL_SRCS})
+		set_property(SOURCE ${src} APPEND_STRING PROPERTY COMPILE_FLAGS " -Wno-unused-function")
+	endforeach()
+endif()
+check_c_compiler_flag("-Wno-parentheses" C_NO_PARENTHESES)
+if (C_NO_PARENTHESES)
+	foreach (src ${EXTERNAL_SRCS})
+		set_property(SOURCE ${src} APPEND_STRING PROPERTY COMPILE_FLAGS " -Wno-parentheses")
+	endforeach()
+endif()
+check_c_compiler_flag("-Wno-sign-compare" C_NO_SIGN_COMPARE)
+if (C_NO_SIGN_COMPARE)
+	foreach (src ${EXTERNAL_SRCS})
+		set_property(SOURCE ${src} APPEND_STRING PROPERTY COMPILE_FLAGS " -Wno-sign-compare")
+	endforeach()
+endif()
+check_c_compiler_flag("-Wno-char-subscripts" C_NO_CHAR_SUBSCRIPTS)
+if (C_NO_CHAR_SUBSCRIPTS)
+	foreach (src ${EXTERNAL_SRCS})
+		set_property(SOURCE ${src} APPEND_STRING PROPERTY COMPILE_FLAGS " -Wno-char-subscripts")
+	endforeach()
+endif()
+check_c_compiler_flag("-Wno-missing-braces" C_NO_MISSING_BRACES)
+if (C_NO_MISSING_BRACES)
+	foreach (src ${EXTERNAL_SRCS})
+		set_property(SOURCE ${src} APPEND_STRING PROPERTY COMPILE_FLAGS " -Wno-missing-braces")
+	endforeach()
+endif()
+# end of ufbx_write.c specific flags
+
 foreach (src ${EXTERNAL_SRCS})
 	engine_source_optimize(${src})
 endforeach()
@@ -71,6 +113,7 @@ set(SRCS
 	private/mesh/OBJFormat.h                 private/mesh/OBJFormat.cpp
 	private/mesh/PLYFormat.h                 private/mesh/PLYFormat.cpp
 	private/mesh/STLFormat.h                 private/mesh/STLFormat.cpp
+	private/mesh/lego/LDrawFormat.h          private/mesh/lego/LDrawFormat.cpp
 	private/mesh/TextureLookup.h             private/mesh/TextureLookup.cpp
 	private/mesh/gis/GMLFormat.h             private/mesh/gis/GMLFormat.cpp
 	private/mesh/gis/OSMFormat.h             private/mesh/gis/OSMFormat.cpp
@@ -180,6 +223,7 @@ set(TEST_SRCS
 	tests/SMFormatTest.cpp
 	tests/SMTPLFormatTest.cpp
 	tests/STLFormatTest.cpp
+	tests/LDrawFormatTest.cpp
 	tests/MeshTriTest.cpp
 	tests/TeardownFormatTest.cpp
 	tests/ThingFormatTest.cpp
@@ -221,6 +265,8 @@ set(TEST_FILES
 	"tests/blockbench_meshtypes.bbmodel"
 	"tests/bug393.obj"
 	"tests/cc.hva"
+	"tests/ldraw-simple.ldr"
+	"tests/ldraw-simple.mpd"
 	"tests/cc.vxl"
 	"tests/bug636/legs.vxl"
 	"tests/bug636/legs.hva"

@@ -23,13 +23,21 @@ static size_t ziparchive_read(void *userdata, mz_uint64 offset, void *targetBuf,
 		Log::error("ziparchive_read: Failed to seek");
 		return 0;
 	}
-	// TODO: read until we have read the expected size
-	const int64_t read = stream->read(targetBuf, targetBufSize);
-	if (read <= -1) {
-		Log::error("Failed to read %i bytes from stream", (int)targetBufSize);
-		return read;
+	size_t remaining = targetBufSize;
+	uint8_t *buf = (uint8_t *)targetBuf;
+	while (remaining > 0) {
+		const int64_t read = stream->read(buf, remaining);
+		if (read <= -1) {
+			Log::error("Failed to read %i bytes from stream", (int)remaining);
+			return 0;
+		}
+		if (read == 0) {
+			break;
+		}
+		buf += read;
+		remaining -= (size_t)read;
 	}
-	return read;
+	return targetBufSize - remaining;
 }
 
 static size_t ziparchive_write_callback(void *userdata, mz_uint64 offset, const void *targetBuf, size_t targetBufSize) {
@@ -79,6 +87,29 @@ ZipArchive::~ZipArchive() {
 
 void ZipArchive::shutdown() {
 	reset();
+	_files.clear();
+}
+
+bool ZipArchive::exists(const core::String &file) const {
+	const core::String normalized = core::string::sanitizePath(file);
+	for (const auto &entry : _files) {
+		if (entry.fullPath == normalized) {
+			return true;
+		}
+	}
+	return false;
+}
+
+void ZipArchive::list(const core::String &basePath, ArchiveFiles &out, const core::String &filter) const {
+	const core::String normalizedBase = core::string::sanitizePath(basePath);
+	for (const auto &entry : _files) {
+		if (!normalizedBase.empty() && !core::string::startsWith(entry.fullPath, normalizedBase)) {
+			continue;
+		}
+		if (core::string::fileMatchesMultiple(entry.name.c_str(), filter.c_str())) {
+			out.push_back(entry);
+		}
+	}
 }
 
 void ZipArchive::reset() {
@@ -153,7 +184,7 @@ bool ZipArchive::init(const core::String &path, io::SeekableReadStream *stream) 
 			continue;
 		}
 		FilesystemEntry entry;
-		entry.fullPath = zipStat.m_filename;
+		entry.fullPath = core::string::sanitizePath(zipStat.m_filename);
 		entry.name = core::string::extractFilenameWithExtension(entry.fullPath);
 		entry.type = FilesystemEntry::Type::file;
 		entry.size = zipStat.m_uncomp_size;
@@ -220,15 +251,16 @@ SeekableReadStream *ZipArchive::readStream(const core::String &filePath) {
 		Log::error("No zip archive loaded");
 		return nullptr;
 	}
+	const core::String normalized = core::string::sanitizePath(filePath);
 	mz_uint32 fileIndex;
-	if (!mz_zip_reader_locate_file_v2((mz_zip_archive *)_zip, filePath.c_str(), nullptr, 0, &fileIndex)) {
-		Log::error("File '%s' not found in zip archive", filePath.c_str());
+	if (!mz_zip_reader_locate_file_v2((mz_zip_archive *)_zip, normalized.c_str(), nullptr, 0, &fileIndex)) {
+		Log::error("File '%s' not found in zip archive", normalized.c_str());
 		return nullptr;
 	}
 
 	mz_zip_archive_file_stat stat;
 	if (!mz_zip_reader_file_stat((mz_zip_archive *)_zip, fileIndex, &stat)) {
-		Log::error("Failed to get file stat for file '%s' in zip archive", filePath.c_str());
+		Log::error("Failed to get file stat for file '%s' in zip archive", normalized.c_str());
 		return nullptr;
 	}
 
@@ -236,11 +268,11 @@ SeekableReadStream *ZipArchive::readStream(const core::String &filePath) {
 	if (!mz_zip_reader_extract_to_callback((mz_zip_archive *)_zip, fileIndex, ziparchive_write_callback, stream, 0)) {
 		const mz_zip_error error = mz_zip_get_last_error((mz_zip_archive *)_zip);
 		const char *err = mz_zip_get_error_string(error);
-		Log::error("Failed to extract file '%s' from zip: %s", filePath.c_str(), err);
+		Log::error("Failed to extract file '%s' from zip: %s", normalized.c_str(), err);
 		delete stream;
 		return nullptr;
 	}
-	Log::debug("Read stream for file '%s' from zip", filePath.c_str());
+	Log::debug("Read stream for file '%s' from zip", normalized.c_str());
 	stream->seek(0);
 	return stream;
 }

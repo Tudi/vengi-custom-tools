@@ -8,7 +8,43 @@ See [the documentation](https://vengi-voxel.github.io/vengi/) for further detail
 
 Known [issues](https://github.com/vengi-voxel/vengi/issues?q=is%3Aissue+is%3Aopen+label%3Abug).
 
-## 0.5.0 (2026-XX-XX)
+## 0.6.0 (2026-XX-XX)
+
+General:
+
+   - Refactored parts of the io module and fixed memory leaks
+   - Added support for `ldr` and `mpd` lego files
+   - Improved `fbx` animation support and added write support
+   - Improved `bbmodel` support and added animation import as well as write support
+   - Fixed blip/cubzh `3zh` file transform issues
+   - Improved StarMade `sment` and `smtpl` support
+   - Import magicavoxel `vox` animation frames as single nodes
+   - Fixed issues with baking the transform
+   - Improved AniVoxel `voxa` support
+   - Improved sandbox `vmx` support
+   - Fixed invisible faces in some situations with the cube mesher
+   - Fixed UTF8 issues with the tokenizer (visible in the file dialog bread crump menu)
+
+VoxEdit:
+
+   - Fixed massive performance issue with multiple viewports
+   - Added the last recently used 10 colors to the viewport
+   - Fixed animation timeline node selection scrolling
+   - Fixed pivot translation via gizmo
+   - Fixed z axis input handling
+   - Fixed missing cache invalidation regarding transforms and max frames
+   - In AceOfSpades modes the new-scene-dialog uses the default map size now
+   - Improved input capturing at startup (the console no longer forcefully requests the focus)
+
+VoxConvert:
+
+   - Added a blender plugin
+
+Thumbnailer:
+
+   - Only run `vengi-thumbnailer.exe` on windows to work around window creation issues from dlls
+
+## 0.5.0 (2026-04-18)
 
 General:
 

@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include "core/collection/MRUBuffer.h"
 #include "image/CaptureTool.h"
 #include "scenegraph/SceneGraphNode.h"
 #include "ui/IMGUIEx.h"
@@ -50,6 +51,8 @@ private:
 	voxelrender::SceneCameraMode _camMode = voxelrender::SceneCameraMode::Free;
 	image::CaptureTool _captureTool;
 	SceneManagerPtr _sceneMgr;
+	core::MRUBuffer<color::RGBA, 10> _recentColors;
+	color::RGBA _lastTrackedColor = {0, 0, 0, 0};
 
 	/**
 	 * @sa lock()
@@ -85,6 +88,7 @@ private:
 	Bounds _bounds;
 
 	voxelrender::RenderContext _renderContext;
+	voxelrender::RenderContext _modifierRenderContext;
 	video::Camera _camera;
 
 	core::VarPtr _showAxisVar;
@@ -103,6 +107,7 @@ private:
 	core::VarPtr _localSpace;
 	core::VarPtr _renderNormals;
 	core::VarPtr _animationPlaying;
+	scenegraph::FrameIndex _lastFrameIdx = InvalidFrame;
 	core::VarPtr _clipping;
 	core::VarPtr _brushGizmo;
 
@@ -159,6 +164,7 @@ private:
 	void menuBarView(command::CommandExecutionListener *listener);
 	void menuBarRenderModeToggle();
 	void menuBarMementoOptions(command::CommandExecutionListener *listener);
+	void menuBarRecentColors();
 	void renderMenuBar(command::CommandExecutionListener *listener);
 	void resize(const glm::ivec2 &contentSize);
 	void resizeCamera(const glm::ivec2 &contentSize);

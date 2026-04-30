@@ -45,9 +45,10 @@ TEST_F(ConvertTest, testVoxToSLAB6VoxPalette) {
 TEST_F(ConvertTest, testVoxToVXM) {
 	VoxFormat src;
 	VXMFormat target;
-	// vxm can't store transforms - only the voxel data.
+	// vxm can't store transforms (translation/rotation/scale) - only the voxel data and pivot.
 	const voxel::ValidateFlags flags =
-		voxel::ValidateFlags::All & ~(voxel::ValidateFlags::Palette | voxel::ValidateFlags::Transform);
+		voxel::ValidateFlags::All & ~(voxel::ValidateFlags::Palette | voxel::ValidateFlags::Translation |
+									  voxel::ValidateFlags::Animations | voxel::ValidateFlags::Scale);
 	testLoadSaveAndLoadSceneGraph("robo.vox", src, "convert-robo.vxm", target, flags);
 }
 
@@ -479,6 +480,17 @@ TEST_F(ConvertTest, testVengiToVox) {
 	const voxel::ValidateFlags flags = voxel::ValidateFlags::Color | voxel::ValidateFlags::Scale |
 									   voxel::ValidateFlags::SceneGraphModels;
 	testConvert("minecraft-skin.vengi", src, "minecraft-skin.vox", target, flags);
+}
+
+// https://github.com/vengi-voxel/vengi/issues/746
+// https://github.com/vengi-voxel/vengi/issues/670
+TEST_F(ConvertTest, testVXLToVox) {
+	VXLFormat src;
+	VoxFormat target;
+	// VXL uses pivot-based transforms while VOX uses lower-corner-based transforms,
+	// so per-node translation comparison won't match. We validate the merged result instead.
+	const voxel::ValidateFlags flags = voxel::ValidateFlags::Color | voxel::ValidateFlags::SceneGraphModels;
+	testConvert("cc.vxl", src, "convert-cc.vox", target, flags);
 }
 
 } // namespace voxelformat

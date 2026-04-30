@@ -15,6 +15,10 @@ namespace image {
 class Image;
 }
 
+namespace io {
+class WriteStream;
+}
+
 namespace palette {
 
 struct ColorPaletteEntry {
@@ -23,6 +27,11 @@ struct ColorPaletteEntry {
 	palette::Material material;
 };
 
+/**
+ * @brief A color palette with support for more than 256 colors
+ * @note The main palette class is @c Palette - a 256 color palette. This class is used in some situations where more
+ * than 256 colors are needed.
+ */
 class ColorPalette : public core::DirtyState {
 private:
 	core::DynamicArray<ColorPaletteEntry> _entries;
@@ -80,8 +89,6 @@ public:
 	const_iterator begin() const;
 
 	const_iterator end() const;
-
-	static core::String print(const ColorPalette &palette, bool colorAsHex = false);
 };
 
 inline const core::String &ColorPalette::filename() const {

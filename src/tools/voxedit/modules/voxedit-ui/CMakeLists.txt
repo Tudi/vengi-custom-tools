@@ -24,6 +24,7 @@ set(SRCS
 	RenderPanel.h RenderPanel.cpp
 	SceneDebugPanel.h SceneDebugPanel.cpp
 	SceneGraphPanel.h SceneGraphPanel.cpp
+	SceneGraphUtil.h
 	SceneSettingsPanel.h SceneSettingsPanel.cpp
 	ScriptPanel.h ScriptPanel.cpp
 	BrushPanel.h BrushPanel.cpp
@@ -32,6 +33,7 @@ set(SRCS
 	ToolsPanel.h ToolsPanel.cpp
 	ViewMode.h ViewMode.cpp
 	Viewport.h Viewport.cpp
+	VoxBoxBrowserPanel.h VoxBoxBrowserPanel.cpp
 	QuitDisallowReason.h
 	WindowTitles.h
 )
@@ -55,6 +57,7 @@ if (USE_IMGUITESTENGINE)
 		tests/OptionsPanelTest.cpp
 		tests/PalettePanelTest.cpp
 		tests/RenderPanelTest.cpp
+		tests/SceneDebugPanelTest.cpp
 		tests/SceneGraphPanelTest.cpp
 		tests/SceneSettingsPanelTest.cpp
 		tests/ScriptPanelTest.cpp

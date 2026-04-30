@@ -8,7 +8,9 @@
 #include "scenegraph/SceneGraphNode.h"
 #include "ui/IMGUIEx.h"
 #include "ui/IconsLucide.h"
+#include "ui/dearimgui/imgui_internal.h"
 #include "ui/dearimgui/imgui_neo_sequencer.h"
+#include "voxedit-ui/SceneGraphUtil.h"
 #include "voxedit-util/Config.h"
 #include "voxedit-util/SceneManager.h"
 
@@ -56,6 +58,12 @@ void AnimationTimeline::header(scenegraph::FrameIndex currentFrame, scenegraph::
 	ImGui::Checkbox(_("Loop"), &_loop);
 
 	ImGui::SameLine();
+	ImGui::SeparatorEx(ImGuiSeparatorFlags_Vertical);
+
+	ImGui::SameLine();
+	ImGui::Text("%i/%i", currentFrame, maxFrame);
+
+	ImGui::SameLine();
 	ImGui::SetNextItemWidth(ImGui::Size(5));
 	if (ImGui::InputDouble(_("FPS"), &_fps, 0.0, 0.0, "%.0f")) {
 		_frameTimeSeconds = 0.0;
@@ -65,7 +73,8 @@ void AnimationTimeline::header(scenegraph::FrameIndex currentFrame, scenegraph::
 void AnimationTimeline::timelineEntry(scenegraph::FrameIndex currentFrame, core::Buffer<Selection> &selectionBuffer,
 									  core::Buffer<scenegraph::FrameIndex> &selectedFrames,
 									  const scenegraph::SceneGraphNode &node) {
-	const core::String &label = core::String::format("%s###node-%i", node.name().c_str(), node.id());
+	const char *icon = nodeIcon(node.type());
+	const core::String &label = core::String::format("%s %s###node-%i", icon, node.name().c_str(), node.id());
 	scenegraph::SceneGraph &sceneGraph = _sceneMgr->sceneGraph();
 	const int activeNode = sceneGraph.activeNode();
 	if (ImGui::BeginNeoTimelineEx(label.c_str(), nullptr, ImGuiNeoTimelineFlags_AllowFrameChanging)) {
@@ -76,7 +85,7 @@ void AnimationTimeline::timelineEntry(scenegraph::FrameIndex currentFrame, core:
 				kf.frameIdx = 0;
 			}
 			if (oldFrameIdx != kf.frameIdx) {
-				sceneGraph.markMaxFramesDirty();
+				sceneGraph.markKeyFramesDirty(node.id());
 			}
 
 			if (ImGui::IsNeoKeyframeHovered()) {
@@ -87,8 +96,6 @@ void AnimationTimeline::timelineEntry(scenegraph::FrameIndex currentFrame, core:
 			}
 		}
 		if (activeNode != _lastActivedNodeId && node.id() == activeNode) {
-			// TODO: UI: doesn't work - see issue https://github.com/vengi-voxel/vengi/issues/437
-			ImGui::SetScrollHereY();
 			_lastActivedNodeId = activeNode;
 		}
 		if (ImGui::IsNeoTimelineSelected(ImGuiNeoTimelineIsSelectedFlags_NewlySelected)) {
@@ -117,6 +124,15 @@ bool AnimationTimeline::init() {
 	return true;
 }
 
+static void fillDisplayNodes_r(const scenegraph::SceneGraph &sceneGraph, const scenegraph::SceneGraphNode &node, core::DynamicArray<int> &displayNodes) {
+	if (!node.isRootNode()) {
+		displayNodes.push_back(node.id());
+	}
+	for (int childId : node.children()) {
+		fillDisplayNodes_r(sceneGraph, sceneGraph.node(childId), displayNodes);
+	}
+}
+
 void AnimationTimeline::sequencer(scenegraph::FrameIndex &currentFrame) {
 	ImGuiNeoSequencerFlags flags = ImGuiNeoSequencerFlags_AlwaysShowHeader;
 	flags |= ImGuiNeoSequencerFlags_EnableSelection;
@@ -133,12 +149,28 @@ void AnimationTimeline::sequencer(scenegraph::FrameIndex &currentFrame) {
 		}
 		core::Buffer<scenegraph::FrameIndex> selectedFrames;
 		const scenegraph::SceneGraph &sceneGraph = _sceneMgr->sceneGraph();
-		for (auto entry : sceneGraph.nodes()) {
-			const scenegraph::SceneGraphNode &node = entry->second;
-			if (!node.isAnyModelNode() && !node.isCameraNode() && !node.isPointNode()) {
-				continue;
+		core::DynamicArray<int> displayNodes;
+		fillDisplayNodes_r(sceneGraph, sceneGraph.root(), displayNodes);
+		const int activeNode = sceneGraph.activeNode();
+		ImGuiListClipper clipper;
+		clipper.Begin((int)displayNodes.size());
+		while (clipper.Step()) {
+			for (int i = clipper.DisplayStart; i < clipper.DisplayEnd; i++) {
+				const scenegraph::SceneGraphNode &node = sceneGraph.node(displayNodes[i]);
+				timelineEntry(currentFrame, selectionBuffer, selectedFrames, node);
 			}
-			timelineEntry(currentFrame, selectionBuffer, selectedFrames, node);
+		}
+		if (activeNode != _lastActivedNodeId) {
+			for (int i = 0; i < (int)displayNodes.size(); i++) {
+				if (displayNodes[i] == activeNode) {
+					const float savedY = ImGui::GetCurrentWindow()->DC.CursorPos.y;
+					clipper.SeekCursorForItem(i);
+					ImGui::SetScrollHereY();
+					ImGui::GetCurrentWindow()->DC.CursorPos.y = savedY;
+					_lastActivedNodeId = activeNode;
+					break;
+				}
+			}
 		}
 		bool selectionRightClicked = ImGui::IsNeoKeyframeSelectionRightClicked();
 		// check if current frame was changed by dragging the handle

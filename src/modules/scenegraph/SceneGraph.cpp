@@ -132,8 +132,7 @@ bool SceneGraph::setAnimation(const core::String &animation) {
 	for (const auto &entry : _nodes) {
 		entry->value.setAnimation(animation);
 	}
-	invalidateFrameTransformCache(InvalidNodeId);
-	markMaxFramesDirty();
+	markKeyFramesDirty(InvalidNodeId);
 	for (SceneGraphListener *listener : _listeners) {
 		listener->onAnimationChanged(animation);
 	}
@@ -169,6 +168,7 @@ bool SceneGraph::duplicateAnimation(const core::String &animation, const core::S
 		listener->onAnimationAdded(newName);
 	}
 	updateTransforms_r(node(0));
+	markKeyFramesDirty(InvalidNodeId);
 	return true;
 }
 
@@ -241,6 +241,11 @@ const core::String &SceneGraph::activeAnimation() const {
 
 void SceneGraph::markMaxFramesDirty() {
 	_cachedMaxFrame = -1;
+}
+
+void SceneGraph::markKeyFramesDirty(int nodeId) {
+	invalidateFrameTransformCache(nodeId);
+	markMaxFramesDirty();
 }
 
 FrameIndex SceneGraph::maxFrames() const {
@@ -832,6 +837,11 @@ int SceneGraph::emplace(SceneGraphNode &&node, int parent) {
 		}
 	}
 	const int nodeId = _nextNodeId;
+	if (type != SceneGraphNodeType::Root && parent < 0) {
+		Log::error("Invalid parent id given: %i - non-root nodes must have a valid parent", parent);
+		node.release();
+		return InvalidNodeId;
+	}
 	if (parent >= nodeId) {
 		Log::error("Invalid parent id given: %i", parent);
 		node.release();
@@ -1032,6 +1042,7 @@ bool SceneGraph::removeNode(int nodeId, bool recursive) {
 	if (type == SceneGraphNodeType::Model) {
 		_regionDirty = true;
 	}
+	markKeyFramesDirty(InvalidNodeId);
 	return state;
 }
 

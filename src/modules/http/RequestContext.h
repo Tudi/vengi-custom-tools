@@ -10,11 +10,12 @@ namespace http {
 
 using Headers = core::DynamicStringMap<core::String>;
 
-enum class RequestType { GET, POST };
+enum class RequestType { GET, POST, PATCH };
 
 struct RequestContext {
 	int _timeoutSecond = 5;
 	int _connectTimeoutSecond = 5;
+	bool _followRedirects = true;
 	RequestType _type;
 	core::String _url;
 	core::String _userAgent;

@@ -4,6 +4,8 @@ set(SRCS
 	Archive.cpp Archive.h
 	Base64.cpp Base64.h
 	Base64Stream.cpp Base64Stream.h
+	CachingArchive.cpp CachingArchive.h
+	CompositeArchive.cpp CompositeArchive.h
 	Base64ReadStream.cpp Base64ReadStream.h
 	Base64WriteStream.cpp Base64WriteStream.h
 	BufferedReadWriteStream.cpp BufferedReadWriteStream.h
@@ -18,6 +20,7 @@ set(SRCS
 	FormatDescription.cpp FormatDescription.h
 	IOResource.h
 	LZFSEReadStream.cpp LZFSEReadStream.h
+	LZMAReadStream.cpp LZMAReadStream.h
 	MemoryArchive.cpp MemoryArchive.h
 	MemoryReadStream.cpp MemoryReadStream.h
 	StdStreamBuf.h
@@ -41,7 +44,7 @@ set(SRCS
 )
 
 set(LIB io)
-set(LIBS core lzfse)
+set(LIBS core lzfse minlzma)
 
 if (USE_LIBDEFLATE)
 	find_package(libdeflate)
@@ -113,12 +116,15 @@ set(TEST_SRCS
 	tests/BufferedReadWriteStreamTest.cpp
 	tests/BufferedWriteStreamTest.cpp
 	tests/FilesystemTest.cpp
+	tests/CachingArchiveTest.cpp
+	tests/CompositeArchiveTest.cpp
 	tests/FilesystemArchiveTest.cpp
 	tests/FileStreamTest.cpp
 	tests/FormatDescriptionTest.cpp
 	tests/FileTest.cpp
 	tests/MemoryArchiveTest.cpp
 	tests/MemoryReadStreamTest.cpp
+	tests/StreamArchiveTest.cpp
 	tests/StdStreamBufTest.cpp
 	tests/TokenStreamTest.cpp
 	tests/ZipArchiveTest.cpp

@@ -2,7 +2,7 @@
 
 - compile: `make`
 - run particular tests: `GTEST_FILTER=SomeTest.* make tests-yourmodulename-run`
-- run ui based tests like this: `UI_TESTFILTER=XXX make tests-voxedit-run`. To get a list of the available tests, run this before: `build/voxedit/vengi-tests-voxedit --imgui_list_tests`. To run all tests, just omit the `UI_TESTFILTER` env var.
+- run ui based tests like this: `UI_TESTFILTER=XXX make tests-voxedit-run`. To get a list of the available tests, run this before: `build/voxedit/vengi-tests-voxedit --imgui_list_tests`. To run all tests, just omit the `UI_TESTFILTER` env var. (See `ImGuiTestEngine_PassFilter` for a description of the filters)
 - run all tests: `make tests`
 - check the documentation under `docs` if your change would also require the documentation to be updated (or extended)
 
@@ -15,6 +15,7 @@
 - when touching code, ensure that a test is written for it - if not, write one to test the change - and execute that test
 - all vengi tools understand the `--help` parameter to print the usage for command line parameters
 - don't add unicode characters in comments or code - only ascii
+- When doing rendering code changes, check if a visual test in `src/tests` exists and implement one. If a tests exists, you can you `--screenshot 5` to generate a screenshot after 5 frames of lifetime. In combination with xvfb-run on linux, you can get the rendering result in a screenshot to inspect.
 
 # Logging
 

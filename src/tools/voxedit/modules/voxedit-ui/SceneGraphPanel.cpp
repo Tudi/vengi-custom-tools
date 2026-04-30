@@ -12,11 +12,13 @@
 #include "core/StringUtil.h"
 #include "core/Trace.h"
 #include "scenegraph/SceneGraphNode.h"
+#include "scenegraph/SceneGraphNodeType.h"
 #include "ui/IMGUIEx.h"
 #include "ui/Style.h"
 #include "ui/IconsLucide.h"
 #include "ui/ScopedStyle.h"
 #include "ui/Toolbar.h"
+#include "voxedit-ui/SceneGraphUtil.h"
 #include "voxedit-ui/WindowTitles.h"
 #include "voxedit-util/Config.h"
 #include "voxedit-util/ModelNodeSettings.h"
@@ -111,20 +113,20 @@ void SceneGraphPanel::contextMenu(video::Camera& camera, const scenegraph::Scene
 
 // see filterTypes array
 bool SceneGraphPanel::isFiltered(const scenegraph::SceneGraphNode &node) const {
-	if (_filterType != 0) {
-		if (_filterType == 1 && !node.isModelNode()) {
+	if (_filterType != scenegraph::SceneGraphNodeType::All) {
+		if (_filterType == scenegraph::SceneGraphNodeType::Model && !node.isModelNode()) {
 			return true;
 		}
-		if (_filterType == 2 && !node.isGroupNode()) {
+		if (_filterType == scenegraph::SceneGraphNodeType::Group && !node.isGroupNode()) {
 			return true;
 		}
-		if (_filterType == 3 && !node.isCameraNode()) {
+		if (_filterType == scenegraph::SceneGraphNodeType::Camera && !node.isCameraNode()) {
 			return true;
 		}
-		if (_filterType == 4 && !node.isReferenceNode()) {
+		if (_filterType == scenegraph::SceneGraphNodeType::ModelReference && !node.isReferenceNode()) {
 			return true;
 		}
-		if (_filterType == 5 && !node.isPointNode()) {
+		if (_filterType == scenegraph::SceneGraphNodeType::Point && !node.isPointNode()) {
 			return true;
 		}
 	}
@@ -198,32 +200,7 @@ void SceneGraphPanel::renderNode(video::Camera &camera, const scenegraph::SceneG
 
 		ImGui::TableNextColumn();
 
-		const char *icon = "";
-		switch (node.type()) {
-		case scenegraph::SceneGraphNodeType::ModelReference:
-			icon = ICON_LC_CODESANDBOX;
-			break;
-		case scenegraph::SceneGraphNodeType::Model:
-			icon = ICON_LC_BOXES;
-			break;
-		case scenegraph::SceneGraphNodeType::Point:
-			icon = ICON_LC_POINTER;
-			break;
-		case scenegraph::SceneGraphNodeType::Root:
-		case scenegraph::SceneGraphNodeType::Group:
-			icon = ICON_LC_GROUP;
-			break;
-		case scenegraph::SceneGraphNodeType::Camera:
-			icon = ICON_LC_CAMERA;
-			break;
-		case scenegraph::SceneGraphNodeType::Unknown:
-			icon = ICON_LC_CIRCLE_QUESTION_MARK;
-			break;
-		case scenegraph::SceneGraphNodeType::AllModels:
-		case scenegraph::SceneGraphNodeType::All:
-		case scenegraph::SceneGraphNodeType::Max:
-			break;
-		}
+		const char *icon = nodeIcon(node.type());
 		const core::String &name = core::String::format("%s##%i", node.name().c_str(), nodeId);
 		const bool selected = nodeId == sceneGraph.activeNode();
 		ImGuiTreeNodeFlags treeFlags = ImGuiTreeNodeFlags_SpanFullWidth | ImGuiTreeNodeFlags_NoTreePushOnOpen;
@@ -394,15 +371,19 @@ void SceneGraphPanel::update(video::Camera& camera, const char *id, ModelNodeSet
 			ImGui::SetNextItemWidth(ImGui::Size(12.0f));
 			ImGui::InputText(_("Filter"), &_filterName);
 			ImGui::SameLine();
-			const char *filterTypes[] = {_("All"), _("Models"), _("Groups"), _("Cameras"), _("References"), _("Points")};
-			static_assert(lengthof(filterTypes) == 6, "Filter types array size mismatch - see SceneGraphPanel::isFiltered");
-			const float modeMaxWidth = ImGui::CalcComboWidth(filterTypes[_filterType]);
+			const scenegraph::SceneGraphNodeType filterTypes[] = {scenegraph::SceneGraphNodeType::All,
+																  scenegraph::SceneGraphNodeType::Model,
+																  scenegraph::SceneGraphNodeType::Group,
+																  scenegraph::SceneGraphNodeType::Camera,
+																  scenegraph::SceneGraphNodeType::ModelReference,
+																  scenegraph::SceneGraphNodeType::Point};
+			const float modeMaxWidth = ImGui::CalcComboWidth(_(scenegraph::SceneGraphNodeTypeStr[(int)_filterType]));
 			ImGui::SetNextItemWidth(modeMaxWidth);
-			if (ImGui::BeginCombo("##filtertype", filterTypes[_filterType])) {
+			if (ImGui::BeginCombo("##filtertype", _(scenegraph::SceneGraphNodeTypeStr[(int)_filterType]))) {
 				for (int i = 0; i < lengthof(filterTypes); i++) {
-					const bool selected = i == _filterType;
-					if (ImGui::Selectable(filterTypes[i], selected)) {
-						_filterType = i;
+					const bool selected = filterTypes[i] == _filterType;
+					if (ImGui::Selectable(_(scenegraph::SceneGraphNodeTypeStr[(int)filterTypes[i]]), selected)) {
+						_filterType = filterTypes[i];
 					}
 					if (selected) {
 						ImGui::SetItemDefaultFocus();
@@ -411,9 +392,9 @@ void SceneGraphPanel::update(video::Camera& camera, const char *id, ModelNodeSet
 				ImGui::EndCombo();
 			}
 		} else {
-			if (!_filterName.empty() || _filterType != 0) {
+			if (!_filterName.empty() || _filterType != scenegraph::SceneGraphNodeType::All) {
 				_filterName = "";
-				_filterType = 0;
+				_filterType = scenegraph::SceneGraphNodeType::All;
 			}
 		}
 

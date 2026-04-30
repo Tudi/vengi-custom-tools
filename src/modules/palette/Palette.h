@@ -10,7 +10,6 @@
 #include "color/RGBA.h"
 #include "core/String.h"
 #include "core/collection/Array.h"
-#include "core/collection/Buffer.h"
 #include "palette/PaletteView.h"
 #include "image/ImageFwd.h"
 #include "palette/Material.h"
@@ -135,8 +134,6 @@ public:
 	bool load(const char *name);
 	bool load(const image::ImagePtr &img);
 	bool save(const char *name = nullptr) const;
-
-	static core::String print(const Palette &palette, bool colorAsHex = false);
 
 	/**
 	 * @brief fill the remaining colors with black

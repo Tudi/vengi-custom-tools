@@ -21,6 +21,7 @@
 #include "voxedit-util/Config.h"
 #include "voxedit-util/ModelNodeSettings.h"
 #include "voxedit-util/SceneManager.h"
+#include "voxel/Region.h"
 #include "voxel/Voxel.h"
 
 #include <glm/gtc/type_ptr.hpp>
@@ -243,8 +244,8 @@ void NodeInspectorPanel::saveRegionSizes(const core::Buffer<glm::ivec3> &sizes) 
 		if (!valStr.empty()) {
 			valStr += ",";
 		}
-		if (maxs.x <= 0 || maxs.x > MaxVolumeSize || maxs.y <= 0 || maxs.y > MaxVolumeSize || maxs.z <= 0 ||
-			maxs.z > MaxVolumeSize) {
+		const voxel::Region region(glm::ivec3(0), maxs);
+		if (_sceneMgr->exceedsMaxSuggestedVolumeSize(region)) {
 			Log::warn("Invalid region size %ix%ix%i", maxs.x, maxs.y, maxs.z);
 			continue;
 		}
@@ -319,10 +320,10 @@ void NodeInspectorPanel::keyFrameInterpolationSettings(scenegraph::SceneGraphNod
 	ImGui::BeginDisabled(node.type() == scenegraph::SceneGraphNodeType::Camera);
 	const scenegraph::SceneGraphKeyFrame &keyFrame = node.keyFrame(keyFrameIdx);
 	const int currentInterpolation = (int)keyFrame.interpolation;
-	if (ImGui::BeginCombo(_("Interpolation"), scenegraph::InterpolationTypeStr[currentInterpolation])) {
+	if (ImGui::BeginCombo(_("Interpolation"), _(scenegraph::InterpolationTypeStr[currentInterpolation]))) {
 		for (int n = 0; n < lengthof(scenegraph::InterpolationTypeStr); n++) {
 			const bool isSelected = (currentInterpolation == n);
-			if (ImGui::Selectable(scenegraph::InterpolationTypeStr[n], isSelected)) {
+			if (ImGui::Selectable(_(scenegraph::InterpolationTypeStr[n]), isSelected)) {
 				_sceneMgr->nodeUpdateKeyFrameInterpolation(node.id(), keyFrameIdx, (scenegraph::InterpolationType)n);
 			}
 			if (isSelected) {
@@ -808,8 +809,8 @@ void NodeInspectorPanel::updateModelRegionSizes() {
 		for (const core::String &s : strs) {
 			glm::ivec3 maxs(0);
 			core::string::parseIVec3(s, &maxs[0]);
-			if (maxs.x <= 0 || maxs.x > MaxVolumeSize || maxs.y <= 0 || maxs.y > MaxVolumeSize || maxs.z <= 0 ||
-				maxs.z > MaxVolumeSize) {
+			const voxel::Region region(glm::ivec3(0), maxs);
+			if (_sceneMgr->exceedsMaxSuggestedVolumeSize(region)) {
 				continue;
 			}
 			_validRegionSizes.push_back(maxs);

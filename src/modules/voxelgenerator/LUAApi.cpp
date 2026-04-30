@@ -22,6 +22,7 @@
 #include "palette/PaletteFormatDescription.h"
 #include "palette/Palette.h"
 #include "palette/PaletteLookup.h"
+#include "palette/PaletteUtil.h"
 #include "scenegraph/SceneGraph.h"
 #include "scenegraph/SceneGraphAnimation.h"
 #include "scenegraph/SceneGraphKeyFrame.h"
@@ -1691,7 +1692,7 @@ static int luaVoxel_palette_color_to_string(lua_State* s) {
 
 static int luaVoxel_palette_tostring(lua_State* s) {
 	const palette::Palette *palette = luaVoxel_toPalette(s, 1);
-	const core::String pal = palette::Palette::print(*palette);
+	const core::String pal = palette::toString(*palette);
 	lua_pushfstring(s, "%s", pal.c_str());
 	return 1;
 }
@@ -3154,7 +3155,7 @@ static int luaVoxel_scenegraphnode_removekeyframeforframe(lua_State* s) {
 		return clua_error(s, "Failed to remove keyframe %d", existingIndex);
 	}
 	scenegraph::SceneGraph* sceneGraph = luaVoxel_scenegraph(s);
-	sceneGraph->markMaxFramesDirty();
+	sceneGraph->markKeyFramesDirty(node->node->id());
 	return 0;
 }
 
@@ -3165,7 +3166,7 @@ static int luaVoxel_scenegraphnode_removekeyframe(lua_State* s) {
 		return clua_error(s, "Failed to remove keyframe %d", keyFrameIdx);
 	}
 	scenegraph::SceneGraph* sceneGraph = luaVoxel_scenegraph(s);
-	sceneGraph->markMaxFramesDirty();
+	sceneGraph->markKeyFramesDirty(node->node->id());
 	return 0;
 }
 
@@ -3182,7 +3183,7 @@ static int luaVoxel_scenegraphnode_addframe(lua_State* s) {
 		return clua_error(s, "Failed to add keyframe for frame %d", frameIdx);
 	}
 	scenegraph::SceneGraph *sceneGraph = luaVoxel_scenegraph(s);
-	sceneGraph->markMaxFramesDirty();
+	sceneGraph->markKeyFramesDirty(node->node->id());
 	scenegraph::SceneGraphKeyFrame &kf = node->node->keyFrame(newKeyFrameIdx);
 	kf.interpolation = interpolation;
 	const scenegraph::SceneGraphKeyFrame &prevKf = node->node->keyFrame(newKeyFrameIdx - 1);
@@ -3243,6 +3244,7 @@ static void luaVoxel_keyframe_updatetransform(lua_State *s, LuaKeyFrame *keyFram
 	scenegraph::SceneGraph *sceneGraph = luaVoxel_scenegraph(s);
 	scenegraph::SceneGraphKeyFrame &kf = keyFrame->keyFrame();
 	kf.transform().update(*sceneGraph, *keyFrame->node, kf.frameIdx, true);
+	sceneGraph->markKeyFramesDirty(keyFrame->node->id());
 }
 
 static int luaVoxel_keyframe_setlocalscale(lua_State *s) {
@@ -3418,7 +3420,14 @@ static int luaVoxel_scenegraphnode_setpivot(lua_State* s) {
 		if (translate) {
 			const glm::vec3 deltaPivot = val - oldPivot;
 			const glm::vec3 size = node->node->region().getDimensionsInVoxels();
-			node->node->localTranslate(deltaPivot * size);
+			const glm::vec3 dp = deltaPivot * size;
+			for (auto *keyFrames : node->node->allKeyFrames()) {
+				for (scenegraph::SceneGraphKeyFrame &keyFrame : keyFrames->value) {
+					scenegraph::SceneGraphTransform &transform = keyFrame.transform();
+					const glm::mat3 rs(transform.localMatrix());
+					transform.setLocalTranslation(transform.localTranslation() + rs * dp);
+				}
+			}
 		}
 		scenegraph::SceneGraph *sceneGraph = luaVoxel_scenegraph(s);
 		sceneGraph->updateTransforms();

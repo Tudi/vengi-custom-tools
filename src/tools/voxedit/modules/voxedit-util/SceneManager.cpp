@@ -682,7 +682,8 @@ bool SceneManager::importDirectory(const core::String& directory, const io::Form
 		return false;
 	}
 	const io::ArchivePtr &archive = io::openFilesystemArchive(_filesystem, directory);
-	const core::DynamicArray<io::FilesystemEntry> &entities = archive->files();
+	io::ArchiveFiles entities;
+	archive->list("", entities, "");
 	if (entities.empty()) {
 		Log::info("Could not find any model in %s", directory.c_str());
 		return false;
@@ -2258,6 +2259,15 @@ int SceneManager::mergeVisibleToTemp() {
 	}
 
 	// Bake all visible nodes into world space and merge
+	// The merged node will be placed under the root, so we need transforms
+	// relative to the root to avoid double-application of the root's transform
+	glm::mat4 rootWorldMatrix(1.0f);
+	{
+		const scenegraph::FrameTransform &rootTransform = _sceneGraph.transformForFrame(_sceneGraph.root(), _currentFrameIdx);
+		rootWorldMatrix = rootTransform.worldMatrix();
+	}
+	const glm::mat4 invRootWorldMatrix = glm::inverse(rootWorldMatrix);
+
 	scenegraph::SceneGraph tempSceneGraph;
 	for (int nodeId : visibleNodeIds) {
 		const scenegraph::SceneGraphNode *node = sceneGraphNode(nodeId);
@@ -2266,9 +2276,10 @@ int SceneManager::mergeVisibleToTemp() {
 		}
 		const scenegraph::FrameTransform &transform =
 			_sceneGraph.transformForFrame(*node, _currentFrameIdx);
+		const glm::mat4 relativeMatrix = invRootWorldMatrix * transform.worldMatrix();
 		const voxel::RawVolume *srcVolume = _sceneGraph.resolveVolume(*node);
 		voxel::RawVolume *bakedVolume =
-			voxelutil::applyTransformToVolume(*srcVolume, transform.worldMatrix(), node->pivot());
+			voxelutil::applyTransformToVolume(*srcVolume, relativeMatrix, node->pivot());
 		if (bakedVolume == nullptr) {
 			continue;
 		}
@@ -2771,6 +2782,23 @@ static bool shouldGetMerged(const scenegraph::SceneGraphNode &node, NodeMergeFla
 }
 
 int SceneManager::mergeNodes(const core::Buffer<int>& nodeIds) {
+	int parent = 0;
+	const scenegraph::SceneGraphNode* firstNode = sceneGraphNode(nodeIds.front());
+	if (firstNode) {
+		parent = firstNode->parent();
+	}
+
+	// compute the target parent's world transform so we can bake transforms
+	// relative to it - otherwise the parent's transform would be applied twice
+	// (once baked into voxels, once via the parent chain during rendering)
+	glm::mat4 parentWorldMatrix(1.0f);
+	if (parent != InvalidNodeId && _sceneGraph.hasNode(parent)) {
+		const scenegraph::SceneGraphNode &parentNode = _sceneGraph.node(parent);
+		const scenegraph::FrameTransform &parentTransform = _sceneGraph.transformForFrame(parentNode, _currentFrameIdx);
+		parentWorldMatrix = parentTransform.worldMatrix();
+	}
+	const glm::mat4 invParentWorldMatrix = glm::inverse(parentWorldMatrix);
+
 	scenegraph::SceneGraph newSceneGraph;
 	for (int nodeId : nodeIds) {
 		const scenegraph::SceneGraphNode *node = sceneGraphNode(nodeId);
@@ -2778,9 +2806,10 @@ int SceneManager::mergeNodes(const core::Buffer<int>& nodeIds) {
 			continue;
 		}
 		const scenegraph::FrameTransform &transform = _sceneGraph.transformForFrame(*node, _currentFrameIdx);
+		const glm::mat4 relativeMatrix = invParentWorldMatrix * transform.worldMatrix();
 		const voxel::RawVolume *srcVolume = _sceneGraph.resolveVolume(*node);
 		voxel::RawVolume *bakedVolume =
-		voxelutil::applyTransformToVolume(*srcVolume, transform.worldMatrix(), node->pivot());
+		voxelutil::applyTransformToVolume(*srcVolume, relativeMatrix, node->pivot());
 		if (bakedVolume == nullptr) {
 			continue;
 		}
@@ -2799,15 +2828,12 @@ int SceneManager::mergeNodes(const core::Buffer<int>& nodeIds) {
 	newNode.setVolume(merged.volume());
 	newNode.setPalette(merged.palette);
 	newNode.setNormalPalette(merged.normalPalette);
-	int parent = 0;
-	if (const scenegraph::SceneGraphNode* firstNode = sceneGraphNode(nodeIds.front())) {
+	if (firstNode) {
 		newNode.setName(firstNode->name());
 		newNode.setVisible(firstNode->visible());
 		newNode.setLocked(firstNode->locked());
-		newNode.setPivot(firstNode->pivot());
 		newNode.setColor(firstNode->color());
 		newNode.addProperties(firstNode->properties());
-		parent = firstNode->parent();
 	}
 
 	int newNodeId = moveNodeToSceneGraph(newNode, parent);
@@ -3325,7 +3351,7 @@ bool SceneManager::setGridResolution(int resolution) {
 	return true;
 }
 
-void SceneManager::render(voxelrender::RenderContext &renderContext, const video::Camera& camera, uint8_t renderMask) {
+void SceneManager::render(voxelrender::RenderContext &renderContext, voxelrender::RenderContext &modifierRenderContext, const video::Camera& camera, uint8_t renderMask) {
 	renderContext.frameBuffer.bind(true);
 	_sceneRenderer->updateLockedPlanes(_modifierFacade.lockedAxis(), _sceneGraph, cursorPosition());
 
@@ -3342,7 +3368,7 @@ void SceneManager::render(voxelrender::RenderContext &renderContext, const video
 		_sceneRenderer->renderUI(renderContext, camera);
 		if (renderContext.isEditMode()) {
 			const glm::mat4 &mat = worldMatrix(renderContext.frame, renderContext.applyTransforms());
-			_modifierFacade.render(camera, activePalette(), mat);
+			_modifierFacade.render(modifierRenderContext, camera, activePalette(), mat);
 		}
 	}
 
@@ -3441,7 +3467,7 @@ void SceneManager::construct() {
 	core::Var::registerVar(voxEditLastPalette);
 	const core::VarDef voxEditViewports(cfg::VoxEditViewports, 2, 1, cfg::MaxViewports, N_("Viewports"), N_("The amount of viewports (not in simple ui mode)"));
 	core::Var::registerVar(voxEditViewports);
-	const core::VarDef voxEditMaxSuggestedVolumeSize(cfg::VoxEditMaxSuggestedVolumeSize, 128, 32, voxedit::MaxVolumeSize, N_("Max volume size"), N_("The maximum size of a volume before a few features are disabled (e.g. undo/autosave)"));
+	const core::VarDef voxEditMaxSuggestedVolumeSize(cfg::VoxEditMaxSuggestedVolumeSize, 128, 32, 4096, N_("Max volume size"), N_("The maximum size of a volume before a few features are disabled (e.g. undo/autosave)"));
 	core::Var::registerVar(voxEditMaxSuggestedVolumeSize);
 	const core::VarDef voxEditViewMode(cfg::VoxEditViewMode, "default", N_("View mode"), N_("Configure the editor view mode"));
 	core::Var::registerVar(voxEditViewMode);
@@ -3768,7 +3794,7 @@ void SceneManager::construct() {
 				});
 				if (didHit) {
 					scenegraph::SceneGraphNode &hitNode = _sceneGraph.node(hit.nodeId);
-					hitNode.setLocked(!hitNode.locked());
+					nodeSetLocked(hit.nodeId, !hitNode.locked());
 					return;
 				}
 			}
@@ -4409,28 +4435,22 @@ void SceneManager::construct() {
 	command::Command::registerCommand("nodelock")
 		.addArg({"nodeid", command::ArgType::String, true, "", "Node ID or UUID to lock"})
 		.setHandler([&] (const command::CommandArgs& args) {
-			const int nodeId = toNodeId(args, activeNode());
-			if (scenegraph::SceneGraphNode* node = sceneGraphNode(nodeId)) {
-				node->setLocked(true);
-			}
+			nodeSetLocked(toNodeId(args, activeNode()), true);
 		}).setHelp(_("Lock a particular node by id - or the current active one")).setArgumentCompleter(nodeCompleter(_sceneGraph));
 
 	command::Command::registerCommand("nodetogglelock")
 		.addArg({"nodeid", command::ArgType::String, true, "", "Node ID or UUID"})
 		.setHandler([&] (const command::CommandArgs& args) {
 			const int nodeId = toNodeId(args, activeNode());
-			if (scenegraph::SceneGraphNode* node = sceneGraphNode(nodeId)) {
-				node->setLocked(!node->locked());
+			if (const scenegraph::SceneGraphNode* node = sceneGraphNode(nodeId)) {
+				nodeSetLocked(nodeId, !node->locked());
 			}
 		}).setHelp(_("Toggle the lock state of a particular node by id - or the current active one")).setArgumentCompleter(nodeCompleter(_sceneGraph));
 
 	command::Command::registerCommand("nodeunlock")
 		.addArg({"nodeid", command::ArgType::String, true, "", "Node ID or UUID to unlock"})
 		.setHandler([&] (const command::CommandArgs& args) {
-			const int nodeId = toNodeId(args, activeNode());
-			if (scenegraph::SceneGraphNode* node = sceneGraphNode(nodeId)) {
-				node->setLocked(false);
-			}
+			nodeSetLocked(toNodeId(args, activeNode()), false);
 		}).setHelp(_("Unlock a particular node by id - or the current active one")).setArgumentCompleter(nodeCompleter(_sceneGraph));
 
 	command::Command::registerCommand("nodeactivate")
@@ -4513,6 +4533,7 @@ void SceneManager::construct() {
 				scenegraph::SceneGraphNode &node = *iter;
 				node.setLocked(true);
 			}
+			_sceneRenderer->markDirty();
 		}).setHelp(_("Lock all nodes"));
 
 	command::Command::registerCommand("modelunlockall")
@@ -4521,6 +4542,7 @@ void SceneManager::construct() {
 				scenegraph::SceneGraphNode &node = *iter;
 				node.setLocked(false);
 			}
+			_sceneRenderer->markDirty();
 		}).setHelp(_("Unlock all nodes"));
 
 	command::Command::registerCommand("noderename")
@@ -4710,7 +4732,10 @@ int SceneManager::addPointChild(const core::String& name, const glm::ivec3& posi
 	scenegraph::KeyFrameIndex keyFrameIdx = 0;
 	newNode.setTransform(keyFrameIdx, transform);
 	newNode.setName(name);
-	const int parentId = activeNode();
+	int parentId = activeNode();
+	if (parentId == InvalidNodeId) {
+		parentId = _sceneGraph.root().id();
+	}
 	const int nodeId = moveNodeToSceneGraph(newNode, parentId);
 	if (nodeId == InvalidNodeId) {
 		Log::error("Failed to add point child node '%s' at position %i:%i:%i", name.c_str(), position.x, position.y, position.z);
@@ -4728,7 +4753,10 @@ int SceneManager::addModelChild(const core::String& name, int width, int height,
 	scenegraph::SceneGraphNode newNode(scenegraph::SceneGraphNodeType::Model, uuid);
 	newNode.createVolume(region);
 	newNode.setName(name);
-	const int parentId = activeNode();
+	int parentId = activeNode();
+	if (parentId == InvalidNodeId) {
+		parentId = _sceneGraph.root().id();
+	}
 	const int nodeId = moveNodeToSceneGraph(newNode, parentId);
 	return nodeId;
 }
@@ -5472,6 +5500,7 @@ bool SceneManager::nodeUpdateKeyFrameInterpolation(scenegraph::SceneGraphNode &n
 		return false;
 	}
 	node.keyFrame(keyFrameIdx).interpolation = interpolation;
+	_sceneGraph.markKeyFramesDirty(node.id());
 	_mementoHandler.markKeyFramesChange(_sceneGraph, node);
 	markDirty();
 	return true;
@@ -5655,8 +5684,7 @@ bool SceneManager::nodeRemoveKeyFrameByIndex(int nodeId, scenegraph::KeyFrameInd
 
 bool SceneManager::nodeRemoveKeyFrame(scenegraph::SceneGraphNode &node, scenegraph::FrameIndex frameIdx) {
 	if (node.removeKeyFrame(frameIdx)) {
-		_mementoHandler.markKeyFramesChange(_sceneGraph, node);
-		markDirty();
+		nodeKeyFramesChanged(node);
 		return true;
 	}
 	return false;
@@ -5664,15 +5692,14 @@ bool SceneManager::nodeRemoveKeyFrame(scenegraph::SceneGraphNode &node, scenegra
 
 bool SceneManager::nodeRemoveKeyFrameByIndex(scenegraph::SceneGraphNode &node, scenegraph::KeyFrameIndex keyFrameIdx) {
 	if (node.removeKeyFrameByIndex(keyFrameIdx)) {
-		_mementoHandler.markKeyFramesChange(_sceneGraph, node);
-		markDirty();
+		nodeKeyFramesChanged(node);
 		return true;
 	}
 	return false;
 }
 
 void SceneManager::nodeKeyFramesChanged(scenegraph::SceneGraphNode &node) {
-	_sceneGraph.invalidateFrameTransformCache(node.id());
+	_sceneGraph.markKeyFramesDirty(node.id());
 	_mementoHandler.markKeyFramesChange(_sceneGraph, node);
 	markDirty();
 }
@@ -5744,7 +5771,17 @@ void SceneManager::nodeSetPivot(scenegraph::SceneGraphNode &node, const glm::vec
 	if (node.setPivot(pivot)) {
 		const glm::vec3 deltaPivot = pivot - oldPivot;
 		const glm::vec3 size = node.region().getDimensionsInVoxels();
-		node.localTranslate(deltaPivot * size);
+		const glm::vec3 dp = deltaPivot * size;
+		// Compensate the pivot change in each keyframe's local translation to keep the
+		// node visually at the same position. The compensation must account for the
+		// keyframe's own rotation and scale (the upper-left 3x3 of the local matrix).
+		for (auto *keyFrames : node.allKeyFrames()) {
+			for (scenegraph::SceneGraphKeyFrame &keyFrame : keyFrames->value) {
+				scenegraph::SceneGraphTransform &transform = keyFrame.transform();
+				const glm::mat3 rs(transform.localMatrix());
+				transform.setLocalTranslation(transform.localTranslation() + rs * dp);
+			}
+		}
 	}
 }
 
@@ -5758,6 +5795,7 @@ bool SceneManager::nodeResetTransform(scenegraph::SceneGraphNode &node, scenegra
 	scenegraph::SceneGraphTransform &transform = keyFrame.transform();
 	transform.setLocalMatrix(glm::mat4(1.0f));
 	_sceneGraph.updateTransforms();
+	_sceneGraph.markKeyFramesDirty(node.id());
 	markDirty();
 	_mementoHandler.markKeyFramesChange(_sceneGraph, node);
 	return true;
@@ -5890,6 +5928,7 @@ bool SceneManager::nodeSetVisible(int nodeId, bool visible) {
 bool SceneManager::nodeSetLocked(int nodeId, bool locked) {
 	if (scenegraph::SceneGraphNode *node = sceneGraphNode(nodeId)) {
 		node->setLocked(locked);
+		_sceneRenderer->markDirty();
 		return true;
 	}
 	return false;
@@ -5903,9 +5942,13 @@ bool SceneManager::nodeRemove(int nodeId, bool recursive) {
 }
 
 bool SceneManager::exceedsMaxSuggestedVolumeSize() const {
+	const voxel::Region &region = _sceneGraph.maxRegion();
+	return exceedsMaxSuggestedVolumeSize(region);
+}
+
+bool SceneManager::exceedsMaxSuggestedVolumeSize(const voxel::Region &region) const {
 	const int maxDim = _maxSuggestedVolumeSize->intVal();
 	const int64_t maxVoxels = (int64_t)maxDim * (int64_t)maxDim * (int64_t)maxDim;
-	const voxel::Region &region = _sceneGraph.maxRegion();
 	return region.voxels() > maxVoxels;
 }
 

@@ -130,6 +130,7 @@ constexpr const char *VoxformatQBTPaletteMode = "voxformat_qbtpalettemode";
 constexpr const char *VoxformatQBTMergeCompounds = "voxformat_qbtmergecompounds";
 constexpr const char *VoxformatVOXCreateLayers = "voxformat_voxcreatelayers";
 constexpr const char *VoxformatVOXCreateGroups = "voxformat_voxcreategroups";
+constexpr const char *VoxformatVOXAnimAsNodes = "voxformat_voxanimasnodes";
 constexpr const char *VoxformatVXLLoadHVA = "voxformat_vxllodhva";
 constexpr const char *VoxformatQBSaveLeftHanded = "voxformat_qbsavelefthanded";
 constexpr const char *VoxformatQBSaveCompressed = "voxformat_qbsavecompressed";
@@ -152,6 +153,7 @@ constexpr const char *VoxformatGMLRegion = "voxformat_gmlregion";
 constexpr const char *VoxformatGMLFilenameFilter = "voxformat_gmlfilenamefilter";
 constexpr const char *VoxformatOSMURL = "voxformat_osmurl";
 constexpr const char *VoxformatOSMMetersPerVoxel = "voxformat_osmmeterspervoxel";
+constexpr const char *VoxformatLDrawDir = "voxformat_ldrawdir";
 
 constexpr const char *GameModeClipping = "g_clipping";
 constexpr const char *GameModeApplyGravity = "g_applygravity";

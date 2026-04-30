@@ -329,6 +329,7 @@ public:
 	bool isSliceModeActive() const;
 
 	bool exceedsMaxSuggestedVolumeSize() const;
+	bool exceedsMaxSuggestedVolumeSize(const voxel::Region &region) const;
 
 	scenegraph::SceneGraphNodeCamera *activeCameraNode();
 
@@ -501,7 +502,7 @@ public:
 	/**
 	 * @brief Performs the rendering for each @c Viewport instance
 	 */
-	void render(voxelrender::RenderContext &renderContext, const video::Camera &camera, uint8_t renderMask = RenderAll);
+	void render(voxelrender::RenderContext &renderContext, voxelrender::RenderContext &modifierRenderContext, const video::Camera &camera, uint8_t renderMask = RenderAll);
 
 	/**
 	 * @return @c true if the trace was executed, @c false otherwise

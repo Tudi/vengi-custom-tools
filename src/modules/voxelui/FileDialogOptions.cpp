@@ -31,6 +31,7 @@
 #include "voxelformat/private/minecraft/SkinFormat.h"
 #include "voxelformat/private/qubicle/QBFormat.h"
 #include "voxelformat/private/qubicle/QBTFormat.h"
+#include "voxelformat/private/mesh/lego/LDrawFormat.h"
 #include "voxelformat/private/vengi/VENGIFormat.h"
 #include "voxelutil/ImageUtils.h"
 
@@ -217,6 +218,7 @@ bool saveOptions(const io::FormatDescription *desc, const io::FilesystemEntry &e
 	if (*desc == voxelformat::VoxFormat::format()) {
 		ImGui::CheckboxVar(cfg::VoxformatVOXCreateGroups);
 		ImGui::CheckboxVar(cfg::VoxformatVOXCreateLayers);
+		ImGui::CheckboxVar(cfg::VoxformatVOXAnimAsNodes);
 	}
 
 	if (*desc == voxelformat::QBFormat::format()) {
@@ -397,6 +399,14 @@ bool loadOptions(const io::FormatDescription *desc, const io::FilesystemEntry &e
 
 	if (*desc == voxelformat::VXLFormat::format()) {
 		ImGui::CheckboxVar(cfg::VoxformatVXLLoadHVA);
+	}
+
+	if (*desc == voxelformat::VoxFormat::format()) {
+		ImGui::CheckboxVar(cfg::VoxformatVOXAnimAsNodes);
+	}
+
+	if (*desc == voxelformat::LDrawFormat::format()) {
+		ImGui::InputVarString(cfg::VoxformatLDrawDir);
 	}
 
 	ImGui::CheckboxVar(cfg::VoxelCropOnLoad);
