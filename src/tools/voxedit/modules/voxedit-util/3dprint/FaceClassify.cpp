@@ -9,8 +9,11 @@
 #include "color/RGBA.h"
 #include "core/GLM.h"
 #include "core/Log.h"
+#include "core/String.h"
 #include "core/TimeProvider.h"
 #include "core/collection/DynamicArray.h"
+#include "core/collection/DynamicSet.h"
+#include "memento/MementoHandler.h"
 #include "palette/Palette.h"
 #include "scenegraph/SceneGraph.h"
 #include "scenegraph/SceneGraphNode.h"
@@ -22,6 +25,7 @@
 #include "voxel/Region.h"
 #include "voxel/Voxel.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <cstring>
@@ -70,7 +74,7 @@ static std::atomic<bool> g_rssCapTripped{false};
 // The verbose calls stay in source so flipping this constant + rebuilding
 // restores the full debug stream when something needs investigating again.
 // Declared here (before logRSS) so all gating sites see the constant.
-static constexpr bool k3DPrintVerbose = false;
+static constexpr bool k3DPrintVerbose = true;
 
 static bool checkRSSCap(const char *where) {
 	const double rss = rssGB();
@@ -88,11 +92,6 @@ static void logRSS(const char *label) {
 	}
 	Log::info("3dprint holefill: [RSS=%.1f GB] %s", rssGB(), label);
 }
-
-static constexpr uint8_t kTagOuter  = 0;
-static constexpr uint8_t kTagInner  = 1;
-static constexpr uint8_t kTagThin   = 2;
-static constexpr uint8_t kTagBuried = 3;
 
 // State values stored in the flat visited array
 static constexpr uint8_t kStateEmpty    = 0; // unvisited empty (unknown)
@@ -126,11 +125,6 @@ static constexpr int kHolefillChunkMaxVox  = 256;
 //     pre-chunked-pass cs=2-only behaviour.
 static constexpr bool kRunChunkedCs1Pass = true;
 
-struct ClassifyResult {
-	glm::ivec3 localPos;
-	uint8_t tag;
-};
-
 struct NodeInfo {
 	uint64_t nodeId;
 	voxel::RawVolume *rv;
@@ -144,6 +138,14 @@ struct NodeInfo {
 };
 
 using CellHash = std::unordered_map<glm::ivec3, uint64_t, glm::hash<glm::ivec3>>;
+// Multimap for cs=N cells whose voxels are owned by more than one node. The
+// primary owner stays in CellHash::solid (one-to-one fast-path); secondary
+// owners go in extraSolid. Most cells (regridded models with cs=128-aligned
+// nodes) have no entries here -- cs=2 cells fit cleanly inside a single
+// regridded box. Non-aligned nodes (orphan plug nodes from fillholes,
+// manually-placed nodes, edge boxes that aren't cs=128 wide) can produce
+// shared cs=2 cells, in which case extraSolid carries the additional owners.
+using ExtraCellHash = std::unordered_multimap<glm::ivec3, uint64_t, glm::hash<glm::ivec3>>;
 using CellSet  = std::unordered_set<glm::ivec3, glm::hash<glm::ivec3>>;
 
 // Flat open-addressing hash set for glm::ivec3 voxel positions. Replaces
@@ -294,7 +296,12 @@ struct Level {
 	int cellSize = 0;
 	int dimX = 0, dimY = 0, dimZ = 0;
 
-	CellHash solid;             // sparse solid map: snapped cell → node index
+	CellHash solid;             // sparse solid map: snapped cell -> primary node index
+	// Secondary owners for shared cells (built when buildSolidHash sees a
+	// collision). chunkInitFromParent and the chunk actions iterate primary +
+	// extras so voxels in non-primary nodes still get classified instead of
+	// silently disappearing into "saw=false" land.
+	ExtraCellHash extraSolid;
 	std::vector<uint8_t> state; // flat: kStateEmpty/Exterior/Interior per cell
 
 	void initGrid(const glm::ivec3 &lo, const glm::ivec3 &hi) {
@@ -356,6 +363,24 @@ static glm::ivec3 toCellOrigin(const glm::ivec3 &worldPos, int cellSize) {
 					  floorDiv(worldPos.z, cellSize) * cellSize);
 }
 
+// Visit every node that has voxels in the cs=N cell at cs2Cell. Calls f once
+// for the primary owner from lvl.solid, then once per extra owner from
+// lvl.extraSolid. Most cells (regridded models with cs=128-aligned nodes)
+// have only the primary -- the extraSolid lookup is a multimap equal_range
+// which is essentially free for empty ranges. f receives the node index.
+template<class Func>
+static inline void forEachCellOwner(const Level &lvl, const glm::ivec3 &cs2Cell, Func &&f) {
+	auto it = lvl.solid.find(cs2Cell);
+	if (it == lvl.solid.end()) {
+		return;
+	}
+	f(it->second);
+	auto range = lvl.extraSolid.equal_range(cs2Cell);
+	for (auto eit = range.first; eit != range.second; ++eit) {
+		f(eit->second);
+	}
+}
+
 // Build solid hash (parallel per-node, then sequential merge).
 // Each node collects at most (nodeSize/fineSize)^3 unique cells (512 at level 16).
 static void buildSolidHash(Level &lvl, const core::DynamicArray<NodeInfo> &nodes,
@@ -402,10 +427,27 @@ static void buildSolidHash(Level &lvl, const core::DynamicArray<NodeInfo> &nodes
 		totalCells += perNodeCells[i].size();
 	}
 	lvl.solid.reserve(totalCells);
+	lvl.extraSolid.clear();
+	uint64_t collisionCount = 0;
 	for (int i = 0; i < numNodes; ++i) {
 		for (const glm::ivec3 &cell : perNodeCells[i]) {
-			lvl.solid.emplace(cell, i);
+			auto inserted = lvl.solid.emplace(cell, (uint64_t)i);
+			if (!inserted.second) {
+				// Cell already has a primary owner (lower-index node). Track
+				// this node as a secondary owner so chunkInitFromParent and
+				// the chunk actions can iterate every node that has voxels in
+				// the cell. Without this, voxels in higher-index nodes that
+				// share cs=N cells with lower-index nodes silently drop out
+				// of chunked classification (saw bit never set; faceclassify
+				// renders them gray; fillholes can't see them either).
+				lvl.extraSolid.emplace(cell, (uint64_t)i);
+				++collisionCount;
+			}
 		}
+	}
+	if (collisionCount > 0 && k3DPrintVerbose) {
+		Log::info("3dprint solidHash: %lu cs=%d cell collision(s) -- %lu shared cell(s) tracked in extraSolid",
+				  (unsigned long)collisionCount, lvl.cellSize, (unsigned long)lvl.extraSolid.size());
 	}
 }
 
@@ -457,7 +499,7 @@ static uint64_t parallelBFS(Level &lvl, core::DynamicArray<int32_t> &frontier, u
 }
 
 // Exterior flood fill (6-connectivity from all 6 grid faces) using parallel BFS.
-// Detects holes: if any exterior cell's coarse parent was interior → returns hole cell size.
+// Detects holes: if any exterior cell's coarse parent was interior -> returns hole cell size.
 static uint64_t buildExterior(Level &lvl, const Level &prevLevel) {
 	core::DynamicArray<int32_t> frontier;
 	frontier.reserve((size_t)lvl.dimX * (size_t)lvl.dimY * 4); // rough seed count estimate
@@ -749,6 +791,21 @@ static void buildFrontiers(const Level &lvl,
 		for (size_t idx : perExt[(size_t)s]) extFrontier.push_back(idx);
 		for (size_t idx : perInt[(size_t)s]) intFrontier.push_back(idx);
 	}
+	// Sort for determinism. The parallel slot fill above pushes indices in
+	// whatever order app::for_parallel hands work to threads, so the slot
+	// contents -- and therefore the concatenated frontier order -- vary
+	// run-to-run. seedChunks consumes extFrontier in order: its first chunk
+	// covers a neighborhood, later cells in that neighborhood get skipped
+	// via the covered-set. Different frontier order -> different chunk
+	// centers -> different cs=1 BFS coverage inside chunks -> different leak
+	// voxels detected -> different fillholes plug counts (~1-2% variance
+	// observed on the gothic model). Sorting here makes seedChunks
+	// deterministic at O(N log N) for surface-area-sized N (negligible
+	// compared to the BFS itself).
+	// core::DynamicArray's iterator doesn't define iterator_traits, so std::sort
+	// won't accept it; sort over the raw pointer range instead.
+	std::sort(extFrontier.data(), extFrontier.data() + extFrontier.size());
+	std::sort(intFrontier.data(), intFrontier.data() + intFrontier.size());
 }
 
 
@@ -1040,26 +1097,41 @@ static void chunkInitFromParent(Level &chunk, const Level &parent,
 						}
 					}
 				} else if (parentState == kStateSolid) {
-					// Look up the owning node once per cs=2 cell. The hash
-					// lookup amortises across the (cs2)^3 cs=1 voxels we'd
-					// otherwise hit through isSolidAt's full lookup chain.
-					auto it = parent.solid.find(cs2Cell);
-					if (it == parent.solid.end()) continue;
-					const NodeInfo &ni = nodes[it->second];
-					const voxel::Region &nodeRegion = ni.rv->region();
-					for (int wx = x0; wx <= x1; ++wx) {
-						const size_t planeBase = (size_t)(wx - chunkLower.x) * planeStride;
-						for (int wy = y0; wy <= y1; ++wy) {
-							const size_t rowBase = planeBase + (size_t)(wy - chunkLower.y) * rowStride;
-							for (int wz = z0; wz <= z1; ++wz) {
-								const glm::ivec3 worldPos(wx, wy, wz);
-								const glm::ivec3 local = transformPoint(ni.invWorldMat, worldPos);
-								if (!nodeRegion.containsPoint(local)) continue;
-								if (voxel::isAir(ni.rv->voxel(local).getMaterial())) continue;
-								chunk.state[rowBase + (size_t)(wz - chunkLower.z)] = kStateSolid;
+					// Mark cs=1 cells kStateSolid if ANY node owning this cs=2
+					// cell has a voxel at the position. parent.solid points to
+					// the primary owner; extraSolid carries any additional
+					// owners that share the cell. Without iterating both, voxels
+					// in non-primary nodes silently appear as kStateEmpty in
+					// chunk.state -- the cs=1 BFS treats them as probe zone,
+					// the chunk action skips them as "not solid", saw bit
+					// stays unset, faceclassify renders them gray, fillholes
+					// can't see them as walls.
+					forEachCellOwner(parent, cs2Cell, [&](uint64_t nodeIdx) {
+						const NodeInfo &ni = nodes[(size_t)nodeIdx];
+						const voxel::Region &nodeRegion = ni.rv->region();
+						for (int wx = x0; wx <= x1; ++wx) {
+							const size_t planeBase = (size_t)(wx - chunkLower.x) * planeStride;
+							for (int wy = y0; wy <= y1; ++wy) {
+								const size_t rowBase = planeBase + (size_t)(wy - chunkLower.y) * rowStride;
+								for (int wz = z0; wz <= z1; ++wz) {
+									const size_t stateIdx = rowBase + (size_t)(wz - chunkLower.z);
+									if (chunk.state[stateIdx] == kStateSolid) {
+										// Already marked solid by an earlier-iterated owner.
+										continue;
+									}
+									const glm::ivec3 worldPos(wx, wy, wz);
+									const glm::ivec3 local = transformPoint(ni.invWorldMat, worldPos);
+									if (!nodeRegion.containsPoint(local)) {
+										continue;
+									}
+									if (voxel::isAir(ni.rv->voxel(local).getMaterial())) {
+										continue;
+									}
+									chunk.state[stateIdx] = kStateSolid;
+								}
 							}
 						}
-					}
+					});
 				}
 				// else (kStateEmpty, kStateBlocked): nothing to do.
 				// kStateBlocked is a hole the cs=2 BFS sealed; cs=1 sees it
@@ -1088,20 +1160,47 @@ static void chunkInitFromParent(Level &chunk, const Level &parent,
 // so per-chunk box queries scan at most 8-27 buckets (worst case for an
 // expanded chunk) instead of all front cells. Without this the seeder is
 // O(extFront * intFront) which is 10^12+ for large models.
+// Anchors chunks on BOTH ext-front AND int-front cs=2 cells. For each shell,
+// every uncovered front cell becomes a chunk centered on it (shared dedup
+// via the covered set so chunks don't pile up where the two shells meet).
+//
+// Why both shells: the chunked cs=1 BFS only sees what's inside chunks. With
+// ext-only anchoring, walls between two interior cavities -- inner walls of
+// gothic buildings, sealed-room dividers, anything more than ~80 voxels from
+// the model's exterior -- never get a chunk. fillholes reports those walls
+// as watertight even when they have visible 1-voxel holes; faceclassify
+// leaves their voxels grey because the saw bit was never set; erode misses
+// them entirely. Anchoring on both shells covers every wall that touches
+// either ext or int air.
+//
+// requireOppositeFront semantics:
+//   true  (fillholes): a chunk anchored on an ext cell needs an int cell in
+//         its (default or expanded) bbox; an int-anchored chunk needs an
+//         ext cell. Walls with no opposite-shell cell in range produce no
+//         chunk -- nothing for the cs=1 BFS to find a contact with there.
+//   false (erode / faceclassify): every uncovered front cell becomes a
+//         chunk at the default size. They need to visit every wall the
+//         model has, regardless of whether ext meets int there.
 static core::DynamicArray<ChunkBox> seedChunks(
 		const Level &parent,
 		const core::DynamicArray<size_t> &extFront,
-		const core::DynamicArray<size_t> &intFront) {
+		const core::DynamicArray<size_t> &intFront,
+		bool requireOppositeFront = true) {
 	core::DynamicArray<ChunkBox> chunks;
-	if (extFront.empty() || intFront.empty()) {
+	if (extFront.empty() && intFront.empty()) {
 		return chunks;
 	}
-	// Empirical (gothic test model): ~1 chunk per ~2400 ext-front cells. Use a
-	// looser ratio (1 per 256) so growth never reallocates -- a couple MB of
-	// over-reservation is far cheaper than mid-loop reallocs across thousands
-	// of chunks.
-	static constexpr size_t kExtFrontPerChunkEstimate = 256;
-	chunks.reserve(extFront.size() / kExtFrontPerChunkEstimate + 32);
+	// With requireOppositeFront=true an empty shell on either side means no
+	// chunk could ever satisfy the filter -- short-circuit to avoid the
+	// per-cell "skippedNoOpposite" accounting on a guaranteed-empty result.
+	if (requireOppositeFront && (extFront.empty() || intFront.empty())) {
+		return chunks;
+	}
+	// Empirical (gothic test model): ~1 chunk per ~2400 front cells per shell.
+	// Reserve to a looser ratio so growth never reallocates across thousands
+	// of chunks. Sized for the combined (ext+int) anchoring.
+	static constexpr size_t kFrontPerChunkEstimate = 256;
+	chunks.reserve((extFront.size() + intFront.size()) / kFrontPerChunkEstimate + 64);
 
 	const int spatialCs = kHolefillChunkVoxels;
 	auto spatialKey = [&](const glm::ivec3 &p) {
@@ -1114,7 +1213,7 @@ static core::DynamicArray<ChunkBox> seedChunks(
 	// Empirical: each spatial bucket (one chunk's worth of world space) holds
 	// roughly chunkVoxels^2 ext/int-front cells in surface-area-bounded models.
 	// Reserve buckets = totalFrontCells / kSpatialBucketAvgEntries to avoid
-	// rehashing during construction. Conservative; over-reserve costs little.
+	// rehashing during construction.
 	static constexpr int kSpatialBucketAvgEntries = 16;
 	FrontGrid extGrid, intGrid;
 	extGrid.reserve(extFront.size() / kSpatialBucketAvgEntries + 1);
@@ -1151,17 +1250,20 @@ static core::DynamicArray<ChunkBox> seedChunks(
 		return false;
 	};
 
+	// Single covered set keyed by cs=2 cell origin -- shared across both shells
+	// so a chunk created by the ext-anchored pass dedupes future int-anchored
+	// candidates whose cells fall inside that chunk's bbox (and vice versa).
 	std::unordered_set<glm::ivec3, glm::hash<glm::ivec3>> covered;
-	covered.reserve(extFront.size());
+	covered.reserve(extFront.size() + intFront.size());
 
-	auto markCovered = [&](const ChunkBox &box) {
+	auto markCoveredFromGrid = [&](const FrontGrid &grid, const ChunkBox &box) {
 		const glm::ivec3 lowKey = spatialKey(box.lower);
 		const glm::ivec3 highKey = spatialKey(box.upper);
 		for (int kz = lowKey.z; kz <= highKey.z; ++kz) {
 			for (int ky = lowKey.y; ky <= highKey.y; ++ky) {
 				for (int kx = lowKey.x; kx <= highKey.x; ++kx) {
-					auto it = extGrid.find(glm::ivec3(kx, ky, kz));
-					if (it == extGrid.end()) {
+					auto it = grid.find(glm::ivec3(kx, ky, kz));
+					if (it == grid.end()) {
 						continue;
 					}
 					for (const glm::ivec3 &cellPos : it->second) {
@@ -1175,52 +1277,158 @@ static core::DynamicArray<ChunkBox> seedChunks(
 			}
 		}
 	};
+	auto markCovered = [&](const ChunkBox &box) {
+		markCoveredFromGrid(extGrid, box);
+		markCoveredFromGrid(intGrid, box);
+	};
 
 	const int defaultHalf  = kHolefillChunkVoxels  / 2 + kHolefillChunkOverlap;
 	const int expandedHalf = kHolefillChunkMaxVox  / 2 + kHolefillChunkOverlap;
+	// The COVERED set marks front cells that should NOT anchor a new chunk
+	// (deduplication). It must use a SMALLER box than the chunk's full bbox:
+	// the chunk's bbox (seed +/- defaultHalf) includes a kHolefillChunkOverlap
+	// buffer on each side. If we mark front cells at the bbox edge as covered,
+	// they can't anchor their own chunks even though wall voxels just past the
+	// edge fall outside the chunk's coverage. The result is gray slices in
+	// faceclassify wherever a wall sits one cell past chunk A's far bbox edge.
+	// Marking covered only inside the CORE (seed +/- chunkVoxels/2) lets cells
+	// in the overlap zone anchor their own chunks; their bboxes overlap chunk
+	// A's overlap heavily but extend coverage past A's far edge -- the wall is
+	// in chunk B's bbox.
+	const int defaultCoverHalf  = kHolefillChunkVoxels / 2;
+	const int expandedCoverHalf = kHolefillChunkMaxVox / 2;
 
 	uint64_t skippedCovered = 0;
-	uint64_t skippedNoInt = 0;
+	uint64_t skippedNoOpposite = 0;
 	uint64_t skippedExpanded = 0;
 
-	for (size_t i = 0; i < extFront.size(); ++i) {
-		const glm::ivec3 ext = parent.toCell(extFront[i]);
-		if (covered.find(ext) != covered.end()) { ++skippedCovered; continue; }
-
-		ChunkBox box;
-		box.lower = ext - glm::ivec3(defaultHalf);
-		box.upper = ext + glm::ivec3(defaultHalf);
-
-		if (!bboxContains(intGrid, box)) {
-			box.lower = ext - glm::ivec3(expandedHalf);
-			box.upper = ext + glm::ivec3(expandedHalf);
-			if (!bboxContains(intGrid, box)) {
-				++skippedNoInt;
+	// One pass per shell. The body is identical apart from which front list
+	// drives the seeds and which grid is the "opposite" (used by the
+	// requireOppositeFront filter).
+	auto processShell = [&](const core::DynamicArray<size_t> &shellFront,
+							 const FrontGrid &oppositeGrid) {
+		for (size_t i = 0; i < shellFront.size(); ++i) {
+			const glm::ivec3 seed = parent.toCell(shellFront[i]);
+			if (covered.find(seed) != covered.end()) {
+				++skippedCovered;
 				continue;
 			}
-			++skippedExpanded;
-		}
 
-		chunks.push_back(box);
-		markCovered(box);
-	}
+			ChunkBox box;
+			box.lower = seed - glm::ivec3(defaultHalf);
+			box.upper = seed + glm::ivec3(defaultHalf);
+			int coverHalf = defaultCoverHalf;
+
+			if (requireOppositeFront) {
+				if (!bboxContains(oppositeGrid, box)) {
+					box.lower = seed - glm::ivec3(expandedHalf);
+					box.upper = seed + glm::ivec3(expandedHalf);
+					coverHalf = expandedCoverHalf;
+					if (!bboxContains(oppositeGrid, box)) {
+						++skippedNoOpposite;
+						continue;
+					}
+					++skippedExpanded;
+				}
+			}
+
+			chunks.push_back(box);
+			ChunkBox coverBox;
+			coverBox.lower = seed - glm::ivec3(coverHalf);
+			coverBox.upper = seed + glm::ivec3(coverHalf);
+			markCovered(coverBox);
+		}
+	};
+
+	processShell(extFront, intGrid);
+	processShell(intFront, extGrid);
 
 	if (k3DPrintVerbose) {
-		Log::info("3dprint holefill: chunked cs=1 seedChunks: %zu chunks (covered-skip=%llu, noint-skip=%llu, expanded=%llu)",
+		Log::info("3dprint holefill: chunked cs=1 seedChunks: %zu chunks (covered-skip=%llu, no-opposite-skip=%llu, expanded=%llu)",
 				  chunks.size(),
 				  (unsigned long long)skippedCovered,
-				  (unsigned long long)skippedNoInt,
+				  (unsigned long long)skippedNoOpposite,
 				  (unsigned long long)skippedExpanded);
 	}
 	// Always-on warning: walls thicker than the expanded chunk size (kHolefillChunkMaxVox)
 	// can hide leaks that the chunked pass won't reach. The user should know.
-	if (skippedNoInt > 0) {
-		Log::warn("3dprint fillholes: %llu wall region(s) skipped -- no int-front cell within %d voxels of the ext-front. "
+	// Suppressed when requireOppositeFront=false (erode/faceclassify): there,
+	// "no opposite shell in range" isn't a skip.
+	if (requireOppositeFront && skippedNoOpposite > 0) {
+		Log::warn("3dprint fillholes: %llu wall region(s) skipped -- no opposite-shell cell within %d voxels of the seed. "
 				  "Walls thicker than this aren't checked for sub-cs=1 leaks. To reach them, raise "
 				  "kHolefillChunkMaxVox in FaceClassify.cpp (memory cost grows ~cubically).",
-				  (unsigned long long)skippedNoInt, kHolefillChunkMaxVox);
+				  (unsigned long long)skippedNoOpposite, kHolefillChunkMaxVox);
 	}
 	return chunks;
+}
+
+// Generic chunked cs=1 driver. Walks the chunk list in parallel; for each
+// chunk runs chunkInitFromParent + chunkRunBidirectionalBFS, then hands the
+// populated chunk Level and the BFS hole-cell list to perChunkAction, which
+// runs in the parallel context.
+//
+// The action MUST be thread-safe with respect to any state it shares across
+// chunks. It MUST also act inside the chunk: do not accumulate per-voxel
+// positions into a global container that grows with the model -- that
+// re-introduces the multi-GB working-set problem that the chunked
+// architecture exists to avoid. Allowed shared state is per-node (bounded
+// by node count, e.g. atomic dirty-region trackers, per-node mark bits)
+// and small per-chunk slots indexed by ci.
+//
+// callerTag and startMs feed the heartbeat log line so that fillholes,
+// holemap, erode and faceclassify each show their own progress identity.
+template<typename PerChunkAction>
+static void runChunkedCs1Driver(
+		const core::DynamicArray<ChunkBox> &chunks,
+		const Level &parent,
+		core::DynamicArray<NodeInfo> &nodes,
+		const char *callerTag,
+		uint64_t startMs,
+		PerChunkAction perChunkAction) {
+	const int totalChunks = (int)chunks.size();
+	std::atomic<int64_t> chunksProcessed{0};
+	std::atomic<uint64_t> lastLogMs{startMs};
+
+	app::for_parallel(0, totalChunks, [&](int start, int end) {
+		// Per-thread chunk Level. The state vector capacity is reused across
+		// iterations within this thread: same-sized chunks (the default
+		// 160^3 case) skip allocation, .assign() resets values in place.
+		// Different-sized chunks (the 288^3 expanded case) realloc, but
+		// those are <1% of chunks.
+		Level chunk;
+		chunk.cellSize = 1;
+		for (int ci = start; ci < end; ++ci) {
+			if (g_rssCapTripped.load(std::memory_order_relaxed)) {
+				return;
+			}
+
+			const ChunkBox &box = chunks[(size_t)ci];
+			chunk.gridLower = box.lower;
+			chunk.dimX = box.upper.x - box.lower.x + 1;
+			chunk.dimY = box.upper.y - box.lower.y + 1;
+			chunk.dimZ = box.upper.z - box.lower.z + 1;
+
+			chunkInitFromParent(chunk, parent, nodes);
+			core::DynamicArray<glm::ivec3> holeCells = chunkRunBidirectionalBFS(chunk);
+
+			perChunkAction(chunk, holeCells, ci);
+
+			const int64_t done = chunksProcessed.fetch_add(1, std::memory_order_relaxed) + 1;
+			const uint64_t now = core::TimeProvider::systemMillis();
+			uint64_t prevMs = lastLogMs.load(std::memory_order_relaxed);
+			if (now - prevMs >= 3000u && lastLogMs.compare_exchange_strong(prevMs, now)) {
+				if (k3DPrintVerbose) {
+					fprintf(stderr, "[CHUNK %s] %lld/%d chunks (%.1f%%) elapsed=%.1fs [RSS=%.1f GB]\n",
+							callerTag, (long long)done, totalChunks,
+							100.0 * (double)done / (double)totalChunks,
+							(double)(now - startMs) / 1000.0, rssGB());
+					fflush(stderr);
+				}
+				checkRSSCap("chunked cs=1 heartbeat");
+			}
+		}
+	});
 }
 
 // Detection-only kernel: builds the chunk list, runs each chunk's BFS in
@@ -1254,53 +1462,18 @@ static core::DynamicArray<glm::ivec3> detectChunkedCs1HoleVoxels(
 
 	core::DynamicArray<core::DynamicArray<glm::ivec3>> perChunkHoles;
 	perChunkHoles.resize(chunks.size());
-
-	std::atomic<int64_t> chunksProcessed{0};
 	std::atomic<int64_t> totalHoleVoxels{0};
-	std::atomic<uint64_t> lastLogMs{startMs};
 
-	const int totalChunks = (int)chunks.size();
-	app::for_parallel(0, totalChunks, [&](int start, int end) {
-		// Hoisted out of the per-chunk loop so chunk.state's vector capacity
-		// is reused across iterations within this thread. Same-sized chunks
-		// (the default 160^3 case) skip allocation; .assign() resets values
-		// in place. Different-sized chunks (the 288^3 expanded case) will
-		// realloc, but those are <1% of chunks.
-		Level chunk;
-		chunk.cellSize = 1;
-		for (int ci = start; ci < end; ++ci) {
-			if (g_rssCapTripped.load(std::memory_order_relaxed)) {
-				return;
-			}
-
-			const ChunkBox &box = chunks[(size_t)ci];
-			chunk.gridLower = box.lower;
-			chunk.dimX = box.upper.x - box.lower.x + 1;
-			chunk.dimY = box.upper.y - box.lower.y + 1;
-			chunk.dimZ = box.upper.z - box.lower.z + 1;
-
-			chunkInitFromParent(chunk, parent, nodes);
-			perChunkHoles[(size_t)ci] = chunkRunBidirectionalBFS(chunk);
+	// Per-chunk hole cell list moves into a slot indexed by ci. Per-chunk
+	// containers are small (a few voxels each on a sealed model); the dedup
+	// step below merges them. No global growing buffer.
+	runChunkedCs1Driver(chunks, parent, nodes, callerTag, startMs,
+		[&](Level &chunk, core::DynamicArray<glm::ivec3> &chunkHoles, int ci) {
+			(void)chunk;
+			perChunkHoles[(size_t)ci] = core::move(chunkHoles);
 			totalHoleVoxels.fetch_add((int64_t)perChunkHoles[(size_t)ci].size(),
 									   std::memory_order_relaxed);
-
-			const int64_t done = chunksProcessed.fetch_add(1, std::memory_order_relaxed) + 1;
-			const uint64_t now = core::TimeProvider::systemMillis();
-			uint64_t prevMs = lastLogMs.load(std::memory_order_relaxed);
-			if (now - prevMs >= 3000u && lastLogMs.compare_exchange_strong(prevMs, now)) {
-				if (k3DPrintVerbose) {
-					fprintf(stderr, "[CHUNK] %lld/%d chunks (%.1f%%) holes=%lld elapsed=%.1fs [RSS=%.1f GB]\n",
-							(long long)done, totalChunks,
-							100.0 * (double)done / (double)totalChunks,
-							(long long)totalHoleVoxels.load(std::memory_order_relaxed),
-							(double)(now - startMs) / 1000.0,
-							rssGB());
-					fflush(stderr);
-				}
-				checkRSSCap("chunked cs=1 heartbeat");
-			}
-		}
-	});
+		});
 
 	// Aggregate hole voxels with dedup (overlapping chunks may detect the
 	// same hole). std::unordered_set is fine here -- this runs sequentially
@@ -1346,15 +1519,63 @@ static FillStats runChunkedCs1Pass(const Level &parent,
 	return stats;
 }
 
-void runFaceClassify(SceneManager *sceneMgr, int minCellSize) {
-	scenegraph::SceneGraph &graph = sceneMgr->sceneGraph();
+// Shared dense-state cap (16 GB). cs=2 on the gothic model is ~7.6 GB; cs=1
+// dense would be ~60 GB, well over this cap and why the chunked cs=1 pass
+// exists. Edit + rebuild to sweep on machines with different RAM budgets.
+static constexpr size_t kDensePassMaxStateCells = 16ull * 1024ull * 1024ull * 1024ull;
 
-	core::DynamicArray<NodeInfo> nodes;
+// Result of buildCoarseShell. ok=false means an error was already logged and
+// the caller should return. ok=true means nodes/coarse were populated; the
+// caller decides what to do when intCount==0 (fillholes / holemap / erode /
+// faceclassify each phrase the warning differently).
+struct CoarseShellResult {
+	bool ok;
+	uint64_t intCount;
+	int coarseCellSize;
+	glm::ivec3 gridLower;
+	glm::ivec3 gridUpper;
+};
+
+// Builds the coarse classification shared by all four chunked-cs=1 commands.
+// Steps mirrored from the original copies in fillholes / holemap / faceclassify:
+//   1. Walk the scene graph, collect NodeInfo (id, volume ptr, world+inverse
+//      matrices) for every model node with a non-null volume.
+//   2. Infer coarse cell size from the modal node width (regrid is expected
+//      to have produced uniform-width nodes).
+//   3. Snap each node's world-space lower corner to the coarse grid, mark its
+//      cell in coarse.solid IF the node has at least one solid voxel. Empty
+//      nodes are skipped: they have no voxels to classify and treating them
+//      as solid blocks at coarse scale would mis-classify their cells as
+//      occupied.
+//   4. Pad the grid by one cell on each side (boundary seeding mustn't touch
+//      genuine interior air) and allocate the dense state vector.
+//   5. Run buildExterior then buildInteriorAllSeeds. intCount is returned to
+//      the caller for context-specific warnings.
+//
+// The caller still owns the post-condition handling (snap minCellSize, build
+// refinement chain, handle intCount==0 with its own message). nodes and coarse
+// are output parameters because Level holds a std::vector that we want to fill
+// in place rather than copy out of the helper.
+static CoarseShellResult buildCoarseShell(
+		SceneManager *sceneMgr,
+		const char *callerTag,
+		core::DynamicArray<NodeInfo> &nodes,
+		Level &coarse) {
+	CoarseShellResult res;
+	res.ok = false;
+	res.intCount = 0;
+	res.coarseCellSize = 0;
+	res.gridLower = glm::ivec3(0);
+	res.gridUpper = glm::ivec3(0);
+
+	scenegraph::SceneGraph &graph = sceneMgr->sceneGraph();
 	nodes.reserve((size_t)graph.size());
 	for (auto iter = graph.beginModel(); iter != graph.end(); ++iter) {
 		scenegraph::SceneGraphNode &node = *iter;
 		voxel::RawVolume *rv = node.volume();
-		if (rv == nullptr) continue;
+		if (rv == nullptr) {
+			continue;
+		}
 		NodeInfo info;
 		info.nodeId = node.id();
 		info.rv = rv;
@@ -1364,18 +1585,11 @@ void runFaceClassify(SceneManager *sceneMgr, int minCellSize) {
 		nodes.push_back(info);
 	}
 	if (nodes.empty()) {
-		Log::warn("3dprint faceclassify: no model nodes -- nothing to do.");
-		return;
+		Log::warn("3dprint %s: no model nodes -- nothing to do.", callerTag);
+		return res;
 	}
-
 	const int totalNodes = (int)nodes.size();
-	int64_t legendOuter = 0, legendInner = 0, legendThin = 0, legendBuried = 0;
-	{
-	ProgressTimer timer("faceclassify", totalNodes, k3DPrintVerbose);
 
-	// -----------------------------------------------------------------------
-	// Step 1: Infer coarse cell size, world bbox, coarse solid hash + grid.
-	// -----------------------------------------------------------------------
 	int coarseCellSize = 0;
 	{
 		std::unordered_map<int, int> widthCount;
@@ -1384,383 +1598,38 @@ void runFaceClassify(SceneManager *sceneMgr, int minCellSize) {
 		}
 		int bestCount = 0;
 		for (const auto &kv : widthCount) {
-			if (kv.second > bestCount) { bestCount = kv.second; coarseCellSize = kv.first; }
+			if (kv.second > bestCount) {
+				bestCount = kv.second;
+				coarseCellSize = kv.first;
+			}
 		}
 	}
 	if (coarseCellSize <= 0) {
-		Log::error("3dprint faceclassify: could not determine cell size -- run 3dprint regrid first");
-		return;
+		Log::error("3dprint %s: could not determine cell size -- run '3dprint regrid' first.", callerTag);
+		return res;
 	}
 
-	// Default minCellSize=2 so faceclassify visualizes at the same depth fillholes
-	// uses for plug detection. Voxels touching fine ext/int regions get correctly
-	// classified as outer/inner/thin instead of being lumped into "buried".
-	if (minCellSize <= 0 || minCellSize >= coarseCellSize) {
-		minCellSize = 2;
-	}
-	if (minCellSize > 0 && minCellSize < coarseCellSize) {
-		// Snap to a power-of-two divisor of coarseCellSize so the halving chain
-		// reaches it cleanly.
-		int s = coarseCellSize;
-		bool valid = false;
-		while (s > 0) {
-			if (s == minCellSize) {
-				valid = true;
-				break;
-			}
-			s /= 2;
-		}
-		if (!valid) {
-			s = coarseCellSize;
-			while (s / 2 >= minCellSize) {
-				s /= 2;
-			}
-			minCellSize = s;
-			Log::info("3dprint faceclassify: snapped minCellSize to %d", minCellSize);
-		}
-	}
-
-	voxel::Region worldBbox = voxel::Region::InvalidRegion;
-	Level coarse;
 	coarse.cellSize = coarseCellSize;
 	coarse.solid.reserve((size_t)totalNodes);
+	glm::ivec3 gridLower(INT_MAX, INT_MAX, INT_MAX);
+	glm::ivec3 gridUpper(INT_MIN, INT_MIN, INT_MIN);
 
 	for (int i = 0; i < totalNodes; ++i) {
 		NodeInfo &ni = nodes[i];
 		const voxel::Region &r = ni.rv->region();
-		const glm::ivec3 corners[8] = {
-			{r.getLowerX(), r.getLowerY(), r.getLowerZ()}, {r.getUpperX(), r.getLowerY(), r.getLowerZ()},
-			{r.getLowerX(), r.getUpperY(), r.getLowerZ()}, {r.getUpperX(), r.getUpperY(), r.getLowerZ()},
-			{r.getLowerX(), r.getLowerY(), r.getUpperZ()}, {r.getUpperX(), r.getLowerY(), r.getUpperZ()},
-			{r.getLowerX(), r.getUpperY(), r.getUpperZ()}, {r.getUpperX(), r.getUpperY(), r.getUpperZ()},
-		};
-		for (const glm::ivec3 &c : corners) {
-			const glm::ivec3 wc = transformPoint(ni.worldMat, c);
-			if (worldBbox.isValid()) worldBbox.accumulate(wc); else worldBbox = voxel::Region(wc, wc);
-		}
 		ni.cellOrigin = toCellOrigin(transformPoint(ni.worldMat, r.getLowerCorner()), coarseCellSize);
-		coarse.solid.emplace(ni.cellOrigin, i);
-	}
-	{
-		const uint64_t col = (uint64_t)nodes.size() - (uint64_t)coarse.solid.size();
-		if (col > 0) Log::warn("3dprint faceclassify: %lu node(s) share a snapped cell origin", (unsigned long)col);
-	}
-
-	glm::ivec3 gridLower(INT_MAX, INT_MAX, INT_MAX);
-	glm::ivec3 gridUpper(INT_MIN, INT_MIN, INT_MIN);
-	for (const NodeInfo &ni : nodes) {
 		gridLower = glm::min(gridLower, ni.cellOrigin);
 		gridUpper = glm::max(gridUpper, ni.cellOrigin);
-	}
-	// Pad by one cell on each side so boundary seeding never touches interior air cells
-	gridLower -= glm::ivec3(coarseCellSize);
-	gridUpper += glm::ivec3(coarseCellSize);
-	coarse.initGrid(gridLower, gridUpper);
-	// Mark solid cells in the state array
-	for (const auto &kv : coarse.solid) {
-		if (coarse.inBounds(kv.first)) {
-			coarse.state[(size_t)coarse.toIdx(kv.first)] = 255; // occupied slot (not exterior/interior)
-		}
-	}
-
-	if (k3DPrintVerbose) {
-		Log::info("3dprint faceclassify: cell size %d, bbox %d x %d x %d, grid %d x %d x %d = %d cells, solid=%lu",
-				  coarseCellSize, worldBbox.getWidthInVoxels(), worldBbox.getHeightInVoxels(), worldBbox.getDepthInVoxels(),
-				  coarse.dimX, coarse.dimY, coarse.dimZ, coarse.dimX * coarse.dimY * coarse.dimZ,
-				  (unsigned long)coarse.solid.size());
-	}
-
-	// -----------------------------------------------------------------------
-	// Step 2: Coarse exterior + interior.
-	// -----------------------------------------------------------------------
-	{
-		// Reset state (solid cells get a placeholder != kStateEmpty so BFS skips them)
-		coarse.state.assign((size_t)coarse.dimX * coarse.dimY * coarse.dimZ, kStateEmpty);
-		for (const auto &kv : coarse.solid) {
-			if (coarse.inBounds(kv.first)) coarse.state[(size_t)coarse.toIdx(kv.first)] = kStateSolid;
-		}
-
-		uint64_t t = core::TimeProvider::systemMillis();
-		Level emptyPrev; // no previous level at coarse
-		const uint64_t hole = buildExterior(coarse, emptyPrev);
-		(void)hole;
-		const uint64_t extCount = countCellsByState(coarse, kStateExterior);
-		if (k3DPrintVerbose) {
-			Log::info("3dprint faceclassify: coarse exterior: %lu cells (%.2fs)", (unsigned long)extCount, elapsedSince(t));
-		}
-
-		t = core::TimeProvider::systemMillis();
-		{
-			const uint64_t intCount = buildInteriorAllSeeds(coarse);
-			if (intCount == 0) {
-				Log::warn("3dprint faceclassify: no enclosed interior at cell size %d -- model may need sealing",
-						  coarseCellSize);
-			} else if (k3DPrintVerbose) {
-				Log::info("3dprint faceclassify: coarse interior: %lu cells (%.2fs)", (unsigned long)intCount, elapsedSince(t));
-			}
-		}
-	}
-
-	// -----------------------------------------------------------------------
-	// Step 3: Refinement levels.
-	// -----------------------------------------------------------------------
-	core::DynamicArray<Level> fineLevels;
-
-	if (minCellSize > 0 && minCellSize < coarseCellSize) {
-		int fineSize = coarseCellSize / 2;
-		Level *prevLevel = &coarse;
-
-		while (fineSize >= minCellSize) {
-			fineLevels.push_back(Level{});
-			Level &lvl = fineLevels[fineLevels.size() - 1];
-			lvl.cellSize = fineSize;
-			lvl.initGrid(gridLower, gridUpper);
-
-			if (k3DPrintVerbose) {
-				Log::info("3dprint faceclassify: refinement level %d (grid %d x %d x %d = %d cells) ...",
-						  fineSize, lvl.dimX, lvl.dimY, lvl.dimZ, lvl.dimX * lvl.dimY * lvl.dimZ);
-			}
-
-			uint64_t t = core::TimeProvider::systemMillis();
-			buildSolidHash(lvl, nodes);
-			if (k3DPrintVerbose) {
-				Log::info("3dprint faceclassify:   level %d solid cells: %lu (%.2fs)",
-						  fineSize, (unsigned long)lvl.solid.size(), elapsedSince(t));
-			}
-
-			// Mark solid in state array so BFS skips them
-			for (const auto &kv : lvl.solid) {
-				if (lvl.inBounds(kv.first)) lvl.state[(size_t)lvl.toIdx(kv.first)] = kStateSolid;
-			}
-
-			// Inherit ext/int classification from the parent level instead of
-			// re-flooding from scratch. Same pattern fillholes uses: cells whose
-			// parent is ext/int copy that classification; cells whose parent is
-			// solid stay kStateEmpty (probe zone, gets filled by BFS below).
-			// Massive speedup at fine levels -- the dense grid is mostly inherited
-			// in parallel; only narrow probe-zone bands need BFS. Without this,
-			// cs=16 interior flood was 33+ seconds on the gothic model because
-			// buildInteriorAllSeeds is single-threaded and walks every interior
-			// cell from a single seed.
-			t = core::TimeProvider::systemMillis();
-			initFineFromPrev(lvl, *prevLevel);
-			if (k3DPrintVerbose) {
-				Log::info("3dprint faceclassify:   level %d initFromPrev (%.2fs)",
-						  fineSize, elapsedSince(t));
-			}
-
-			// runBidirectionalBFS expands ext into probe-zone cells where parent
-			// was solid, similarly for int, and emits kStateBlocked at contacts
-			// (treated like solid by the ray cast in step 4 -- ray stops). Same
-			// kStateExterior/kStateInterior/kStateSolid set the ray cast queries.
-			t = core::TimeProvider::systemMillis();
-			const core::DynamicArray<glm::ivec3> holeCells = runBidirectionalBFS(lvl);
-			if (k3DPrintVerbose) {
-				Log::info("3dprint faceclassify:   level %d BFS done (%.2fs, %zu hole cell(s))",
-						  fineSize, elapsedSince(t), holeCells.size());
-			}
-
-			prevLevel = &lvl;
-			fineSize /= 2;
-		}
-	}
-
-	// Build level stack: finest first, coarse last (for ray cast checks)
-	core::DynamicArray<Level *> levelStack;
-	// Reverse loop MUST be int (signed): unsigned `i >= 0` is always true,
-	// after i decrements past 0 it wraps to SIZE_MAX -> infinite loop.
-	for (int i = (int)fineLevels.size() - 1; i >= 0; --i) levelStack.push_back(&fineLevels[i]);
-	levelStack.push_back(&coarse);
-	const Level &finestLevel = *levelStack[0];
-
-	// -----------------------------------------------------------------------
-	// Step 4: Parallel ray cast classification per node.
-	// -----------------------------------------------------------------------
-	core::DynamicArray<core::DynamicArray<ClassifyResult>> results;
-	results.resize((size_t)totalNodes);
-	std::atomic<uint64_t> processed{0};
-
-	app::for_parallel(0, totalNodes, [&](int start, int end) {
-		for (int i = start; i < end; ++i) {
-			const NodeInfo &ni = nodes[i];
-			const voxel::Region &region = ni.rv->region();
-			core::DynamicArray<ClassifyResult> &nodeResults = results[i];
-
-			for (int z = region.getLowerZ(); z <= region.getUpperZ(); ++z) {
-				for (int y = region.getLowerY(); y <= region.getUpperY(); ++y) {
-					for (int x = region.getLowerX(); x <= region.getUpperX(); ++x) {
-						if (voxel::isAir(ni.rv->voxel(x, y, z).getMaterial())) continue;
-
-						const glm::ivec3 worldPos = transformPoint(ni.worldMat, glm::ivec3(x, y, z));
-						bool facesOuter = false;
-						bool facesInner = false;
-
-						for (const glm::ivec3 &faceOff : voxel::arrayPathfinderFaces) {
-							glm::ivec3 rayPos = worldPos + faceOff;
-							while (true) {
-								// cellState returns kStateExterior for out-of-bounds positions,
-								// so no explicit bbox check needed -- the ray self-terminates.
-								bool classified = false;
-								for (Level *lvl : levelStack) {
-									const uint8_t s = lvl->cellState(toCellOrigin(rayPos, lvl->cellSize));
-									if (s == kStateExterior) { facesOuter = true; classified = true; break; }
-									if (s == kStateInterior) { facesInner = true; classified = true; break; }
-								}
-								if (classified) break;
-
-								// Solid check at finest available level
-								if (isSolidAt(rayPos, finestLevel, nodes)) break;
-
-								rayPos += faceOff;
-							}
-							if (facesOuter && facesInner) break;
-						}
-
-						uint8_t tag;
-						if      (facesOuter && facesInner) tag = kTagThin;
-						else if (facesOuter)               tag = kTagOuter;
-						else if (facesInner)               tag = kTagInner;
-						else                               tag = kTagBuried;
-						nodeResults.push_back({glm::ivec3(x, y, z), tag});
+		bool hasSolid = false;
+		for (int z = r.getLowerZ(); z <= r.getUpperZ() && !hasSolid; ++z) {
+			for (int y = r.getLowerY(); y <= r.getUpperY() && !hasSolid; ++y) {
+				for (int x = r.getLowerX(); x <= r.getUpperX() && !hasSolid; ++x) {
+					if (!voxel::isAir(ni.rv->voxel(x, y, z).getMaterial())) {
+						hasSolid = true;
 					}
 				}
 			}
-			timer.addVoxels((int64_t)nodeResults.size());
-			timer.tick(++processed);
 		}
-	});
-
-	// -----------------------------------------------------------------------
-	// Step 5: Apply recoloring (sequential).
-	// -----------------------------------------------------------------------
-	static constexpr color::RGBA kOuterColor(255, 140,   0, 255);
-	static constexpr color::RGBA kInnerColor( 30, 120, 255, 255);
-	static constexpr color::RGBA kThinColor (220,   0, 220, 255);
-	static constexpr color::RGBA kBuriedColor(255, 230,  0, 255);
-
-	uint64_t totalClassified = 0, nodesTouched = 0;
-	for (int i = 0; i < totalNodes; ++i) {
-		const core::DynamicArray<ClassifyResult> &nodeResults = results[i];
-		if (nodeResults.empty()) continue;
-		scenegraph::SceneGraphNode &node = graph.node(nodes[i].nodeId);
-		palette::Palette &pal = node.palette();
-		uint8_t outerIdx = 0, innerIdx = 0, thinIdx = 0, buriedIdx = 0;
-		pal.tryAdd(kOuterColor,  true, &outerIdx,  true);
-		pal.tryAdd(kInnerColor,  true, &innerIdx,  true);
-		pal.tryAdd(kThinColor,   true, &thinIdx,   true);
-		pal.tryAdd(kBuriedColor, true, &buriedIdx, true);
-		voxel::RawVolumeWrapper wrapper(nodes[i].rv);
-		for (const ClassifyResult &r : nodeResults) {
-			const voxel::Voxel &orig = nodes[i].rv->voxel(r.localPos);
-			uint8_t colorIdx;
-			switch (r.tag) {
-			case kTagOuter:  colorIdx = outerIdx;  ++legendOuter;  break;
-			case kTagInner:  colorIdx = innerIdx;  ++legendInner;  break;
-			case kTagThin:   colorIdx = thinIdx;   ++legendThin;   break;
-			default:         colorIdx = buriedIdx; ++legendBuried; break;
-			}
-			wrapper.setVoxel(r.localPos, voxel::createVoxel(orig.getMaterial(), colorIdx,
-															  orig.getNormal(), orig.getFlags(), orig.getBoneIdx()));
-		}
-		if (wrapper.dirtyRegion().isValid()) {
-			sceneMgr->modified(nodes[i].nodeId, wrapper.dirtyRegion());
-			++nodesTouched;
-		}
-		totalClassified += (uint64_t)nodeResults.size();
-	}
-	} // ProgressTimer destructs here
-
-	Log::info("3dprint faceclassify: color legend and voxel counts:");
-	Log::info("  ORANGE  (255,140,  0) = outer surface -- face sees exterior space       : %ld voxels", (long)legendOuter);
-	Log::info("  BLUE    ( 30,120,255) = inner surface -- face sees interior space only  : %ld voxels", (long)legendInner);
-	Log::info("  MAGENTA (220,  0,220) = thin wall     -- face sees both ext and interior: %ld voxels", (long)legendThin);
-	Log::info("  YELLOW  (255,230,  0) = buried solid  -- no air face at all             : %ld voxels", (long)legendBuried);
-}
-
-void runHoleMap(SceneManager *sceneMgr, int minCellSize) {
-	scenegraph::SceneGraph &graph = sceneMgr->sceneGraph();
-
-	core::DynamicArray<NodeInfo> nodes;
-	nodes.reserve((size_t)graph.size());
-	for (auto iter = graph.beginModel(); iter != graph.end(); ++iter) {
-		scenegraph::SceneGraphNode &node = *iter;
-		voxel::RawVolume *rv = node.volume();
-		if (rv == nullptr) continue;
-		NodeInfo info;
-		info.nodeId = node.id();
-		info.rv = rv;
-		info.worldMat = graph.worldMatrix(node, 0);
-		info.invWorldMat = glm::inverse(info.worldMat);
-		info.cellOrigin = glm::ivec3(0);
-		nodes.push_back(info);
-	}
-	if (nodes.empty()) {
-		Log::warn("3dprint holemap: no model nodes -- nothing to do.");
-		return;
-	}
-	const int totalNodes = (int)nodes.size();
-
-	// Infer coarse cell size from modal node width
-	int coarseCellSize = 0;
-	{
-		std::unordered_map<int, int> widthCount;
-		for (const NodeInfo &ni : nodes)
-			widthCount[ni.rv->region().getWidthInVoxels()]++;
-		int bestCount = 0;
-		for (const auto &kv : widthCount)
-			if (kv.second > bestCount) { bestCount = kv.second; coarseCellSize = kv.first; }
-	}
-	if (coarseCellSize <= 0) {
-		Log::error("3dprint holemap: could not determine cell size -- run 3dprint regrid first");
-		return;
-	}
-	// Default minCellSize=2 so holemap visualizes at the same depth fillholes
-	// uses for plug detection. After the dense pass, a chunked cs=1 sweep also
-	// runs to recolor walls adjacent to sub-cs=2 leaks.
-	if (minCellSize <= 0 || minCellSize >= coarseCellSize) {
-		minCellSize = 2;
-	}
-	if (minCellSize <= 0) {
-		Log::error("3dprint holemap: coarse cell size %d too small to subdivide", coarseCellSize);
-		return;
-	}
-	if (k3DPrintVerbose) {
-		Log::info("3dprint holemap: coarse=%d, refining down to minCellSize=%d, nodes=%d",
-				  coarseCellSize, minCellSize, totalNodes);
-	}
-
-	// World bbox and coarse solid hash (one cell per node at coarse level)
-	voxel::Region worldBbox = voxel::Region::InvalidRegion;
-	Level coarse;
-	coarse.cellSize = coarseCellSize;
-	coarse.solid.reserve((size_t)totalNodes);
-	glm::ivec3 gridLower(INT_MAX, INT_MAX, INT_MAX);
-	glm::ivec3 gridUpper(INT_MIN, INT_MIN, INT_MIN);
-
-	for (int i = 0; i < totalNodes; ++i) {
-		NodeInfo &ni = nodes[i];
-		const voxel::Region &r = ni.rv->region();
-		const glm::ivec3 corners[8] = {
-			{r.getLowerX(), r.getLowerY(), r.getLowerZ()}, {r.getUpperX(), r.getLowerY(), r.getLowerZ()},
-			{r.getLowerX(), r.getUpperY(), r.getLowerZ()}, {r.getUpperX(), r.getUpperY(), r.getLowerZ()},
-			{r.getLowerX(), r.getLowerY(), r.getUpperZ()}, {r.getUpperX(), r.getLowerY(), r.getUpperZ()},
-			{r.getLowerX(), r.getUpperY(), r.getUpperZ()}, {r.getUpperX(), r.getUpperY(), r.getUpperZ()},
-		};
-		for (const glm::ivec3 &c : corners) {
-			const glm::ivec3 wc = transformPoint(ni.worldMat, c);
-			if (worldBbox.isValid()) worldBbox.accumulate(wc); else worldBbox = voxel::Region(wc, wc);
-		}
-		ni.cellOrigin = toCellOrigin(transformPoint(ni.worldMat, r.getLowerCorner()), coarseCellSize);
-		gridLower = glm::min(gridLower, ni.cellOrigin);
-		gridUpper = glm::max(gridUpper, ni.cellOrigin);
-		// Only add to coarse solid hash if node has at least one solid voxel.
-		// Fully empty nodes left out so they can seed interior rooms after exterior BFS.
-		bool hasSolid = false;
-		for (int z = r.getLowerZ(); z <= r.getUpperZ() && !hasSolid; ++z)
-			for (int y = r.getLowerY(); y <= r.getUpperY() && !hasSolid; ++y)
-				for (int x = r.getLowerX(); x <= r.getUpperX() && !hasSolid; ++x)
-					if (!voxel::isAir(ni.rv->voxel(x, y, z).getMaterial()))
-						hasSolid = true;
 		if (hasSolid) {
 			coarse.solid.emplace(ni.cellOrigin, i);
 		}
@@ -1770,27 +1639,644 @@ void runHoleMap(SceneManager *sceneMgr, int minCellSize) {
 	gridUpper += glm::ivec3(coarseCellSize);
 	coarse.initGrid(gridLower, gridUpper);
 	coarse.state.assign((size_t)coarse.dimX * coarse.dimY * coarse.dimZ, kStateEmpty);
-	for (const auto &kv : coarse.solid)
-		if (coarse.inBounds(kv.first)) coarse.state[(size_t)coarse.toIdx(kv.first)] = kStateSolid;
+	for (const auto &kv : coarse.solid) {
+		if (coarse.inBounds(kv.first)) {
+			coarse.state[(size_t)coarse.toIdx(kv.first)] = kStateSolid;
+		}
+	}
 
-	// Coarse exterior + interior BFS (full flood, works at node scale)
 	{
 		Level emptyPrev;
 		buildExterior(coarse, emptyPrev);
 	}
-	{
-		const uint64_t intCount = buildInteriorAllSeeds(coarse);
-		if (intCount == 0) {
-			Log::warn("3dprint holemap: no enclosed interior at coarse scale -- model may not be sealed");
-			return;
+	res.intCount = buildInteriorAllSeeds(coarse);
+	res.coarseCellSize = coarseCellSize;
+	res.gridLower = gridLower;
+	res.gridUpper = gridUpper;
+	res.ok = true;
+	return res;
+}
+
+// No-op default for buildRefinedShell's per-level hook: callers that don't
+// need to inspect intermediate levels (faceclassify) get this and the compiler
+// inlines the call away.
+struct BuildRefinedShellNoopHook {
+	void operator()(const Level &lvl, int cellSize) const {
+		(void)lvl;
+		(void)cellSize;
+	}
+};
+
+// Refines coarse classification down to minCellSize. The per-level hook fires
+// after each level's BFS, before the level moves into prevOut. Erode uses it
+// to run disjoint detection at cs=4 while that level is alive, avoiding a
+// second buildSolidHash + BFS just for that.
+//
+// On return, prevOut holds the deepest reached level: minCellSize when the
+// 16 GB dense cap was respected at every step, or a coarser cs if a level
+// would have exceeded the cap or the RSS cap tripped. Either way the chunked
+// cs=1 driver can use prevOut as parent.
+template<class PerLevelHook = BuildRefinedShellNoopHook>
+static void buildRefinedShell(
+		const Level &coarse,
+		int minCellSize,
+		const glm::ivec3 &gridLower,
+		const glm::ivec3 &gridUpper,
+		const core::DynamicArray<NodeInfo> &nodes,
+		const char *callerTag,
+		Level &prevOut,
+		PerLevelHook perLevelHook = BuildRefinedShellNoopHook{}) {
+	prevOut = coarse;
+	const int totalNodes = (int)nodes.size();
+	const core::String solidHashLabel = core::String(callerTag) + " solidHash";
+	for (int fineSize = coarse.cellSize / 2; fineSize >= minCellSize; fineSize /= 2) {
+		Level fine;
+		fine.cellSize = fineSize;
+		fine.initGrid(gridLower, gridUpper);
+		const size_t stateCells = (size_t)fine.dimX * (size_t)fine.dimY * (size_t)fine.dimZ;
+		if (stateCells > kDensePassMaxStateCells) {
+			Log::warn("3dprint %s: cs=%d grid %dx%dx%d = %.1f GB dense state would exceed the 16 GB budget. "
+					  "Stopping refinement at the previously-reached cs=%d -- chunked cs=1 still runs "
+					  "(per-chunk allocation, no dense global state) using cs=%d as parent.",
+					  callerTag, fineSize, fine.dimX, fine.dimY, fine.dimZ,
+					  (double)stateCells / (1024.0 * 1024.0 * 1024.0),
+					  fineSize * 2, fineSize * 2);
+			break;
 		}
-		if (k3DPrintVerbose) {
-			Log::info("3dprint holemap: coarse grid %dx%dx%d -- exterior=%lu interior=%lu solid=%lu",
-					  coarse.dimX, coarse.dimY, coarse.dimZ,
-					  (unsigned long)countCellsByState(coarse, kStateExterior),
-					  (unsigned long)intCount,
-					  (unsigned long)coarse.solid.size());
+
+		fine.solid.clear();
+		fine.state.assign(stateCells, kStateEmpty);
+		{
+			ProgressTimer levelTimer(solidHashLabel.c_str(), totalNodes, k3DPrintVerbose);
+			buildSolidHash(fine, nodes, &levelTimer);
 		}
+		for (const auto &kv : fine.solid) {
+			if (fine.inBounds(kv.first)) {
+				fine.state[(size_t)fine.toIdx(kv.first)] = kStateSolid;
+			}
+		}
+
+		initFineFromPrev(fine, prevOut);
+		if (checkRSSCap("after initFineFromPrev")) {
+			break;
+		}
+		// Hole cells are not collected here -- callers that need them (fillholes,
+		// holemap) drive their own per-level loop. Erode and faceclassify use this
+		// helper because they only need the final cs=2 ext/int classification.
+		runBidirectionalBFS(fine);
+		if (checkRSSCap("after runBidirectionalBFS")) {
+			break;
+		}
+
+		// Hook runs while the level is still alive but before it shifts into
+		// prevOut. Callers can read fine.state and fine.solid here.
+		perLevelHook(fine, fineSize);
+
+		prevOut = core::move(fine);
+	}
+}
+
+// Cell size at which erode runs disjoint-interior detection. Hooks into
+// buildRefinedShell at this level. Larger = faster, smaller = more accurate
+// at picking up thin disjoint connections to the main shell. cs=4 is the
+// pragmatic choice on the gothic model: ~15 MB BFS bit array, ~3-5 s, finds
+// disjoint cs=4 blocks of voxels with reasonable precision. If you change
+// this, ensure runErode's minCellSize plumbing still reaches it (the chain
+// must descend to at least this cs for the hook to fire).
+static constexpr int kErodeDisjointCellSize = 4;
+
+// Bit-array-backed lookup for "is this world position in a disjoint cs=N cell?".
+// Stored as a flat bit per cs=N cell over the level's grid bounds: O(1) lookup,
+// ~15 MB on the gothic model at cs=4 -- vs a hash set with fixed-bucket-count
+// DynamicSet, which would do chain walks for every one of the ~100M post-pass
+// lookups. The post-pass calls isDisjoint per non-air voxel; cache locality
+// of the flat bit array matters a lot more than the hash-set sparseness would.
+struct DisjointInteriorMap {
+	int cellSize = 0;
+	int dimX = 0;
+	int dimY = 0;
+	int dimZ = 0;
+	glm::ivec3 gridLower{0};
+	core::DynamicArray<uint8_t> bits;
+	bool populated = false;
+
+	bool isDisjoint(const glm::ivec3 &worldPos) const {
+		if (!populated) {
+			return false;
+		}
+		const int ix = (worldPos.x - gridLower.x) / cellSize;
+		const int iy = (worldPos.y - gridLower.y) / cellSize;
+		const int iz = (worldPos.z - gridLower.z) / cellSize;
+		if (ix < 0 || ix >= dimX || iy < 0 || iy >= dimY || iz < 0 || iz >= dimZ) {
+			return false;
+		}
+		const size_t idx = (size_t)ix * (size_t)dimY * (size_t)dimZ
+						 + (size_t)iy * (size_t)dimZ
+						 + (size_t)iz;
+		return (bits[idx >> 3] & (uint8_t)(1u << (idx & 7))) != 0;
+	}
+};
+
+// Detects cs=N "disjoint" solid cells at the given level: kStateSolid cells
+// not reachable from cells touching kStateExterior or kStateBlocked via
+// kStateSolid face-adjacency. By construction, an unreachable kStateSolid
+// cell has no kStateExterior/kStateBlocked face-neighbour (otherwise it
+// would be a seed) -- so its voxels see only int cavity or other solid
+// neighbours, exactly the user's "interior shell only" criterion.
+//
+// Memory: temporary "reached" bit array sized to lvl.state (~15 MB at cs=4
+// on gothic), freed when the function returns. The output map stores its own
+// bit array of the same size (also ~15 MB) which survives for use in the
+// post-pass.
+//
+// Frontier reservation follows the growth-ceiling rule: worst case every
+// kStateSolid cell becomes a seed (a fully-faceted, ext-touching shell), so
+// reserve to lvl.solid.size() up front. Per-round next-frontier reserves to
+// (current frontier * 6) inside the BFS loop -- the standard 6-neighbour
+// expansion cap.
+static void detectDisjointInteriorCells(
+		const Level &lvl,
+		DisjointInteriorMap &out) {
+	out.cellSize = lvl.cellSize;
+	out.dimX = lvl.dimX;
+	out.dimY = lvl.dimY;
+	out.dimZ = lvl.dimZ;
+	out.gridLower = lvl.gridLower;
+	const size_t totalCells = lvl.state.size();
+	const size_t bitArrSize = (totalCells + 7) / 8;
+	out.bits.resize(bitArrSize);
+	out.populated = true;
+
+	if (lvl.solid.empty()) {
+		return;
+	}
+
+	core::DynamicArray<uint8_t> reached;
+	reached.resize(bitArrSize);
+
+	auto markReached = [&](size_t idx) {
+		reached[idx >> 3] |= (uint8_t)(1u << (idx & 7));
+	};
+	auto isReached = [&](size_t idx) -> bool {
+		return (reached[idx >> 3] & (uint8_t)(1u << (idx & 7))) != 0;
+	};
+
+	core::DynamicArray<size_t> frontier;
+	// Reserve to the seed-loop growth ceiling. Every kStateSolid cell could
+	// hypothetically be ext-touching (paper-thin shell); under-reserving here
+	// has burned us before. Memory cost = 8 bytes * |solid|; for cs=4 gothic
+	// that's a few MB even at maximum.
+	frontier.reserve(lvl.solid.size());
+
+	// Seed: kStateSolid cells with at least one face-neighbour classified
+	// kStateExterior or kStateBlocked (a leak/seam cell -- the wall around
+	// such a cell is part of the main shell, not disjoint).
+	for (const auto &kv : lvl.solid) {
+		const glm::ivec3 cell = kv.first;
+		if (!lvl.inBounds(cell)) {
+			continue;
+		}
+		const size_t idx = lvl.toIdx(cell);
+		if (lvl.state[idx] != kStateSolid) {
+			continue;
+		}
+		for (const glm::ivec3 &off : voxel::arrayPathfinderFaces) {
+			const uint8_t s = lvl.cellState(cell + off * lvl.cellSize);
+			if (s == kStateExterior || s == kStateBlocked) {
+				if (!isReached(idx)) {
+					markReached(idx);
+					frontier.push_back(idx);
+				}
+				break;
+			}
+		}
+	}
+
+	// BFS through kStateSolid face-adjacent neighbours.
+	while (!frontier.empty()) {
+		core::DynamicArray<size_t> next;
+		// Per-round growth ceiling: each frontier cell has 6 face neighbours.
+		next.reserve(frontier.size() * 6);
+		for (size_t idx : frontier) {
+			const glm::ivec3 cell = lvl.toCell(idx);
+			for (const glm::ivec3 &off : voxel::arrayPathfinderFaces) {
+				const glm::ivec3 nb = cell + off * lvl.cellSize;
+				if (!lvl.inBounds(nb)) {
+					continue;
+				}
+				const size_t nbIdx = lvl.toIdx(nb);
+				if (lvl.state[nbIdx] != kStateSolid) {
+					continue;
+				}
+				if (isReached(nbIdx)) {
+					continue;
+				}
+				markReached(nbIdx);
+				next.push_back(nbIdx);
+			}
+		}
+		frontier = core::move(next);
+	}
+
+	// Mark unreached kStateSolid cells in out.bits -- these are disjoint.
+	for (const auto &kv : lvl.solid) {
+		if (!lvl.inBounds(kv.first)) {
+			continue;
+		}
+		const size_t idx = lvl.toIdx(kv.first);
+		if (lvl.state[idx] != kStateSolid) {
+			continue;
+		}
+		if (!isReached(idx)) {
+			out.bits[idx >> 3] |= (uint8_t)(1u << (idx & 7));
+		}
+	}
+}
+
+// Counts set bits in the disjoint map -- used for the verbose-log line so we
+// don't have to keep a parallel count during construction.
+static uint64_t countDisjointCells(const DisjointInteriorMap &map) {
+	uint64_t total = 0;
+	for (uint8_t b : map.bits) {
+		total += (uint64_t)__builtin_popcount((unsigned)b);
+	}
+	return total;
+}
+
+// Faceclassify: tag every solid voxel as Outer / Inner / Thin / Buried at
+// cs=1 precision, then recolor for visual inspection.
+//
+// Tag definition (from cs=1 face-neighbor inspection of the chunked classifier):
+//   extAdj && intAdj  -> Thin    (magenta) -- 1-voxel wall between ext and a cavity
+//   extAdj only       -> Outer   (orange)  -- exterior shell
+//   intAdj only       -> Inner   (blue)    -- inner cavity surface
+//   neither           -> Buried  (yellow)  -- no air face at cs=1
+//
+// The previous implementation walked rays voxel-by-voxel through a hierarchical
+// cs=2 ext/int level stack. That mis-classified any wall voxel near a sub-cs=2
+// feature (1-voxel U-tunnel, slit, etc.): cs=2 cells along the tunnel were
+// kStateSolid (they contain wall material), so rays through tunnel air walked
+// past kStateSolid lookups and only terminated when they hit another solid voxel,
+// giving every wall voxel near the tunnel a Buried tag.
+//
+// The cs=1 chunked mark approach fixes that by reusing fillholes' chunked
+// architecture: per chunk, build local cs=1 state from parent cs=2 + per-voxel
+// solid checks, run ext-then-int BFS so the cs=1 state encodes the truth at
+// voxel granularity, then face-neighbor inspect each solid voxel inside the
+// chunk and atomic-OR an extAdj / intAdj bit for it. The tunnel air gets cs=1
+// kStateExterior, the wall voxel beside it sees an ext face-neighbor, gets
+// the extAdj bit, ends up Outer.
+void runFaceClassify(SceneManager *sceneMgr, int minCellSize) {
+	g_rssCapTripped.store(false);
+	logRSS("entry to runFaceClassify");
+	const uint64_t totalStartMs = core::TimeProvider::systemMillis();
+
+	memento::ScopedMementoHandlerLock mementoLock(sceneMgr->mementoHandler());
+
+	scenegraph::SceneGraph &graph = sceneMgr->sceneGraph();
+	core::DynamicArray<NodeInfo> nodes;
+	Level coarse;
+	const CoarseShellResult shell = buildCoarseShell(sceneMgr, "faceclassify", nodes, coarse);
+	if (!shell.ok) {
+		return;
+	}
+	const int totalNodes = (int)nodes.size();
+	const int coarseCellSize = shell.coarseCellSize;
+	const glm::ivec3 gridLower = shell.gridLower;
+	const glm::ivec3 gridUpper = shell.gridUpper;
+	if (minCellSize <= 0 || minCellSize >= coarseCellSize) {
+		minCellSize = 2;
+	}
+	if (shell.intCount == 0) {
+		Log::warn("3dprint faceclassify: no enclosed interior at coarse scale (cs=%d) -- model is open or fully solid. "
+				  "Without an interior region, every Inner/Thin tag would collapse into Outer (no int seeds). "
+				  "Run '3dprint fillholes' to seal the model first if it should have an interior.",
+				  coarseCellSize);
+	}
+
+	Level prev;
+	buildRefinedShell(coarse, minCellSize, gridLower, gridUpper, nodes, "faceclassify", prev);
+
+	// Per-node ext / int / saw mark bit arrays. 3 bits per voxel total.
+	// Atomic OR (__atomic_or_fetch) keeps the parallel chunk action race-free.
+	//
+	// Saw is set for any voxel the chunk inspects as kStateSolid in its
+	// local cs=1 state. The post-pass uses it to distinguish "not seen, leave
+	// original color" from "seen but no marks, recolor as Buried". Voxels
+	// in nodes that share a cs=2 cell with another node (typically fillholes
+	// orphan plug voxels) are missed by chunkInitFromParent's single-owner
+	// lookup and therefore never get saw set: leaving their original colour
+	// is more useful than mis-tagging them yellow Buried.
+	core::DynamicArray<core::DynamicArray<uint8_t>> nodeExtAdjBits;
+	core::DynamicArray<core::DynamicArray<uint8_t>> nodeIntAdjBits;
+	core::DynamicArray<core::DynamicArray<uint8_t>> nodeLeakAdjBits;
+	core::DynamicArray<core::DynamicArray<uint8_t>> nodeSawBits;
+	nodeExtAdjBits.resize((size_t)totalNodes);
+	nodeIntAdjBits.resize((size_t)totalNodes);
+	nodeLeakAdjBits.resize((size_t)totalNodes);
+	nodeSawBits.resize((size_t)totalNodes);
+	int64_t totalMarkBytes = 0;
+	for (int i = 0; i < totalNodes; ++i) {
+		const voxel::Region &r = nodes[(size_t)i].rv->region();
+		const int64_t voxelCount = (int64_t)r.getWidthInVoxels()
+								 * (int64_t)r.getHeightInVoxels()
+								 * (int64_t)r.getDepthInVoxels();
+		const int64_t byteCount = (voxelCount + 7) / 8;
+		nodeExtAdjBits[(size_t)i].resize((size_t)byteCount);
+		nodeIntAdjBits[(size_t)i].resize((size_t)byteCount);
+		nodeLeakAdjBits[(size_t)i].resize((size_t)byteCount);
+		nodeSawBits[(size_t)i].resize((size_t)byteCount);
+		totalMarkBytes += byteCount * 4;
+	}
+	if (k3DPrintVerbose) {
+		Log::info("3dprint faceclassify: mark bit arrays allocated -- %.1f MB across %d node(s) (ext+int+leak+saw)",
+				  (double)totalMarkBytes / (1024.0 * 1024.0), totalNodes);
+	}
+
+	core::DynamicArray<size_t> chunkExtFront;
+	core::DynamicArray<size_t> chunkIntFront;
+	buildFrontiers(prev, chunkExtFront, chunkIntFront, /*wrapSolid=*/true);
+
+	// requireOppositeFront=false: faceclassify visits every front cs=2 cell on
+	// either shell so all wall voxels get classified, including inner walls
+	// far from any exterior surface. seedChunks anchors on both ext-front
+	// AND int-front cells (deduped via shared covered set).
+	core::DynamicArray<ChunkBox> chunks = seedChunks(prev, chunkExtFront, chunkIntFront,
+													  /*requireOppositeFront=*/false);
+	if (k3DPrintVerbose) {
+		Log::info("3dprint faceclassify: chunked cs=1 mark pass entering with %zu chunk(s)", chunks.size());
+	}
+
+	const Level &parent = prev;
+	runChunkedCs1Driver(chunks, parent, nodes, "faceclassify", core::TimeProvider::systemMillis(),
+		[&](Level &chunk, core::DynamicArray<glm::ivec3> &chunkHoles, int ci) {
+			(void)chunkHoles;
+			(void)ci;
+
+			const int cs2 = parent.cellSize;
+			const glm::ivec3 chunkLower = chunk.gridLower;
+			const glm::ivec3 chunkUpper = chunkLower + glm::ivec3(chunk.dimX - 1, chunk.dimY - 1, chunk.dimZ - 1);
+			const glm::ivec3 cs2Lower = toCellOrigin(chunkLower, cs2);
+			const glm::ivec3 cs2Upper = toCellOrigin(chunkUpper, cs2);
+
+			for (int cx = cs2Lower.x; cx <= cs2Upper.x; cx += cs2) {
+				for (int cy = cs2Lower.y; cy <= cs2Upper.y; cy += cs2) {
+					for (int cz = cs2Lower.z; cz <= cs2Upper.z; cz += cs2) {
+						const glm::ivec3 cs2Cell(cx, cy, cz);
+						if (parent.cellState(cs2Cell) != kStateSolid) {
+							continue;
+						}
+
+						const int x0 = glm::max(cx, chunkLower.x);
+						const int y0 = glm::max(cy, chunkLower.y);
+						const int z0 = glm::max(cz, chunkLower.z);
+						const int x1 = glm::min(cx + cs2 - 1, chunkUpper.x);
+						const int y1 = glm::min(cy + cs2 - 1, chunkUpper.y);
+						const int z1 = glm::min(cz + cs2 - 1, chunkUpper.z);
+
+						for (int wx = x0; wx <= x1; ++wx) {
+							for (int wy = y0; wy <= y1; ++wy) {
+								for (int wz = z0; wz <= z1; ++wz) {
+									const glm::ivec3 worldPos(wx, wy, wz);
+									const size_t cellIdx = chunk.toIdx(worldPos);
+									if (chunk.state[cellIdx] != kStateSolid) {
+										continue;
+									}
+
+									// Compute neighbor adjacency once per voxel position.
+									// kStateBlocked is a leak/seam contact (cs=1 cell where ext
+									// reached first then int was about to enter). It is its own
+									// signal -- voxels face-adjacent to it get the LeakAdj tag
+									// rather than being folded into Outer/Inner/Thin -- so the
+									// faceclassify visualisation distinguishes "real 1-voxel
+									// wall between ext and a cavity" (Thin) from "voxel sits
+									// next to a hole the model still has".
+									bool extAdj = false;
+									bool intAdj = false;
+									bool leakAdj = false;
+									for (const glm::ivec3 &off : voxel::arrayPathfinderFaces) {
+										const glm::ivec3 nb = worldPos + off;
+										uint8_t s;
+										if (chunk.inBounds(nb)) {
+											s = chunk.state[chunk.toIdx(nb)];
+										} else {
+											s = parent.cellState(toCellOrigin(nb, cs2));
+										}
+										if (s == kStateExterior) {
+											extAdj = true;
+										} else if (s == kStateInterior) {
+											intAdj = true;
+										} else if (s == kStateBlocked) {
+											leakAdj = true;
+										}
+										if (extAdj && intAdj && leakAdj) {
+											break;
+										}
+									}
+
+									// Set bits in EACH owning node's bit arrays (multi-node cs=2
+									// cells: each owner gets its saw/extAdj/intAdj/leakAdj bit
+									// for the voxels it actually owns at this position). Without
+									// iterating extras, voxels in non-primary nodes silently
+									// stay unclassified (saw=false -> faceclassify renders gray).
+									forEachCellOwner(parent, cs2Cell, [&](uint64_t nodeIdxU) {
+										const int nodeIdx = (int)nodeIdxU;
+										const NodeInfo &ni = nodes[(size_t)nodeIdx];
+										const voxel::Region &nodeRegion = ni.rv->region();
+										const glm::ivec3 local = transformPoint(ni.invWorldMat, worldPos);
+										if (!nodeRegion.containsPoint(local)) {
+											return;
+										}
+										// Per-node voxel check: this node may not have a voxel
+										// at this position even though some other owner does.
+										// (chunk.state was set kStateSolid by chunkInit if ANY
+										// owner had a voxel; that doesn't mean THIS owner does.)
+										if (voxel::isAir(ni.rv->voxel(local).getMaterial())) {
+											return;
+										}
+										const int64_t heightVox = (int64_t)nodeRegion.getHeightInVoxels();
+										const int64_t depthVox  = (int64_t)nodeRegion.getDepthInVoxels();
+										const int64_t vIdx = (int64_t)(local.x - nodeRegion.getLowerX())
+																* heightVox * depthVox
+															+ (int64_t)(local.y - nodeRegion.getLowerY())
+																* depthVox
+															+ (int64_t)(local.z - nodeRegion.getLowerZ());
+										const int64_t byteIdx = vIdx >> 3;
+										const uint8_t bitMask = (uint8_t)(1u << (vIdx & 7));
+
+										__atomic_or_fetch(&nodeSawBits[(size_t)nodeIdx][(size_t)byteIdx],
+														  bitMask, __ATOMIC_RELAXED);
+										if (extAdj) {
+											__atomic_or_fetch(&nodeExtAdjBits[(size_t)nodeIdx][(size_t)byteIdx],
+															  bitMask, __ATOMIC_RELAXED);
+										}
+										if (intAdj) {
+											__atomic_or_fetch(&nodeIntAdjBits[(size_t)nodeIdx][(size_t)byteIdx],
+															  bitMask, __ATOMIC_RELAXED);
+										}
+										if (leakAdj) {
+											__atomic_or_fetch(&nodeLeakAdjBits[(size_t)nodeIdx][(size_t)byteIdx],
+															  bitMask, __ATOMIC_RELAXED);
+										}
+									});
+								}
+							}
+						}
+					}
+				}
+			}
+		});
+	logRSS("faceclassify: after chunked cs=1 mark pass");
+
+	// Sequential per-node recolor based on (leak, ext, int) marks. Leak takes
+	// priority -- a voxel face-adjacent to a kStateBlocked cs=1 cell is sitting
+	// next to a hole the model still has, regardless of what else its other
+	// face-neighbors look like, and the user wants to see those distinctly.
+	static constexpr color::RGBA kOuterColor (255, 140,   0, 255);
+	static constexpr color::RGBA kInnerColor ( 30, 120, 255, 255);
+	static constexpr color::RGBA kThinColor  (220,   0, 220, 255);
+	static constexpr color::RGBA kBuriedColor(255, 230,   0, 255);
+	static constexpr color::RGBA kLeakAdjColor(255,  0,    0, 255);
+
+	int64_t legendOuter = 0;
+	int64_t legendInner = 0;
+	int64_t legendThin = 0;
+	int64_t legendBuried = 0;
+	int64_t legendLeakAdj = 0;
+	uint64_t totalClassified = 0;
+	uint64_t nodesTouched = 0;
+	for (int i = 0; i < totalNodes; ++i) {
+		if (g_rssCapTripped.load(std::memory_order_relaxed)) {
+			break;
+		}
+		const NodeInfo &ni = nodes[(size_t)i];
+		const voxel::Region &nodeRegion = ni.rv->region();
+		const core::DynamicArray<uint8_t> &extBits  = nodeExtAdjBits[(size_t)i];
+		const core::DynamicArray<uint8_t> &intBits  = nodeIntAdjBits[(size_t)i];
+		const core::DynamicArray<uint8_t> &leakBits = nodeLeakAdjBits[(size_t)i];
+		const core::DynamicArray<uint8_t> &sawBits  = nodeSawBits[(size_t)i];
+		const int64_t heightVox = (int64_t)nodeRegion.getHeightInVoxels();
+		const int64_t depthVox  = (int64_t)nodeRegion.getDepthInVoxels();
+
+		scenegraph::SceneGraphNode &node = graph.node(ni.nodeId);
+		palette::Palette &pal = node.palette();
+		uint8_t outerIdx = 0;
+		uint8_t innerIdx = 0;
+		uint8_t thinIdx = 0;
+		uint8_t buriedIdx = 0;
+		uint8_t leakAdjIdx = 0;
+		pal.tryAdd(kOuterColor,   true, &outerIdx,   true);
+		pal.tryAdd(kInnerColor,   true, &innerIdx,   true);
+		pal.tryAdd(kThinColor,    true, &thinIdx,    true);
+		pal.tryAdd(kBuriedColor,  true, &buriedIdx,  true);
+		pal.tryAdd(kLeakAdjColor, true, &leakAdjIdx, true);
+
+		voxel::RawVolumeWrapper wrapper(ni.rv);
+		uint64_t classifiedThisNode = 0;
+		for (int z = nodeRegion.getLowerZ(); z <= nodeRegion.getUpperZ(); ++z) {
+			for (int y = nodeRegion.getLowerY(); y <= nodeRegion.getUpperY(); ++y) {
+				for (int x = nodeRegion.getLowerX(); x <= nodeRegion.getUpperX(); ++x) {
+					const voxel::Voxel &orig = ni.rv->voxel(x, y, z);
+					if (voxel::isAir(orig.getMaterial())) {
+						continue;
+					}
+					const int64_t vIdx = (int64_t)(x - nodeRegion.getLowerX()) * heightVox * depthVox
+									   + (int64_t)(y - nodeRegion.getLowerY()) * depthVox
+									   + (int64_t)(z - nodeRegion.getLowerZ());
+					const int64_t byteIdx = vIdx >> 3;
+					const uint8_t bitMask = (uint8_t)(1u << (vIdx & 7));
+					const bool saw    = (sawBits[(size_t)byteIdx] & bitMask) != 0;
+					if (!saw) {
+						// Voxel never inspected by any chunk (typically a fillholes
+						// orphan plug voxel in a node sharing a cs=2 cell with another
+						// node, or a voxel deeper than the chunk reach). Leave its
+						// original color rather than mis-tagging it Buried.
+						continue;
+					}
+					const bool leakAdj = (leakBits[(size_t)byteIdx] & bitMask) != 0;
+					const bool extAdj  = (extBits[(size_t)byteIdx]  & bitMask) != 0;
+					const bool intAdj  = (intBits[(size_t)byteIdx]  & bitMask) != 0;
+
+					uint8_t colorIdx;
+					if (leakAdj) {
+						colorIdx = leakAdjIdx;
+						++legendLeakAdj;
+					} else if (extAdj && intAdj) {
+						colorIdx = thinIdx;
+						++legendThin;
+					} else if (extAdj) {
+						colorIdx = outerIdx;
+						++legendOuter;
+					} else if (intAdj) {
+						colorIdx = innerIdx;
+						++legendInner;
+					} else {
+						colorIdx = buriedIdx;
+						++legendBuried;
+					}
+					wrapper.setVoxel(x, y, z,
+									 voxel::createVoxel(orig.getMaterial(), colorIdx,
+														orig.getNormal(), orig.getFlags(),
+														orig.getBoneIdx()));
+					++classifiedThisNode;
+				}
+			}
+		}
+		if (classifiedThisNode > 0 && wrapper.dirtyRegion().isValid()) {
+			sceneMgr->modified(ni.nodeId, wrapper.dirtyRegion());
+			++nodesTouched;
+			totalClassified += classifiedThisNode;
+		}
+	}
+
+	const double totalSecs = (double)(core::TimeProvider::systemMillis() - totalStartMs) / 1000.0;
+	if (g_rssCapTripped.load(std::memory_order_relaxed)) {
+		Log::warn("3dprint faceclassify: aborted at %.1fs after %lu voxel(s) classified -- RSS cap (%g GB) tripped.",
+				  totalSecs, (unsigned long)totalClassified, kHolefillRSSCapGB);
+	} else {
+		Log::info("3dprint faceclassify: classified %lu voxel(s) across %lu node(s) in %.1fs",
+				  (unsigned long)totalClassified, (unsigned long)nodesTouched, totalSecs);
+	}
+	Log::info("3dprint faceclassify: color legend and voxel counts:");
+	Log::info("  ORANGE  (255,140,  0) = outer surface  -- cs=1 face sees exterior space        : %ld voxels", (long)legendOuter);
+	Log::info("  BLUE    ( 30,120,255) = inner surface  -- cs=1 face sees interior cavity only  : %ld voxels", (long)legendInner);
+	Log::info("  MAGENTA (220,  0,220) = thin wall      -- cs=1 face sees both ext and interior : %ld voxels", (long)legendThin);
+	Log::info("  YELLOW  (255,230,  0) = buried solid   -- no cs=1 air face at all              : %ld voxels", (long)legendBuried);
+	Log::info("  RED     (255,  0,  0) = leak-adjacent  -- cs=1 face sees a kStateBlocked seam   : %ld voxels", (long)legendLeakAdj);
+}
+
+void runHoleMap(SceneManager *sceneMgr, int minCellSize) {
+	// 3dprint mutating subcommands disable undo: the rewrite scope (potentially
+	// every solid voxel adjacent to a leak across hundreds of nodes) is too
+	// large for memento snapshots. Same precedent as Regrid.cpp.
+	memento::ScopedMementoHandlerLock mementoLock(sceneMgr->mementoHandler());
+
+	scenegraph::SceneGraph &graph = sceneMgr->sceneGraph();
+	core::DynamicArray<NodeInfo> nodes;
+	Level coarse;
+	const CoarseShellResult shell = buildCoarseShell(sceneMgr, "holemap", nodes, coarse);
+	if (!shell.ok) {
+		return;
+	}
+	const int totalNodes = (int)nodes.size();
+	const int coarseCellSize = shell.coarseCellSize;
+	const glm::ivec3 gridLower = shell.gridLower;
+	const glm::ivec3 gridUpper = shell.gridUpper;
+	if (minCellSize <= 0 || minCellSize >= coarseCellSize) {
+		minCellSize = 2;
+	}
+	if (shell.intCount == 0) {
+		Log::warn("3dprint holemap: no enclosed interior at coarse scale -- model may not be sealed");
+		return;
+	}
+	if (k3DPrintVerbose) {
+		Log::info("3dprint holemap: coarse=%d, refining down to minCellSize=%d, nodes=%d",
+				  coarseCellSize, minCellSize, totalNodes);
+		Log::info("3dprint holemap: coarse grid %dx%dx%d -- exterior=%lu interior=%lu solid=%lu",
+				  coarse.dimX, coarse.dimY, coarse.dimZ,
+				  (unsigned long)countCellsByState(coarse, kStateExterior),
+				  (unsigned long)shell.intCount,
+				  (unsigned long)coarse.solid.size());
 	}
 
 	uint64_t numLevels = 0;
@@ -1802,18 +2288,13 @@ void runHoleMap(SceneManager *sceneMgr, int minCellSize) {
 	allHoleCells.reserve(totalNodes);
 	Level prev = coarse;
 
-	// Same dense-state budget as fillholes: cs=2 on the gothic model is ~7.6 GB,
-	// well within the 16 GB cap. holemap was previously capped at 1 GB which
-	// stopped it at cs=4, hiding leaks fillholes would actually find.
-	static constexpr size_t kMaxStateCellsHM = 16ull * 1024ull * 1024ull * 1024ull;
-
 	for (int fineSize = coarseCellSize / 2; fineSize >= minCellSize; fineSize /= 2) {
 		Level fine;
 		fine.cellSize = fineSize;
 		fine.initGrid(gridLower, gridUpper);
 
 		const size_t stateCells = (size_t)fine.dimX * (size_t)fine.dimY * (size_t)fine.dimZ;
-		if (stateCells > kMaxStateCellsHM) {
+		if (stateCells > kDensePassMaxStateCells) {
 			Log::warn("3dprint holemap: cs=%d grid %dx%dx%d = %.1f GB state would exceed the 16 GB budget. "
 					  "Stopping the dense pass at the previously-reached cs=%d -- chunked cs=1 still runs.",
 					  fineSize, fine.dimX, fine.dimY, fine.dimZ,
@@ -1887,48 +2368,53 @@ void runHoleMap(SceneManager *sceneMgr, int minCellSize) {
 
 	uint64_t totalColored = 0;
 	uint64_t nodesTouched = 0;
+	// For each adjacent cs=N cell, recolor solid voxels in EVERY owning node's
+	// volume. Multi-node cs=N cells (regrid edge boxes, fillholes orphan plug
+	// nodes overlapping wall nodes) need each owner visited; previously only
+	// the primary owner from prev.solid.find got recolored, leaving non-primary
+	// node voxels in the original color even though they're adjacent to a leak.
 	for (const glm::ivec3 &solidCell : adjacentSolids) {
-		auto it = prev.solid.find(solidCell);
-		if (it == prev.solid.end()) continue;
-		const NodeInfo &ni = nodes[it->second];
-		scenegraph::SceneGraphNode &node = graph.node(ni.nodeId);
-		palette::Palette &pal = node.palette();
+		forEachCellOwner(prev, solidCell, [&](uint64_t nodeIdxU) {
+			const NodeInfo &ni = nodes[(size_t)nodeIdxU];
+			scenegraph::SceneGraphNode &node = graph.node(ni.nodeId);
+			palette::Palette &pal = node.palette();
 
-		uint8_t skipColorIdx = palette::PaletteColorNotFound;
-		for (int dz = 0; dz < finalCellSize && skipColorIdx == palette::PaletteColorNotFound; ++dz)
-			for (int dy = 0; dy < finalCellSize && skipColorIdx == palette::PaletteColorNotFound; ++dy)
-				for (int dx = 0; dx < finalCellSize && skipColorIdx == palette::PaletteColorNotFound; ++dx) {
-					const glm::ivec3 localPos = transformPoint(ni.invWorldMat,
-					                                           solidCell + glm::ivec3(dx, dy, dz));
-					if (!ni.rv->region().containsPoint(localPos)) continue;
-					const voxel::Voxel &v = ni.rv->voxel(localPos);
-					if (!voxel::isAir(v.getMaterial()))
-						skipColorIdx = v.getColor();
-				}
+			uint8_t skipColorIdx = palette::PaletteColorNotFound;
+			for (int dz = 0; dz < finalCellSize && skipColorIdx == palette::PaletteColorNotFound; ++dz)
+				for (int dy = 0; dy < finalCellSize && skipColorIdx == palette::PaletteColorNotFound; ++dy)
+					for (int dx = 0; dx < finalCellSize && skipColorIdx == palette::PaletteColorNotFound; ++dx) {
+						const glm::ivec3 localPos = transformPoint(ni.invWorldMat,
+						                                           solidCell + glm::ivec3(dx, dy, dz));
+						if (!ni.rv->region().containsPoint(localPos)) continue;
+						const voxel::Voxel &v = ni.rv->voxel(localPos);
+						if (!voxel::isAir(v.getMaterial()))
+							skipColorIdx = v.getColor();
+					}
 
-		uint8_t holeColorIdx = 0;
-		const bool paletteChanged = pal.tryAdd(kHoleColor, true, &holeColorIdx, true, skipColorIdx);
+			uint8_t holeColorIdx = 0;
+			const bool paletteChanged = pal.tryAdd(kHoleColor, true, &holeColorIdx, true, skipColorIdx);
 
-		voxel::RawVolumeWrapper wrapper(ni.rv);
-		for (int dz = 0; dz < finalCellSize; ++dz)
-			for (int dy = 0; dy < finalCellSize; ++dy)
-				for (int dx = 0; dx < finalCellSize; ++dx) {
-					const glm::ivec3 localPos = transformPoint(ni.invWorldMat,
-					                                           solidCell + glm::ivec3(dx, dy, dz));
-					if (!ni.rv->region().containsPoint(localPos)) continue;
-					const voxel::Voxel &v = ni.rv->voxel(localPos);
-					if (voxel::isAir(v.getMaterial())) continue;
-					wrapper.setVoxel(localPos, voxel::createVoxel(v.getMaterial(), holeColorIdx,
-					                                               v.getNormal(), v.getFlags(), v.getBoneIdx()));
-					++totalColored;
-				}
+			voxel::RawVolumeWrapper wrapper(ni.rv);
+			for (int dz = 0; dz < finalCellSize; ++dz)
+				for (int dy = 0; dy < finalCellSize; ++dy)
+					for (int dx = 0; dx < finalCellSize; ++dx) {
+						const glm::ivec3 localPos = transformPoint(ni.invWorldMat,
+						                                           solidCell + glm::ivec3(dx, dy, dz));
+						if (!ni.rv->region().containsPoint(localPos)) continue;
+						const voxel::Voxel &v = ni.rv->voxel(localPos);
+						if (voxel::isAir(v.getMaterial())) continue;
+						wrapper.setVoxel(localPos, voxel::createVoxel(v.getMaterial(), holeColorIdx,
+						                                               v.getNormal(), v.getFlags(), v.getBoneIdx()));
+						++totalColored;
+					}
 
-		if (wrapper.dirtyRegion().isValid() || paletteChanged) {
-			const voxel::Region dirtyRgn = wrapper.dirtyRegion().isValid()
-				? wrapper.dirtyRegion() : ni.rv->region();
-			sceneMgr->modified(ni.nodeId, dirtyRgn);
-			++nodesTouched;
-		}
+			if (wrapper.dirtyRegion().isValid() || paletteChanged) {
+				const voxel::Region dirtyRgn = wrapper.dirtyRegion().isValid()
+					? wrapper.dirtyRegion() : ni.rv->region();
+				sceneMgr->modified(ni.nodeId, dirtyRgn);
+				++nodesTouched;
+			}
+		});
 	}
 
 	// cs=1 leak voxels: recolor each face-adjacent solid voxel (1 voxel per face,
@@ -1950,15 +2436,15 @@ void runHoleMap(SceneManager *sceneMgr, int minCellSize) {
 
 		// Group by owning node so we open RawVolumeWrapper once per node, write
 		// many voxels, then call sceneMgr->modified once with the dirty region.
+		// Iterate ALL owners per cs=2 cell (primary + extras) so voxels in
+		// non-primary nodes get the red recolor too.
 		std::unordered_map<int, core::DynamicArray<glm::ivec3>> perNodeVoxels;
 		perNodeVoxels.reserve(nodes.size());
 		for (const glm::ivec3 &solidVoxel : adjacentSolidVoxels) {
 			const glm::ivec3 cs2Cell = toCellOrigin(solidVoxel, prev.cellSize);
-			auto it = prev.solid.find(cs2Cell);
-			if (it == prev.solid.end()) {
-				continue;
-			}
-			perNodeVoxels[(int)it->second].push_back(solidVoxel);
+			forEachCellOwner(prev, cs2Cell, [&](uint64_t nodeIdxU) {
+				perNodeVoxels[(int)nodeIdxU].push_back(solidVoxel);
+			});
 		}
 
 		for (auto &kv : perNodeVoxels) {
@@ -2032,21 +2518,35 @@ static FillStats applyHoleFills(
 	core::DynamicArray<glm::ivec3> orphanVoxels;
 	orphanVoxels.reserve(fillUpperBound);
 
-	for (const glm::ivec3 &holeCell : holeCells) {
-		int bestNodeIdx = -1;
-		int bestDistSq = INT_MAX;
-		for (const glm::ivec3 &off : voxel::arrayPathfinderFaces) {
-			const glm::ivec3 adjCell = holeCell + off * finalCellSize;
-			auto it = lookup.solid.find(adjCell);
-			if (it == lookup.solid.end()) continue;
-			const int ni = it->second;
-			const glm::ivec3 local = transformPoint(nodes[(size_t)ni].invWorldMat, holeCell);
+	// For each candidate adjacent cs=N cell, examine ALL nodes that own voxels
+	// in it (primary + extras) when picking the best plug owner. Without this,
+	// a leak voxel landing inside a region claimed by a non-primary node would
+	// orphan unnecessarily because the search only saw the primary node, whose
+	// region might not contain the leak position.
+	auto considerOwnersForPlug = [&](const glm::ivec3 &lookupCell,
+									 const glm::ivec3 &targetWorldPos,
+									 int &bestNodeIdx, int &bestDistSq) {
+		forEachCellOwner(lookup, lookupCell, [&](uint64_t nodeIdxU) {
+			const int ni = (int)nodeIdxU;
+			const glm::ivec3 local = transformPoint(nodes[(size_t)ni].invWorldMat, targetWorldPos);
 			const glm::ivec3 lo = nodes[(size_t)ni].rv->region().getLowerCorner();
 			const glm::ivec3 hi = nodes[(size_t)ni].rv->region().getUpperCorner();
 			const glm::ivec3 clamped = glm::clamp(local, lo, hi);
 			const glm::ivec3 d = local - clamped;
 			const int distSq = d.x * d.x + d.y * d.y + d.z * d.z;
-			if (distSq < bestDistSq) { bestDistSq = distSq; bestNodeIdx = ni; }
+			if (distSq < bestDistSq) {
+				bestDistSq = distSq;
+				bestNodeIdx = ni;
+			}
+		});
+	};
+
+	for (const glm::ivec3 &holeCell : holeCells) {
+		int bestNodeIdx = -1;
+		int bestDistSq = INT_MAX;
+		for (const glm::ivec3 &off : voxel::arrayPathfinderFaces) {
+			const glm::ivec3 adjCell = holeCell + off * finalCellSize;
+			considerOwnersForPlug(adjCell, holeCell, bestNodeIdx, bestDistSq);
 		}
 		if (bestNodeIdx < 0) {
 			for (int dz = 0; dz < finalCellSize; ++dz)
@@ -2070,21 +2570,9 @@ static FillStats applyHoleFills(
 		const glm::ivec3 holeCell = toCellOrigin(holeVoxel, finalCellSize);
 		int bestNodeIdx = -1;
 		int bestDistSq = INT_MAX;
-		auto trySolidCell = [&](const glm::ivec3 &c) {
-			auto it = lookup.solid.find(c);
-			if (it == lookup.solid.end()) return;
-			const int ni = it->second;
-			const glm::ivec3 local = transformPoint(nodes[(size_t)ni].invWorldMat, holeVoxel);
-			const glm::ivec3 lo = nodes[(size_t)ni].rv->region().getLowerCorner();
-			const glm::ivec3 hi = nodes[(size_t)ni].rv->region().getUpperCorner();
-			const glm::ivec3 clamped = glm::clamp(local, lo, hi);
-			const glm::ivec3 d = local - clamped;
-			const int distSq = d.x * d.x + d.y * d.y + d.z * d.z;
-			if (distSq < bestDistSq) { bestDistSq = distSq; bestNodeIdx = ni; }
-		};
-		trySolidCell(holeCell);
+		considerOwnersForPlug(holeCell, holeVoxel, bestNodeIdx, bestDistSq);
 		for (const glm::ivec3 &off : voxel::arrayPathfinderFaces) {
-			trySolidCell(holeCell + off * finalCellSize);
+			considerOwnersForPlug(holeCell + off * finalCellSize, holeVoxel, bestNodeIdx, bestDistSq);
 		}
 		if (bestNodeIdx < 0) {
 			orphanVoxels.push_back(holeVoxel);
@@ -2182,122 +2670,43 @@ static FillStats applyHoleFills(
 void runHoleFill(SceneManager *sceneMgr, int minCellSize) {
 	g_rssCapTripped.store(false);
 	logRSS("entry to runHoleFill");
+	// 3dprint mutating subcommands disable undo. Plug voxels span hundreds of
+	// nodes in the gothic pipeline; memento snapshots would compress and store
+	// each affected node, multi-GB RAM and minutes of work for a non-reversible
+	// pipeline stage. Same precedent as Regrid.cpp.
+	memento::ScopedMementoHandlerLock mementoLock(sceneMgr->mementoHandler());
 	const uint64_t totalStartMs = core::TimeProvider::systemMillis();
 	// Aggregated across cs=N main loop and chunked cs=1 pass for the end-of-run
 	// summary line. Currently only the chunked pass writes fills (cs=N fill is
 	// skipped when kRunChunkedCs1Pass=true) but tracking both keeps the summary
 	// correct if the toggle flips.
 	FillStats totalStats;
-	scenegraph::SceneGraph &graph = sceneMgr->sceneGraph();
-
 	core::DynamicArray<NodeInfo> nodes;
-	nodes.reserve((size_t)graph.size());
-	for (auto iter = graph.beginModel(); iter != graph.end(); ++iter) {
-		scenegraph::SceneGraphNode &node = *iter;
-		voxel::RawVolume *rv = node.volume();
-		if (rv == nullptr) continue;
-		NodeInfo info;
-		info.nodeId = node.id();
-		info.rv = rv;
-		info.worldMat = graph.worldMatrix(node, 0);
-		info.invWorldMat = glm::inverse(info.worldMat);
-		info.cellOrigin = glm::ivec3(0);
-		nodes.push_back(info);
-	}
-	if (nodes.empty()) {
-		Log::warn("3dprint fillholes: no model nodes -- nothing to do. Add a model node to the scene first.");
+	Level coarse;
+	const CoarseShellResult shell = buildCoarseShell(sceneMgr, "fillholes", nodes, coarse);
+	if (!shell.ok) {
 		return;
 	}
 	const int totalNodes = (int)nodes.size();
-
-	int coarseCellSize = 0;
-	{
-		std::unordered_map<int, int> widthCount;
-		for (const NodeInfo &ni : nodes)
-			widthCount[ni.rv->region().getWidthInVoxels()]++;
-		int bestCount = 0;
-		for (const auto &kv : widthCount)
-			if (kv.second > bestCount) { bestCount = kv.second; coarseCellSize = kv.first; }
-	}
-	if (coarseCellSize <= 0) {
-		Log::error("3dprint holefill: could not determine cell size -- run 3dprint regrid first");
-		return;
-	}
+	const int coarseCellSize = shell.coarseCellSize;
+	const glm::ivec3 gridLower = shell.gridLower;
+	const glm::ivec3 gridUpper = shell.gridUpper;
 	// Default deepest dense level: cs=2. The main loop runs cs/2 ... cs=2 (or
 	// stops earlier if the kMaxStateCells memory cap trips). The chunked cs=1
 	// pass after the loop plugs sub-cs=2 leaks at voxel precision regardless.
-	//
-	// Override: pass an explicit minCellSize via the command arg if you want to
-	// stop the main loop early (e.g. `3dprint fillholes 4` on memory-tight
-	// machines). minCellSize doesn't disable the chunked cs=1 pass.
 	if (minCellSize <= 0 || minCellSize >= coarseCellSize) {
 		minCellSize = 2;
 	}
-	if (minCellSize <= 0) {
-		Log::error("3dprint holefill: coarse cell size %d too small to subdivide", coarseCellSize);
+	if (shell.intCount == 0) {
+		Log::warn("3dprint fillholes: no enclosed interior at coarse scale (cs=%d). The model has no sealed cavity -- "
+				  "exterior flood reached every air cell. Either the model is genuinely solid/open, or it has a "
+				  "coarse-scale gap (>= %d voxels wide) that lets ext flow through. To proceed: seal large gaps "
+				  "manually, or run '3dprint regrid <smaller_cs>' to make the coarse grid finer. Aborting.",
+				  coarseCellSize, coarseCellSize);
 		return;
 	}
-
-	voxel::Region worldBbox = voxel::Region::InvalidRegion;
-	Level coarse;
-	coarse.cellSize = coarseCellSize;
-	coarse.solid.reserve((size_t)totalNodes);
-	glm::ivec3 gridLower(INT_MAX, INT_MAX, INT_MAX);
-	glm::ivec3 gridUpper(INT_MIN, INT_MIN, INT_MIN);
-
-	for (int i = 0; i < totalNodes; ++i) {
-		NodeInfo &ni = nodes[i];
-		const voxel::Region &r = ni.rv->region();
-		const glm::ivec3 corners[8] = {
-			{r.getLowerX(), r.getLowerY(), r.getLowerZ()}, {r.getUpperX(), r.getLowerY(), r.getLowerZ()},
-			{r.getLowerX(), r.getUpperY(), r.getLowerZ()}, {r.getUpperX(), r.getUpperY(), r.getLowerZ()},
-			{r.getLowerX(), r.getLowerY(), r.getUpperZ()}, {r.getUpperX(), r.getLowerY(), r.getUpperZ()},
-			{r.getLowerX(), r.getUpperY(), r.getUpperZ()}, {r.getUpperX(), r.getUpperY(), r.getUpperZ()},
-		};
-		for (const glm::ivec3 &c : corners) {
-			const glm::ivec3 wc = transformPoint(ni.worldMat, c);
-			if (worldBbox.isValid()) worldBbox.accumulate(wc); else worldBbox = voxel::Region(wc, wc);
-		}
-		ni.cellOrigin = toCellOrigin(transformPoint(ni.worldMat, r.getLowerCorner()), coarseCellSize);
-		gridLower = glm::min(gridLower, ni.cellOrigin);
-		gridUpper = glm::max(gridUpper, ni.cellOrigin);
-		bool hasSolid = false;
-		for (int z = r.getLowerZ(); z <= r.getUpperZ() && !hasSolid; ++z)
-			for (int y = r.getLowerY(); y <= r.getUpperY() && !hasSolid; ++y)
-				for (int x = r.getLowerX(); x <= r.getUpperX() && !hasSolid; ++x)
-					if (!voxel::isAir(ni.rv->voxel(x, y, z).getMaterial()))
-						hasSolid = true;
-		if (hasSolid) {
-			coarse.solid.emplace(ni.cellOrigin, i);
-		}
-	}
-
-	gridLower -= glm::ivec3(coarseCellSize);
-	gridUpper += glm::ivec3(coarseCellSize);
-	coarse.initGrid(gridLower, gridUpper);
-	coarse.state.assign((size_t)coarse.dimX * coarse.dimY * coarse.dimZ, kStateEmpty);
-	for (const auto &kv : coarse.solid)
-		if (coarse.inBounds(kv.first)) coarse.state[(size_t)coarse.toIdx(kv.first)] = kStateSolid;
-	logRSS("after coarse grid init");
-
-	{
-		Level emptyPrev;
-		buildExterior(coarse, emptyPrev);
-	}
-	logRSS("after coarse buildExterior");
-	{
-		const uint64_t intCount = buildInteriorAllSeeds(coarse);
-		if (intCount == 0) {
-			Log::warn("3dprint fillholes: no enclosed interior at coarse scale (cs=%d). The model has no sealed cavity -- "
-					  "exterior flood reached every air cell. Either the model is genuinely solid/open, or it has a "
-					  "coarse-scale gap (>= %d voxels wide) that lets ext flow through. To proceed: seal large gaps "
-					  "manually, or run '3dprint regrid <smaller_cs>' to make the coarse grid finer. Aborting.",
-					  coarseCellSize, coarseCellSize);
-			return;
-		}
-		if (k3DPrintVerbose) {
-			Log::info("3dprint holefill: coarse interior: %lu cell(s)", (unsigned long)intCount);
-		}
+	if (k3DPrintVerbose) {
+		Log::info("3dprint holefill: coarse interior: %lu cell(s)", (unsigned long)shell.intCount);
 	}
 	logRSS("after coarse buildInterior");
 
@@ -2310,23 +2719,18 @@ void runHoleFill(SceneManager *sceneMgr, int minCellSize) {
 	allHoleCells.reserve(totalNodes);
 	Level prev = coarse;
 
-	// 16 GB state cap: admits cs=2 on the big model (~7.6 GB) while still blocking
-	// cs=1 (~60 GB). Keep the next-level scan time in mind -- BFS at cs=2 walks an
-	// 8x larger grid than cs=4.
-	static constexpr size_t kMaxStateCells = 16ull * 1024ull * 1024ull * 1024ull;
-
 	for (int fineSize = coarseCellSize / 2; fineSize >= minCellSize; fineSize /= 2) {
 		Level fine;
 		fine.cellSize = fineSize;
 		fine.initGrid(gridLower, gridUpper);
 
 		const size_t stateCells = (size_t)fine.dimX * (size_t)fine.dimY * (size_t)fine.dimZ;
-		if (stateCells > kMaxStateCells) {
+		if (stateCells > kDensePassMaxStateCells) {
 			Log::warn("3dprint fillholes: cs=%d grid %dx%dx%d = %.1f GB state would exceed the 16 GB dense-pass budget. "
 					  "Stopping the dense refinement at the previously-reached cs=%d. The chunked cs=1 pass still runs "
 					  "(it allocates per-chunk, not globally) -- expect slightly less precise results since the chunked "
 					  "pass uses cs=%d as parent classification. To go finer on a higher-RAM machine, raise the cap "
-					  "(kMaxStateCells in FaceClassify.cpp); to go finer on this machine, run '3dprint regrid <larger_cs>' "
+					  "(kDensePassMaxStateCells in FaceClassify.cpp); to go finer on this machine, run '3dprint regrid <larger_cs>' "
 					  "to produce a smaller bbox first.",
 					  fineSize, fine.dimX, fine.dimY, fine.dimZ,
 					  (double)stateCells / (1024.0 * 1024.0 * 1024.0),
@@ -2552,6 +2956,352 @@ void runHoleFill(SceneManager *sceneMgr, int minCellSize) {
 				  (unsigned long)totalStats.orphanFilled,
 				  totalStats.orphanNodes,
 				  totalSecs);
+	}
+}
+
+// Soft cap on the per-node keep-bit memory. The total budget is bounded
+// (1 bit per voxel, e.g. ~460 MB on the gothic 6000^3 model) but this
+// constant lets us emit a warning before allocation if a future scene
+// somehow blows past the expectation -- safer than silently allocating
+// many GB of bookkeeping.
+static constexpr double kErodeKeepBitsSoftCapGB = 8.0;
+
+// Erode: keep only voxels face-adjacent to the global exterior at cs=1
+// precision. Removes Inner-only and Buried voxels so the model collapses
+// to a 1-voxel exterior shell with all internal cavities merged.
+//
+// Pipeline:
+//   1. Coarse setup mirrored from runHoleFill (cell-size inference, world
+//      bbox, coarse buildExterior + buildInteriorAllSeeds). Aborts with a
+//      warning if no enclosed interior is found at coarse scale (model is
+//      open; user should run '3dprint fillholes' first).
+//   2. Dense refinement chain to minCellSize: each level builds solidHash,
+//      runs initFineFromPrev + runBidirectionalBFS to refine the ext/int
+//      classification. No hole detection or filling. The 16 GB dense state
+//      cap is honoured -- if the next level would exceed it, refinement
+//      stops and the chunked pass uses the previously-reached cs as parent.
+//   3. Per-node keep bit array (1 bit per voxel) is allocated. Atomic OR
+//      (__atomic_or_fetch) is used so multiple chunks can mark the same
+//      voxel concurrently without races.
+//   4. Chunked cs=1 driver runs with seedChunks(requireOppositeFront=false) so
+//      every ext-front cs=2 cell is visited (not just walls with a matching
+//      int-front in range). Per chunk, after the cs=1 BFS populates ext/int
+//      classification, the action walks solid voxels and ORs the keep bit
+//      for any voxel with a kStateExterior cs=1 face-neighbor (ext rays
+//      crossing the chunk boundary fall back to parent cs=2 classification).
+//   5. Sequential post-pass iterates each node's voxels and clears any solid
+//      voxel whose keep bit was not set. dirty regions accumulate per node
+//      and are reported via sceneMgr->modified.
+//
+// Undo recording is suppressed for the duration -- the rewrite scope makes
+// memento snapshots prohibitive at this model size.
+void runErode(SceneManager *sceneMgr, int minCellSize) {
+	g_rssCapTripped.store(false);
+	logRSS("entry to runErode");
+	const uint64_t totalStartMs = core::TimeProvider::systemMillis();
+
+	memento::ScopedMementoHandlerLock mementoLock(sceneMgr->mementoHandler());
+
+	core::DynamicArray<NodeInfo> nodes;
+	Level coarse;
+	const CoarseShellResult shell = buildCoarseShell(sceneMgr, "erode", nodes, coarse);
+	if (!shell.ok) {
+		return;
+	}
+	const int totalNodes = (int)nodes.size();
+	const int coarseCellSize = shell.coarseCellSize;
+	const glm::ivec3 gridLower = shell.gridLower;
+	const glm::ivec3 gridUpper = shell.gridUpper;
+	if (minCellSize <= 0 || minCellSize >= coarseCellSize) {
+		minCellSize = 2;
+	}
+	if (shell.intCount == 0) {
+		Log::warn("3dprint erode: no enclosed interior at coarse scale (cs=%d). The model is open or fully solid -- "
+				  "every air cell reaches exterior at coarse scale. Erode would either remove every voxel "
+				  "(no shell to keep) or do nothing meaningful. Run '3dprint fillholes' first to seal the model. "
+				  "Aborting.",
+				  coarseCellSize);
+		return;
+	}
+
+	// Disjoint-interior bit map (cs=N grid, N = kErodeDisjointCellSize).
+	// Built by the refinement-chain hook at cs=N; survives until the
+	// post-pass which uses it for O(1) per-voxel lookups via isDisjoint.
+	DisjointInteriorMap disjointMap;
+	if (minCellSize > kErodeDisjointCellSize) {
+		Log::warn("3dprint erode: minCellSize=%d skips the cs=%d level -- disjoint-interior detection disabled "
+				  "(it hooks the refinement chain at cs=%d). Pass a smaller minCellSize to enable.",
+				  minCellSize, kErodeDisjointCellSize, kErodeDisjointCellSize);
+	}
+
+	Level prev;
+	buildRefinedShell(coarse, minCellSize, gridLower, gridUpper, nodes, "erode", prev,
+		[&disjointMap](const Level &lvl, int cellSize) {
+			if (cellSize != kErodeDisjointCellSize) {
+				return;
+			}
+			const uint64_t startMs = core::TimeProvider::systemMillis();
+			detectDisjointInteriorCells(lvl, disjointMap);
+			const double secs = (double)(core::TimeProvider::systemMillis() - startMs) / 1000.0;
+			const uint64_t cellCount = countDisjointCells(disjointMap);
+			if (k3DPrintVerbose || cellCount > 0) {
+				Log::info("3dprint erode: cs=%d disjoint detection found %lu cell(s) in %.1fs",
+						  cellSize, (unsigned long)cellCount, secs);
+			}
+		});
+
+	// Per-node keep + saw bit arrays (1 bit per voxel each). Saw is set when
+	// the chunked action actually inspected a voxel as kStateSolid in the
+	// chunk's local cs=1 state; keep is the subset with a kStateExterior
+	// face-neighbor at cs=1.
+	//
+	// Why two bits: chunkInitFromParent finds the owning node via
+	// parent.solid.find, which is one-to-one (CellHash::emplace keeps the
+	// first node when several share a cs=2 cell). Voxels in a different node
+	// that ALSO has solid voxels in the same cs=2 cell -- typically fillholes
+	// orphan plug voxels living in newly-created nodes that overlap original
+	// wall nodes -- are invisible to the chunk's per-voxel walk: their cs=1
+	// position appears kStateEmpty (then kStateExterior/Interior/Blocked
+	// after BFS), never kStateSolid. Without a saw bit, these voxels would
+	// be removed by the post-pass simply because no chunk set their keep bit
+	// -- reopening every leak fillholes had just plugged.
+	//
+	// Conservative rule in the post-pass: remove only when (saw && !keep).
+	// Voxels never seen by any chunk are LEFT ALONE -- this preserves orphan
+	// plug voxels and any voxels deeper than the chunk reach. Deep buried
+	// voxels in walls thicker than the chunk reach also stay; that is a
+	// less-aggressive trade-off than the user's "remove everything not on
+	// the outer shell" goal but it's correctness-preserving (no new holes
+	// created) and acceptable until/unless we move to a multi-node owner
+	// hash that fixes the underlying lookup.
+	core::DynamicArray<core::DynamicArray<uint8_t>> nodeKeepBits;
+	core::DynamicArray<core::DynamicArray<uint8_t>> nodeSawBits;
+	nodeKeepBits.resize((size_t)totalNodes);
+	nodeSawBits.resize((size_t)totalNodes);
+	int64_t totalKeepBytes = 0;
+	for (int i = 0; i < totalNodes; ++i) {
+		const voxel::Region &r = nodes[(size_t)i].rv->region();
+		const int64_t voxelCount = (int64_t)r.getWidthInVoxels()
+								 * (int64_t)r.getHeightInVoxels()
+								 * (int64_t)r.getDepthInVoxels();
+		const int64_t byteCount = (voxelCount + 7) / 8;
+		// resize(N) emplaces uint8_t{} = 0 for each element, so the bits start cleared.
+		nodeKeepBits[(size_t)i].resize((size_t)byteCount);
+		nodeSawBits[(size_t)i].resize((size_t)byteCount);
+		totalKeepBytes += byteCount * 2;
+	}
+	const double keepBitsGB = (double)totalKeepBytes / (1024.0 * 1024.0 * 1024.0);
+	if (keepBitsGB > kErodeKeepBitsSoftCapGB) {
+		Log::warn("3dprint erode: keep+saw bit arrays use %.1f GB (soft cap %.1f GB). "
+				  "Operation continues but you may run low on memory; consider running on a machine with more RAM.",
+				  keepBitsGB, kErodeKeepBitsSoftCapGB);
+	}
+	if (k3DPrintVerbose) {
+		Log::info("3dprint erode: keep+saw bit arrays allocated -- %.1f MB across %d node(s)",
+				  (double)totalKeepBytes / (1024.0 * 1024.0), totalNodes);
+	}
+
+	// Build chunked-pass frontiers at the deepest dense level.
+	core::DynamicArray<size_t> chunkExtFront;
+	core::DynamicArray<size_t> chunkIntFront;
+	buildFrontiers(prev, chunkExtFront, chunkIntFront, /*wrapSolid=*/true);
+
+	// requireOppositeFront=false: erode visits every front cs=2 cell on either
+	// shell. seedChunks anchors on both ext-front AND int-front cells, so
+	// even purely interior walls (between two cavities, no exterior surface
+	// within chunk reach) get classified -- their saw bits get set, and the
+	// existing saw && !keep logic decides what stays.
+	core::DynamicArray<ChunkBox> chunks = seedChunks(prev, chunkExtFront, chunkIntFront,
+													  /*requireOppositeFront=*/false);
+	if (k3DPrintVerbose) {
+		Log::info("3dprint erode: chunked cs=1 driver entering with %zu chunk(s) (parent cs=%d)",
+				  chunks.size(), prev.cellSize);
+	}
+
+	// Capture by reference: nodeKeepBits is the shared sink, prev/nodes are
+	// read-only. The action runs in the parallel context; concurrent OR-marks
+	// on the same byte are safe via __atomic_or_fetch.
+	const Level &parent = prev;
+	runChunkedCs1Driver(chunks, parent, nodes, "erode", core::TimeProvider::systemMillis(),
+		[&](Level &chunk, core::DynamicArray<glm::ivec3> &chunkHoles, int ci) {
+			(void)chunkHoles;
+			(void)ci;
+
+			const int cs2 = parent.cellSize;
+			const glm::ivec3 chunkLower = chunk.gridLower;
+			const glm::ivec3 chunkUpper = chunkLower + glm::ivec3(chunk.dimX - 1, chunk.dimY - 1, chunk.dimZ - 1);
+			const glm::ivec3 cs2Lower = toCellOrigin(chunkLower, cs2);
+			const glm::ivec3 cs2Upper = toCellOrigin(chunkUpper, cs2);
+
+			// Outer loop is cs=2 cells. For each kStateSolid cs=2 cell we iterate
+			// every node owning voxels in it (primary in parent.solid + extras in
+			// parent.extraSolid) -- otherwise voxels in non-primary nodes never
+			// get their saw bit set and the post-pass leaves them alone instead
+			// of erode-classifying them.
+			for (int cx = cs2Lower.x; cx <= cs2Upper.x; cx += cs2) {
+				for (int cy = cs2Lower.y; cy <= cs2Upper.y; cy += cs2) {
+					for (int cz = cs2Lower.z; cz <= cs2Upper.z; cz += cs2) {
+						const glm::ivec3 cs2Cell(cx, cy, cz);
+						if (parent.cellState(cs2Cell) != kStateSolid) {
+							continue;
+						}
+
+						const int x0 = glm::max(cx, chunkLower.x);
+						const int y0 = glm::max(cy, chunkLower.y);
+						const int z0 = glm::max(cz, chunkLower.z);
+						const int x1 = glm::min(cx + cs2 - 1, chunkUpper.x);
+						const int y1 = glm::min(cy + cs2 - 1, chunkUpper.y);
+						const int z1 = glm::min(cz + cs2 - 1, chunkUpper.z);
+
+						for (int wx = x0; wx <= x1; ++wx) {
+							for (int wy = y0; wy <= y1; ++wy) {
+								for (int wz = z0; wz <= z1; ++wz) {
+									const glm::ivec3 worldPos(wx, wy, wz);
+									const size_t cellIdx = chunk.toIdx(worldPos);
+									if (chunk.state[cellIdx] != kStateSolid) {
+										continue;
+									}
+
+									// Compute extAdj once per voxel position.
+									// kStateBlocked counts as ext-reachable: BFS classified
+									// the cell as "ext reached me, then int tried to enter"
+									// -- a leak/contact point. The wall voxel beside it must
+									// stay or the leak widens.
+									bool extAdj = false;
+									for (const glm::ivec3 &off : voxel::arrayPathfinderFaces) {
+										const glm::ivec3 nb = worldPos + off;
+										uint8_t s;
+										if (chunk.inBounds(nb)) {
+											s = chunk.state[chunk.toIdx(nb)];
+										} else {
+											s = parent.cellState(toCellOrigin(nb, cs2));
+										}
+										if (s == kStateExterior || s == kStateBlocked) {
+											extAdj = true;
+											break;
+										}
+									}
+
+									// Set saw / keep bits in EACH owning node's bit array.
+									// Multi-node cs=2 cells: each owner gets bits for the
+									// voxels it actually owns at this position.
+									forEachCellOwner(parent, cs2Cell, [&](uint64_t nodeIdxU) {
+										const int nodeIdx = (int)nodeIdxU;
+										const NodeInfo &ni = nodes[(size_t)nodeIdx];
+										const voxel::Region &nodeRegion = ni.rv->region();
+										const glm::ivec3 local = transformPoint(ni.invWorldMat, worldPos);
+										if (!nodeRegion.containsPoint(local)) {
+											return;
+										}
+										// Per-node check: this owner may not actually have a
+										// voxel here even though some other owner does.
+										if (voxel::isAir(ni.rv->voxel(local).getMaterial())) {
+											return;
+										}
+										const int64_t heightVox = (int64_t)nodeRegion.getHeightInVoxels();
+										const int64_t depthVox  = (int64_t)nodeRegion.getDepthInVoxels();
+										const int64_t vIdx = (int64_t)(local.x - nodeRegion.getLowerX())
+															 * heightVox * depthVox
+													   + (int64_t)(local.y - nodeRegion.getLowerY())
+														 * depthVox
+													   + (int64_t)(local.z - nodeRegion.getLowerZ());
+										const int64_t byteIdx = vIdx >> 3;
+										const uint8_t bitMask = (uint8_t)(1u << (vIdx & 7));
+										__atomic_or_fetch(&nodeSawBits[(size_t)nodeIdx][(size_t)byteIdx],
+														  bitMask, __ATOMIC_RELAXED);
+										if (extAdj) {
+											__atomic_or_fetch(&nodeKeepBits[(size_t)nodeIdx][(size_t)byteIdx],
+															  bitMask, __ATOMIC_RELAXED);
+										}
+									});
+								}
+							}
+						}
+					}
+				}
+			}
+		});
+	logRSS("erode: after chunked cs=1 mark pass");
+
+	// Sequential per-node post-pass: clear any solid voxel whose keep bit
+	// was not set. RawVolume writes in the wrapper aren't documented as
+	// thread-safe, so we keep this serial. Per-node iteration cost scales
+	// with node voxel count; amortised across nodes this is O(total voxels).
+	uint64_t totalRemoved = 0;
+	uint64_t nodesTouched = 0;
+	for (int i = 0; i < totalNodes; ++i) {
+		if (g_rssCapTripped.load(std::memory_order_relaxed)) {
+			break;
+		}
+		const NodeInfo &ni = nodes[(size_t)i];
+		const voxel::Region &nodeRegion = ni.rv->region();
+		const core::DynamicArray<uint8_t> &keepBits = nodeKeepBits[(size_t)i];
+		const core::DynamicArray<uint8_t> &sawBits  = nodeSawBits[(size_t)i];
+		const int64_t heightVox = (int64_t)nodeRegion.getHeightInVoxels();
+		const int64_t depthVox  = (int64_t)nodeRegion.getDepthInVoxels();
+		voxel::RawVolumeWrapper wrapper(ni.rv);
+		uint64_t removedThisNode = 0;
+		uint64_t removedDisjointThisNode = 0;
+		for (int z = nodeRegion.getLowerZ(); z <= nodeRegion.getUpperZ(); ++z) {
+			for (int y = nodeRegion.getLowerY(); y <= nodeRegion.getUpperY(); ++y) {
+				for (int x = nodeRegion.getLowerX(); x <= nodeRegion.getUpperX(); ++x) {
+					const voxel::Voxel &v = ni.rv->voxel(x, y, z);
+					if (voxel::isAir(v.getMaterial())) {
+						continue;
+					}
+
+					// Disjoint-interior override: if the voxel's cs=N
+					// (= kErodeDisjointCellSize) cell was flagged disjoint by the
+					// refinement-chain hook, remove it regardless of saw/keep.
+					// Disjoint cells by definition only see int or solid neighbours,
+					// which is the user's "remove debris from inside the model"
+					// criterion. Lookup is O(1) into the bit array; the worldPos
+					// transform is the only per-voxel cost added.
+					if (disjointMap.populated) {
+						const glm::ivec3 worldPos = transformPoint(ni.worldMat, glm::ivec3(x, y, z));
+						if (disjointMap.isDisjoint(worldPos)) {
+							wrapper.setVoxel(x, y, z, voxel::Voxel());
+							++removedDisjointThisNode;
+							continue;
+						}
+					}
+
+					const int64_t vIdx = (int64_t)(x - nodeRegion.getLowerX()) * heightVox * depthVox
+									   + (int64_t)(y - nodeRegion.getLowerY()) * depthVox
+									   + (int64_t)(z - nodeRegion.getLowerZ());
+					const int64_t byteIdx = vIdx >> 3;
+					const uint8_t bitMask = (uint8_t)(1u << (vIdx & 7));
+					const bool saw  = (sawBits[(size_t)byteIdx]  & bitMask) != 0;
+					const bool keep = (keepBits[(size_t)byteIdx] & bitMask) != 0;
+					// Remove only if the chunk actually inspected this voxel as solid
+					// AND found no kStateExterior face-neighbor at cs=1. Voxels never
+					// seen by any chunk -- typically fillholes orphan plug voxels in
+					// nodes that share a cs=2 cell with another node, or voxels deeper
+					// in solid material than the chunk reach -- are left alone, which
+					// preserves the watertightness fillholes established.
+					if (saw && !keep) {
+						wrapper.setVoxel(x, y, z, voxel::Voxel());
+						++removedThisNode;
+					}
+				}
+			}
+		}
+		removedThisNode += removedDisjointThisNode;
+		if (removedThisNode > 0 && wrapper.dirtyRegion().isValid()) {
+			sceneMgr->modified(ni.nodeId, wrapper.dirtyRegion());
+			++nodesTouched;
+			totalRemoved += removedThisNode;
+		}
+	}
+
+	const double totalSecs = (double)(core::TimeProvider::systemMillis() - totalStartMs) / 1000.0;
+	if (g_rssCapTripped.load(std::memory_order_relaxed)) {
+		Log::warn("3dprint erode: aborted at %.1fs after %lu voxel(s) removed -- RSS cap (%g GB) tripped. "
+				  "Result is partial: some non-shell voxels remain. Free memory and rerun.",
+				  totalSecs, (unsigned long)totalRemoved, kHolefillRSSCapGB);
+	} else {
+		Log::info("3dprint erode: removed %lu voxel(s) across %lu node(s) in %.1fs -- kept exterior shell only.",
+				  (unsigned long)totalRemoved, (unsigned long)nodesTouched, totalSecs);
 	}
 }
 

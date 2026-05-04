@@ -120,11 +120,12 @@ static void runRecolor(SceneManager *sceneMgr, int packedRGB) {
 
 static void dispatch(SceneManager *sceneMgr, const command::CommandArgs &args) {
 	if (!args.has("subcommand")) {
-		Log::info("3dprint: usage: 3dprint <hello|fillholes|regrid|faceclassify|holemap|debugfrontier|recolor> [cellSize|maxHoleSize|colorIndex] [minSolidNeighbors] [debugColor]");
+		Log::info("3dprint: usage: 3dprint <hello|fillholes|erode|regrid|faceclassify|holemap|debugfrontier|recolor> [cellSize|maxHoleSize|colorIndex] [minSolidNeighbors] [debugColor]");
 		Log::info("         debugColor: palette index (0-255) for newly placed voxels, or -1 for cyan marker (default -1)");
 		Log::info("         all three commands mark new voxels with cyan by default so additions are visually inspectable");
 		Log::info("         regrid: rebucket all model nodes into world-aligned cellSize^3 cells (default 128)");
 		Log::info("         faceclassify: recolor all voxels: orange=outer surface, blue=inner cavity surface, magenta=thin wall, gray=buried");
+		Log::info("         erode: hollow the model -- keep only exterior-facing voxels at cs=1 precision (run fillholes first)");
 		return;
 	}
 	const core::String &sub = args.str("subcommand");
@@ -135,6 +136,13 @@ static void dispatch(SceneManager *sceneMgr, const command::CommandArgs &args) {
 	if (sub == "fillholes") {
 		const int minCellSize = args.intVal("maxHoleSize", 0);
 		runHoleFill(sceneMgr, minCellSize);
+		return;
+	}
+	if (sub == "erode") {
+		// maxHoleSize arg slot reused as minCellSize (deepest dense refinement,
+		// default cs=2; the chunked cs=1 driver always runs after).
+		const int minCellSize = args.intVal("maxHoleSize", 0);
+		runErode(sceneMgr, minCellSize);
 		return;
 	}
 	if (sub == "regrid") {
@@ -176,7 +184,7 @@ static void dispatch(SceneManager *sceneMgr, const command::CommandArgs &args) {
 
 void registerCommands(SceneManager *sceneMgr) {
 	command::Command::registerCommand("3dprint")
-		.addArg({"subcommand", command::ArgType::String, false, "", "hello|fillholes|regrid|faceclassify|holemap|debugfrontier|recolor"})
+		.addArg({"subcommand", command::ArgType::String, false, "", "hello|fillholes|erode|regrid|faceclassify|holemap|debugfrontier|recolor"})
 		.addArg({"maxHoleSize", command::ArgType::Int, true, "1000", "fillholes: optional minCellSize override for the dense pass (default cs=2; chunked cs=1 always runs after). regrid: cellSize (default 128). faceclassify/holemap: minCellSize."})
 		.addArg({"minSolidNeighbors", command::ArgType::Int, true, "3",
 				 "Min solid 6-neighbors for a hole seed (fillholes only)"})

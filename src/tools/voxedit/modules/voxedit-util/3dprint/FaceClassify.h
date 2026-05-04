@@ -25,6 +25,25 @@ void runHoleMap(SceneManager *sceneMgr, int minCellSize = 0);
 // Positions outside all node regions are skipped and logged.
 void runHoleFill(SceneManager *sceneMgr, int minCellSize = 0);
 
+// Erode: hollow the model down to its outward-facing shell. Removes any solid
+// voxel that is not face-adjacent (in cs=1 voxel space) to the global exterior.
+// Inner-cavity-facing voxels and buried voxels are removed; sealed cavities
+// merge into the surrounding bulk so the printed result is one big internal
+// hollow bounded by the original outer skin.
+//
+// minCellSize controls the deepest dense refinement (default 2). The chunked
+// cs=1 driver always runs after the dense pass; voxels far from any sub-cs=2
+// air feature classify as buried and are removed.
+//
+// Pre-condition: the model SHOULD be voxel-watertight (run '3dprint fillholes'
+// first). If the coarse exterior flood reaches every air cell (no enclosed
+// interior), erode warns and aborts -- otherwise it would just keep the entire
+// model since every solid voxel is exterior-facing at coarse scale.
+//
+// Undo is disabled inside this function: the rewrite scope (millions of voxels
+// across hundreds of nodes) makes the memento snapshot infeasible.
+void runErode(SceneManager *sceneMgr, int minCellSize = 0);
+
 // Debug: paint the BFS frontier shell at a given cellSize. Single-level BFS:
 // orange = exterior frontier, blue = interior frontier. cellSize controls the
 // resolution of the wrap; pass 0 for "auto = modal regridded width" (typically 128).
