@@ -1340,6 +1340,130 @@ TEST_F(SceneManagerTest, test3dPrintErode) {
 		<< "erode should have removed the buried center block and inner shell voxels";
 }
 
+TEST_F(SceneManagerTest, test3dPrintFlatBaseRaise) {
+	// 10 columns, 1 outlier at Y=0 and 9 at Y=3. With default trimPercent=10 the
+	// outlier (10% of 10 = 1 sample) is dropped, target Y = 3. The outlier column
+	// should be raised: voxel at Y=0 cleared, voxel placed at Y=3.
+	const voxel::Region region{0, 9};
+	ASSERT_TRUE(_sceneMgr->newScene(true, "flatbase_raise_test", region));
+	const int nodeId = _sceneMgr->sceneGraph().activeNode();
+	voxel::RawVolume *v = _sceneMgr->volume(nodeId);
+	ASSERT_NE(nullptr, v);
+
+	// Outlier column at (0, _, 0) with a single voxel at Y=0.
+	v->setVoxel(0, 0, 0, voxel::createVoxel(voxel::VoxelType::Generic, 1));
+	// 9 cluster columns at z=1, x=0..8, each with a single voxel at Y=3.
+	for (int x = 0; x <= 8; ++x) {
+		v->setVoxel(x, 3, 1, voxel::createVoxel(voxel::VoxelType::Generic, 1));
+	}
+
+	ASSERT_EQ(1, command::Command::execute("3dprint flatbase 5 10 -1"));
+
+	EXPECT_TRUE(voxel::isAir(v->voxel(0, 0, 0).getMaterial())) << "outlier voxel at Y=0 should be cleared";
+	EXPECT_FALSE(voxel::isAir(v->voxel(0, 3, 0).getMaterial())) << "outlier column should be capped at target Y=3";
+	for (int x = 0; x <= 8; ++x) {
+		EXPECT_FALSE(voxel::isAir(v->voxel(x, 3, 1).getMaterial())) << "cluster column x=" << x << " should be untouched";
+	}
+}
+
+TEST_F(SceneManagerTest, test3dPrintFlatBaseLower) {
+	// 1 column at Y=0, 9 columns at Y=3. With trimPercent=0 the target = global min = 0.
+	// The 9 high columns must be lowered: voxels added at Y=0,1,2 in each.
+	const voxel::Region region{0, 9};
+	ASSERT_TRUE(_sceneMgr->newScene(true, "flatbase_lower_test", region));
+	const int nodeId = _sceneMgr->sceneGraph().activeNode();
+	voxel::RawVolume *v = _sceneMgr->volume(nodeId);
+	ASSERT_NE(nullptr, v);
+
+	v->setVoxel(0, 0, 0, voxel::createVoxel(voxel::VoxelType::Generic, 1));
+	for (int x = 0; x <= 8; ++x) {
+		v->setVoxel(x, 3, 1, voxel::createVoxel(voxel::VoxelType::Generic, 1));
+	}
+
+	ASSERT_EQ(1, command::Command::execute("3dprint flatbase 5 0 -1"));
+
+	// The single low column unchanged.
+	EXPECT_FALSE(voxel::isAir(v->voxel(0, 0, 0).getMaterial())) << "low column should remain";
+	// Each high column should now be solid from Y=0 through Y=3.
+	for (int x = 0; x <= 8; ++x) {
+		for (int y = 0; y <= 3; ++y) {
+			EXPECT_FALSE(voxel::isAir(v->voxel(x, y, 1).getMaterial()))
+				<< "lowered column x=" << x << " expected solid at Y=" << y;
+		}
+	}
+}
+
+TEST_F(SceneManagerTest, test3dPrintFlatBaseOutliers) {
+	// Same fixture as the Raise test (1 outlier at Y=0, 9 cluster columns at Y=3) but
+	// run with trimPercent=0 to verify trimming actually changes the target plane.
+	// With no trim, target = 0 -> 9 columns lowered (the inverse of the Raise case).
+	const voxel::Region region{0, 9};
+	ASSERT_TRUE(_sceneMgr->newScene(true, "flatbase_outliers_test", region));
+	const int nodeId = _sceneMgr->sceneGraph().activeNode();
+	voxel::RawVolume *v = _sceneMgr->volume(nodeId);
+	ASSERT_NE(nullptr, v);
+
+	v->setVoxel(0, 0, 0, voxel::createVoxel(voxel::VoxelType::Generic, 1));
+	for (int x = 0; x <= 8; ++x) {
+		v->setVoxel(x, 3, 1, voxel::createVoxel(voxel::VoxelType::Generic, 1));
+	}
+
+	ASSERT_EQ(1, command::Command::execute("3dprint flatbase 5 0 -1"));
+
+	// Outlier column unchanged.
+	EXPECT_FALSE(voxel::isAir(v->voxel(0, 0, 0).getMaterial())) << "outlier column should remain at target Y=0";
+	// Each cluster column got voxels added down to Y=0.
+	for (int x = 0; x <= 8; ++x) {
+		EXPECT_FALSE(voxel::isAir(v->voxel(x, 0, 1).getMaterial()))
+			<< "cluster column x=" << x << " should be lowered to Y=0";
+	}
+}
+
+TEST_F(SceneManagerTest, test3dPrintFlatBaseNonBottomNodeIgnored) {
+	// Two-node scene: a base node at translation (0,0,0) and a tower node sitting far
+	// above (translation Y=20). The tower's regionMinWorldY is well outside slabThickness
+	// of the base, so flatbase must leave it untouched.
+	const voxel::Region region{0, 5};
+	ASSERT_TRUE(_sceneMgr->newScene(true, "flatbase_tower_test", region));
+	const int baseNodeId = _sceneMgr->sceneGraph().activeNode();
+	voxel::RawVolume *baseVol = _sceneMgr->volume(baseNodeId);
+	ASSERT_NE(nullptr, baseVol);
+
+	// Base columns: 1 outlier at Y=0, several at Y=2 -- so trim=10 will raise the outlier.
+	baseVol->setVoxel(0, 0, 0, voxel::createVoxel(voxel::VoxelType::Generic, 1));
+	for (int x = 1; x <= 5; ++x) {
+		baseVol->setVoxel(x, 2, 0, voxel::createVoxel(voxel::VoxelType::Generic, 1));
+	}
+	for (int x = 0; x <= 5; ++x) {
+		baseVol->setVoxel(x, 2, 1, voxel::createVoxel(voxel::VoxelType::Generic, 1));
+	}
+
+	// Tower node sitting 20 units above the base.
+	const int rootNodeId = _sceneMgr->sceneGraph().root().id();
+	scenegraph::SceneGraphNode towerNode(scenegraph::SceneGraphNodeType::Model);
+	towerNode.createVolume(region);
+	towerNode.setName("tower");
+	scenegraph::SceneGraphTransform towerTransform;
+	towerTransform.setWorldTranslation(glm::vec3(0.0f, 20.0f, 0.0f));
+	towerNode.keyFrame(0).setTransform(towerTransform);
+	const int towerNodeId = _sceneMgr->moveNodeToSceneGraph(towerNode, rootNodeId);
+	ASSERT_NE(InvalidNodeId, towerNodeId);
+	voxel::RawVolume *towerVol = _sceneMgr->volume(towerNodeId);
+	ASSERT_NE(nullptr, towerVol);
+	// Single tower-floor voxel at local Y=0 (world Y=20).
+	towerVol->setVoxel(0, 0, 0, voxel::createVoxel(voxel::VoxelType::Generic, 1));
+
+	ASSERT_EQ(1, command::Command::execute("3dprint flatbase 5 10 -1"));
+
+	// Tower must be untouched: still exactly one solid voxel at local (0,0,0).
+	EXPECT_FALSE(voxel::isAir(towerVol->voxel(0, 0, 0).getMaterial())) << "tower's original voxel must remain";
+	EXPECT_EQ(1, voxelutil::countVoxels(*towerVol)) << "tower should not gain any new voxels";
+
+	// Base outlier column raised to target Y=2 (after trim of the lone Y=0 sample).
+	EXPECT_TRUE(voxel::isAir(baseVol->voxel(0, 0, 0).getMaterial())) << "base outlier voxel should be cleared";
+	EXPECT_FALSE(voxel::isAir(baseVol->voxel(0, 2, 0).getMaterial())) << "base outlier column should land at target Y=2";
+}
+
 TEST_F(SceneManagerTest, testFill) {
 	const voxel::Region region{0, 3};
 	ASSERT_TRUE(_sceneMgr->newScene(true, "fill_test", region));

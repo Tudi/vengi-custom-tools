@@ -4,6 +4,7 @@
 
 #include "PrintCommands.h"
 #include "FaceClassify.h"
+#include "FlatBase.h"
 #include "Progress.h"
 #include "Regrid.h"
 
@@ -120,12 +121,13 @@ static void runRecolor(SceneManager *sceneMgr, int packedRGB) {
 
 static void dispatch(SceneManager *sceneMgr, const command::CommandArgs &args) {
 	if (!args.has("subcommand")) {
-		Log::info("3dprint: usage: 3dprint <hello|fillholes|erode|regrid|faceclassify|holemap|debugfrontier|recolor> [cellSize|maxHoleSize|colorIndex] [minSolidNeighbors] [debugColor]");
+		Log::info("3dprint: usage: 3dprint <hello|fillholes|erode|regrid|faceclassify|holemap|debugfrontier|recolor|flatbase> [cellSize|maxHoleSize|colorIndex|slabThickness] [minSolidNeighbors|trimPercent] [debugColor]");
 		Log::info("         debugColor: palette index (0-255) for newly placed voxels, or -1 for cyan marker (default -1)");
 		Log::info("         all three commands mark new voxels with cyan by default so additions are visually inspectable");
 		Log::info("         regrid: rebucket all model nodes into world-aligned cellSize^3 cells (default 128)");
 		Log::info("         faceclassify: recolor all voxels: orange=outer surface, blue=inner cavity surface, magenta=thin wall, gray=buried");
 		Log::info("         erode: hollow the model -- keep only exterior-facing voxels at cs=1 precision (run fillholes first)");
+		Log::info("         flatbase: voxel-perfect flat min-Y plane across all bottom nodes. Args: slabThickness=5, trimPercent=10, debugColor=-1");
 		return;
 	}
 	const core::String &sub = args.str("subcommand");
@@ -177,6 +179,31 @@ static void dispatch(SceneManager *sceneMgr, const command::CommandArgs &args) {
 		runRecolor(sceneMgr, packedRGB);
 		return;
 	}
+	if (sub == "flatbase") {
+		// The maxHoleSize / minSolidNeighbors arg slots are shared across every
+		// 3dprint subcommand and carry global registered defaults of "1000" and
+		// "3" (those values were chosen for fillholes). Command::parseArgs
+		// pre-populates those defaults into the args map when the user omits
+		// them, so a plain `args.intVal("maxHoleSize", 5)` would always return
+		// 1000 -- the registered default -- and the per-subcommand fallback
+		// would never fire. Detect the registered-default leak and substitute
+		// flatbase's own defaults instead. Caveat: this means an explicit
+		// `flatbase 1000 3` is treated as defaults; 1000-voxel slabs and 3%
+		// trim are nonsense for this command anyway.
+		int slabThickness = 5;
+		int trimPercent = 10;
+		const core::String &slabStr = args.str("maxHoleSize");
+		if (!slabStr.empty() && slabStr != "1000") {
+			slabThickness = slabStr.toInt();
+		}
+		const core::String &trimStr = args.str("minSolidNeighbors");
+		if (!trimStr.empty() && trimStr != "3") {
+			trimPercent = trimStr.toInt();
+		}
+		const int debugColor = args.intVal("debugColor", -1);
+		runFlatBase(sceneMgr, slabThickness, trimPercent, debugColor);
+		return;
+	}
 	Log::warn("3dprint: unknown subcommand '%s'", sub.c_str());
 }
 
@@ -184,14 +211,14 @@ static void dispatch(SceneManager *sceneMgr, const command::CommandArgs &args) {
 
 void registerCommands(SceneManager *sceneMgr) {
 	command::Command::registerCommand("3dprint")
-		.addArg({"subcommand", command::ArgType::String, false, "", "hello|fillholes|erode|regrid|faceclassify|holemap|debugfrontier|recolor"})
-		.addArg({"maxHoleSize", command::ArgType::Int, true, "1000", "fillholes: optional minCellSize override for the dense pass (default cs=2; chunked cs=1 always runs after). regrid: cellSize (default 128). faceclassify/holemap: minCellSize."})
+		.addArg({"subcommand", command::ArgType::String, false, "", "hello|fillholes|erode|regrid|faceclassify|holemap|debugfrontier|recolor|flatbase"})
+		.addArg({"maxHoleSize", command::ArgType::Int, true, "1000", "fillholes: optional minCellSize override for the dense pass (default cs=2; chunked cs=1 always runs after). regrid: cellSize (default 128). faceclassify/holemap: minCellSize. flatbase: slabThickness (default 5)."})
 		.addArg({"minSolidNeighbors", command::ArgType::Int, true, "3",
-				 "Min solid 6-neighbors for a hole seed (fillholes only)"})
+				 "Min solid 6-neighbors for a hole seed (fillholes). For flatbase: trimPercent (default 10)."})
 		.addArg({"debugColor", command::ArgType::Int, true, "-1",
 				 "Palette index (0-255) to force-colorize newly placed voxels, or -1 for auto"})
 		.setHandler([sceneMgr](const command::CommandArgs &args) { dispatch(sceneMgr, args); })
-		.setHelp(_("3D print preparation commands. Usage: 3dprint <hello|fillholes|regrid|faceclassify> [args...]"));
+		.setHelp(_("3D print preparation commands. Usage: 3dprint <hello|fillholes|regrid|faceclassify|flatbase> [args...]"));
 }
 
 } // namespace printing
