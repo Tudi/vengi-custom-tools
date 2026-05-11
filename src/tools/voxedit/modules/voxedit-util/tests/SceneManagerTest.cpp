@@ -1340,6 +1340,91 @@ TEST_F(SceneManagerTest, test3dPrintErode) {
 		<< "erode should have removed the buried center block and inner shell voxels";
 }
 
+TEST_F(SceneManagerTest, test3dPrintThicken) {
+	// 21x21x21 hollow shell. Thicken should add a 1-voxel-thick interior layer,
+	// strictly increasing the total solid voxel count.
+	const voxel::Region region{0, 20};
+	ASSERT_TRUE(_sceneMgr->newScene(true, "3dprint_thicken_test", region));
+	const int nodeId = _sceneMgr->sceneGraph().activeNode();
+	voxel::RawVolume *v = _sceneMgr->volume(nodeId);
+	ASSERT_NE(nullptr, v);
+
+	for (int x = 0; x <= 20; ++x) {
+		for (int y = 0; y <= 20; ++y) {
+			for (int z = 0; z <= 20; ++z) {
+				const bool onShell = (x == 0 || x == 20 || y == 0 || y == 20 || z == 0 || z == 20);
+				if (onShell) {
+					v->setVoxel(x, y, z, voxel::createVoxel(voxel::VoxelType::Generic, 1));
+				}
+			}
+		}
+	}
+
+	ASSERT_EQ(1, command::Command::execute("3dprint regrid 3"));
+	const int64_t voxelsBefore = totalSolidVoxelsAcrossScene(_sceneMgr->sceneGraph());
+	ASSERT_GT(voxelsBefore, 0);
+	ASSERT_EQ(1, command::Command::execute("3dprint thicken"));
+	const int64_t voxelsAfter = totalSolidVoxelsAcrossScene(_sceneMgr->sceneGraph());
+	EXPECT_GT(voxelsAfter, voxelsBefore)
+		<< "thicken should have added an interior wall layer";
+}
+
+TEST_F(SceneManagerTest, test3dPrintThickenSolidBlockIsNoop) {
+	// Fully solid block: no enclosed interior at coarse scale -> thicken
+	// warns and returns. Voxel count unchanged.
+	const voxel::Region region{0, 20};
+	ASSERT_TRUE(_sceneMgr->newScene(true, "3dprint_thicken_solid_test", region));
+	const int nodeId = _sceneMgr->sceneGraph().activeNode();
+	voxel::RawVolume *v = _sceneMgr->volume(nodeId);
+	ASSERT_NE(nullptr, v);
+
+	for (int x = 0; x <= 20; ++x) {
+		for (int y = 0; y <= 20; ++y) {
+			for (int z = 0; z <= 20; ++z) {
+				v->setVoxel(x, y, z, voxel::createVoxel(voxel::VoxelType::Generic, 1));
+			}
+		}
+	}
+
+	ASSERT_EQ(1, command::Command::execute("3dprint regrid 3"));
+	const int64_t voxelsBefore = totalSolidVoxelsAcrossScene(_sceneMgr->sceneGraph());
+	ASSERT_EQ(1, command::Command::execute("3dprint thicken"));
+	const int64_t voxelsAfter = totalSolidVoxelsAcrossScene(_sceneMgr->sceneGraph());
+	EXPECT_EQ(voxelsBefore, voxelsAfter)
+		<< "thicken on a fully-solid block has nothing to plug";
+}
+
+TEST_F(SceneManagerTest, test3dPrintThickenRepeatedGrowsWall) {
+	// Each thicken pass adds one cs=1 layer to the inside of the wall. Two
+	// passes should each grow the count -- the second pass operates on the
+	// shell that is now one voxel thicker but still has interior to consume.
+	const voxel::Region region{0, 20};
+	ASSERT_TRUE(_sceneMgr->newScene(true, "3dprint_thicken_repeat_test", region));
+	const int nodeId = _sceneMgr->sceneGraph().activeNode();
+	voxel::RawVolume *v = _sceneMgr->volume(nodeId);
+	ASSERT_NE(nullptr, v);
+
+	for (int x = 0; x <= 20; ++x) {
+		for (int y = 0; y <= 20; ++y) {
+			for (int z = 0; z <= 20; ++z) {
+				const bool onShell = (x == 0 || x == 20 || y == 0 || y == 20 || z == 0 || z == 20);
+				if (onShell) {
+					v->setVoxel(x, y, z, voxel::createVoxel(voxel::VoxelType::Generic, 1));
+				}
+			}
+		}
+	}
+
+	ASSERT_EQ(1, command::Command::execute("3dprint regrid 3"));
+	const int64_t v0 = totalSolidVoxelsAcrossScene(_sceneMgr->sceneGraph());
+	ASSERT_EQ(1, command::Command::execute("3dprint thicken"));
+	const int64_t v1 = totalSolidVoxelsAcrossScene(_sceneMgr->sceneGraph());
+	EXPECT_GT(v1, v0) << "first thicken pass should add voxels";
+	ASSERT_EQ(1, command::Command::execute("3dprint thicken"));
+	const int64_t v2 = totalSolidVoxelsAcrossScene(_sceneMgr->sceneGraph());
+	EXPECT_GT(v2, v1) << "second thicken pass should still add voxels (deeper interior layer)";
+}
+
 TEST_F(SceneManagerTest, test3dPrintFlatBaseRaise) {
 	// 10 columns, 1 outlier at Y=0 and 9 at Y=3. With default trimPercent=10 the
 	// outlier (10% of 10 = 1 sample) is dropped, target Y = 3. The outlier column

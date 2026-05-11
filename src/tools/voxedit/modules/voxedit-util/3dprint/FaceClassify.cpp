@@ -682,7 +682,7 @@ static void initFineFromPrev(Level &fine, const Level &prev) {
 									100.0 * (double)globalDone / (double)totalS,
 									(double)(now - startMs) / 1000.0,
 									rssGB());
-							fflush(stderr);
+
 						}
 						checkRSSCap("initFineFromPrev heartbeat");
 					}
@@ -768,7 +768,7 @@ static void buildFrontiers(const Level &lvl,
 									100.0 * (double)globalDone / (double)totalS,
 									(double)(now - startMs) / 1000.0,
 									rssGB());
-							fflush(stderr);
+
 						}
 						checkRSSCap("buildFrontiers heartbeat");
 					}
@@ -831,7 +831,7 @@ static core::DynamicArray<glm::ivec3> runBidirectionalBFS(Level &lvl) {
 						(int)bfsRound, extFrontier.size(), intFrontier.size(),
 						holeCells.size(), (double)(nowMs - bfsStartMs) / 1000.0,
 						rssGB());
-				fflush(stderr);
+
 			}
 			if (checkRSSCap("BFS round heartbeat")) {
 				return holeCells;
@@ -915,7 +915,9 @@ static FillStats applyHoleFills(
 		const Level &lookup,
 		core::DynamicArray<NodeInfo> &nodes,
 		SceneManager *sceneMgr,
-		int finalCellSize);
+		int finalCellSize,
+		const color::RGBA &fillColor = color::RGBA(0, 220, 0, 255),
+		const char *orphanNodeName = "holefill_orphan");
 
 // =====================================================================
 // Wall-walking chunked cs=1 pass.
@@ -1295,8 +1297,24 @@ static core::DynamicArray<ChunkBox> seedChunks(
 	// in the overlap zone anchor their own chunks; their bboxes overlap chunk
 	// A's overlap heavily but extend coverage past A's far edge -- the wall is
 	// in chunk B's bbox.
-	const int defaultCoverHalf  = kHolefillChunkVoxels / 2;
-	const int expandedCoverHalf = kHolefillChunkMaxVox / 2;
+	//
+	// Second subtle constraint -- cover-half must be STRICTLY less than core-half
+	// (chunkVoxels/2), not equal. With cover-half == core-half, the minimum
+	// permitted chebyshev distance between two seeds is core-half + 1 (since the
+	// cover check uses '<= cover-half' inclusive). When two seeds land at that
+	// minimum distance along TWO axes simultaneously (a "diagonal corner"), the
+	// voxel at chebyshev = core-half + 1 from BOTH seeds falls outside BOTH cores
+	// -- it sits one voxel past each core's boundary in one of the two axes.
+	// Tiling gap. With cover-half = core-half - 1, the minimum permitted seed
+	// spacing drops to core-half, which equals the core's reach, so the diagonal
+	// corner voxel sits exactly on each seed's core boundary and is covered.
+	// Observed in the gothic model: a 17-voxel-wide strip of wall voxels at
+	// Y=-1763 was skipped because no chunk core covered it -- ci=168 core ended
+	// at Y=-1762 and ci=265 core started at Y=-1764, and the diagonal seeds (at
+	// chebyshev 65 in both Y and Z) couldn't be filled with an intermediate seed
+	// because the cover boxes had already marked the spots as covered.
+	const int defaultCoverHalf  = kHolefillChunkVoxels / 2 - 1;
+	const int expandedCoverHalf = kHolefillChunkMaxVox / 2 - 1;
 
 	uint64_t skippedCovered = 0;
 	uint64_t skippedNoOpposite = 0;
@@ -1423,7 +1441,7 @@ static void runChunkedCs1Driver(
 							callerTag, (long long)done, totalChunks,
 							100.0 * (double)done / (double)totalChunks,
 							(double)(now - startMs) / 1000.0, rssGB());
-					fflush(stderr);
+
 				}
 				checkRSSCap("chunked cs=1 heartbeat");
 			}
@@ -2496,12 +2514,13 @@ static FillStats applyHoleFills(
 		const Level &lookup,
 		core::DynamicArray<NodeInfo> &nodes,
 		SceneManager *sceneMgr,
-		int finalCellSize) {
+		int finalCellSize,
+		const color::RGBA &fillColor,
+		const char *orphanNodeName) {
 
 	FillStats stats;
 	if (holeCells.empty() && holeVoxels.empty()) return stats;
 
-	static constexpr color::RGBA kFillColor(0, 220, 0, 255);
 	scenegraph::SceneGraph &graph = sceneMgr->sceneGraph();
 
 	struct FillPos {
@@ -2566,24 +2585,95 @@ static FillStats applyHoleFills(
 		}
 	}
 
-	for (const glm::ivec3 &holeVoxel : holeVoxels) {
-		const glm::ivec3 holeCell = toCellOrigin(holeVoxel, finalCellSize);
-		int bestNodeIdx = -1;
-		int bestDistSq = INT_MAX;
-		considerOwnersForPlug(holeCell, holeVoxel, bestNodeIdx, bestDistSq);
-		for (const glm::ivec3 &off : voxel::arrayPathfinderFaces) {
-			considerOwnersForPlug(holeCell + off * finalCellSize, holeVoxel, bestNodeIdx, bestDistSq);
-		}
-		if (bestNodeIdx < 0) {
-			orphanVoxels.push_back(holeVoxel);
-			continue;
-		}
-		fills.push_back({bestNodeIdx,
-						 transformPoint(nodes[(size_t)bestNodeIdx].invWorldMat, holeVoxel)});
+	// Per-voxel owner search is independent across plugs, so run it in parallel
+	// with a sentinel-slot scheme: each thread writes to a fixed index in
+	// `fillsParallel`, using nodeIdx=-1 to mark an orphan. After the parallel
+	// region we compact serially. This is a hot path for thicken (millions of
+	// plugs); fillholes' typical workload (thousands) sees a small overhead.
+	//
+	// Heartbeat: log every ~3 s so the user sees progress instead of a freeze.
+	struct ParallelFill {
+		int nodeIdx;
+		glm::ivec3 localPos;
+	};
+	const int holeVoxelCount = (int)holeVoxels.size();
+	core::DynamicArray<ParallelFill> fillsParallel;
+	fillsParallel.resize((size_t)holeVoxelCount);
+	const uint64_t ownerPhaseStartMs = core::TimeProvider::systemMillis();
+	if (holeVoxelCount > 0) {
+		std::atomic<int64_t> processedAtomic{0};
+		std::atomic<uint64_t> lastLogMs{ownerPhaseStartMs};
+		app::for_parallel(0, holeVoxelCount, [&](int start, int end) {
+			for (int i = start; i < end; ++i) {
+				const glm::ivec3 &holeVoxel = holeVoxels[(size_t)i];
+				const glm::ivec3 holeCell = toCellOrigin(holeVoxel, finalCellSize);
+				int bestNodeIdx = -1;
+				int bestDistSq = INT_MAX;
+				considerOwnersForPlug(holeCell, holeVoxel, bestNodeIdx, bestDistSq);
+				for (const glm::ivec3 &off : voxel::arrayPathfinderFaces) {
+					considerOwnersForPlug(holeCell + off * finalCellSize, holeVoxel, bestNodeIdx, bestDistSq);
+				}
+				if (bestNodeIdx < 0) {
+					fillsParallel[(size_t)i] = {-1, glm::ivec3(0)};
+				} else {
+					fillsParallel[(size_t)i] = {bestNodeIdx,
+												transformPoint(nodes[(size_t)bestNodeIdx].invWorldMat, holeVoxel)};
+				}
+			}
+			const int64_t done = processedAtomic.fetch_add(end - start, std::memory_order_relaxed) + (end - start);
+			const uint64_t now = core::TimeProvider::systemMillis();
+			uint64_t prevMs = lastLogMs.load(std::memory_order_relaxed);
+			if (now - prevMs >= 3000u && lastLogMs.compare_exchange_strong(prevMs, now)) {
+				fprintf(stderr, "[applyHoleFills] owner-search %lld/%d (%.1f%%) elapsed=%.1fs\n",
+						(long long)done, holeVoxelCount,
+						100.0 * (double)done / (double)holeVoxelCount,
+						(double)(now - ownerPhaseStartMs) / 1000.0);
+
+			}
+		});
+	}
+	const double ownerPhaseSecs = (double)(core::TimeProvider::systemMillis() - ownerPhaseStartMs) / 1000.0;
+	if (holeVoxelCount > 1000000 || ownerPhaseSecs > 1.0) {
+		Log::info("3dprint applyHoleFills: parallel owner search done in %.1fs (%d plug voxel(s))",
+				  ownerPhaseSecs, holeVoxelCount);
 	}
 
-	fills.sort([](const FillPos &a, const FillPos &b) { return a.nodeIdx < b.nodeIdx; });
+	// Compact: split into fills + orphans. The serial pass is O(N) and runs
+	// at memory-bandwidth speed -- not the bottleneck.
+	const uint64_t compactStartMs = core::TimeProvider::systemMillis();
+	for (int i = 0; i < holeVoxelCount; ++i) {
+		const ParallelFill &pf = fillsParallel[(size_t)i];
+		if (pf.nodeIdx < 0) {
+			orphanVoxels.push_back(holeVoxels[(size_t)i]);
+		} else {
+			fills.push_back({pf.nodeIdx, pf.localPos});
+		}
+	}
+	fillsParallel.release();
+	const double compactSecs = (double)(core::TimeProvider::systemMillis() - compactStartMs) / 1000.0;
+	if (holeVoxelCount > 1000000 || compactSecs > 1.0) {
+		Log::info("3dprint applyHoleFills: compact done in %.1fs (fills=%zu orphans=%zu)",
+				  compactSecs, fills.size(), orphanVoxels.size());
+	}
 
+	const uint64_t sortStartMs = core::TimeProvider::systemMillis();
+	// core::DynamicArray::sort is insertion sort (O(N^2)) -- unusable at the
+	// thicken scale (45M plugs would take days). Use std::sort = introsort
+	// (O(N log N)) on raw pointers (DynamicArray's iterator lacks
+	// iterator_traits so std::sort can't deduce difference_type from it).
+	if (!fills.empty()) {
+		FillPos *fillsBegin = &fills[0];
+		FillPos *fillsEnd = fillsBegin + fills.size();
+		std::sort(fillsBegin, fillsEnd,
+				  [](const FillPos &a, const FillPos &b) { return a.nodeIdx < b.nodeIdx; });
+	}
+	const double sortSecs = (double)(core::TimeProvider::systemMillis() - sortStartMs) / 1000.0;
+	if (fills.size() > 1000000 || sortSecs > 1.0) {
+		Log::info("3dprint applyHoleFills: sort done in %.1fs (%zu fills)", sortSecs, fills.size());
+	}
+
+	const uint64_t writeStartMs = core::TimeProvider::systemMillis();
+	std::atomic<uint64_t> writeLastLogMs{writeStartMs};
 	int fillIdx = 0;
 	while (fillIdx < (int)fills.size()) {
 		const int curNode = fills[(size_t)fillIdx].nodeIdx;
@@ -2602,7 +2692,7 @@ static FillStats applyHoleFills(
 		scenegraph::SceneGraphNode &node = graph.node(nodeId);
 		palette::Palette &pal = node.palette();
 		uint8_t fillColorIdx = 0;
-		pal.tryAdd(kFillColor, true, &fillColorIdx, true);
+		pal.tryAdd(fillColor, true, &fillColorIdx, true);
 		voxel::RawVolumeWrapper wrapper(nodes[(size_t)curNode].rv);
 		while (fillIdx < (int)fills.size() && fills[(size_t)fillIdx].nodeIdx == curNode) {
 			const glm::ivec3 &localPos = fills[(size_t)fillIdx].localPos;
@@ -2616,9 +2706,26 @@ static FillStats applyHoleFills(
 			sceneMgr->modified(nodeId, wrapper.dirtyRegion());
 			++stats.nodesTouched;
 		}
+		// Heartbeat every ~3 s for the per-node write loop.
+		const uint64_t now = core::TimeProvider::systemMillis();
+		uint64_t prevMs = writeLastLogMs.load(std::memory_order_relaxed);
+		if (now - prevMs >= 3000u && writeLastLogMs.compare_exchange_strong(prevMs, now)) {
+			fprintf(stderr, "[applyHoleFills] writes %d/%d (%.1f%%) elapsed=%.1fs\n",
+					fillIdx, (int)fills.size(),
+					100.0 * (double)fillIdx / (double)fills.size(),
+					(double)(now - writeStartMs) / 1000.0);
+
+		}
+	}
+	const double writeSecs = (double)(core::TimeProvider::systemMillis() - writeStartMs) / 1000.0;
+	if (fills.size() > 1000000 || writeSecs > 1.0) {
+		Log::info("3dprint applyHoleFills: per-node writes done in %.1fs (filled=%lu touched=%lu resized=%lu)",
+				  writeSecs, (unsigned long)stats.totalFilled,
+				  (unsigned long)stats.nodesTouched, (unsigned long)stats.nodesResized);
 	}
 
 	if (!orphanVoxels.empty()) {
+		const uint64_t orphanStartMs = core::TimeProvider::systemMillis();
 		static constexpr int kBinSize = 64;
 		using Bin = core::DynamicArray<glm::ivec3>;
 		std::unordered_map<glm::ivec3, Bin, glm::hash<glm::ivec3>> bins;
@@ -2646,7 +2753,7 @@ static FillStats applyHoleFills(
 			voxel::RawVolume *vol = new voxel::RawVolume(region);
 			palette::Palette pal;
 			uint8_t fillColorIdx = 0;
-			pal.tryAdd(kFillColor, true, &fillColorIdx, true);
+			pal.tryAdd(fillColor, true, &fillColorIdx, true);
 			const voxel::Voxel fillVoxel = voxel::createVoxel(voxel::VoxelType::Generic, fillColorIdx);
 			for (const glm::ivec3 &p : voxels) {
 				vol->setVoxelUnsafe(p - mn, fillVoxel);
@@ -2654,13 +2761,18 @@ static FillStats applyHoleFills(
 			}
 			scenegraph::SceneGraphNode newNode(scenegraph::SceneGraphNodeType::Model);
 			newNode.setVolume(vol);
-			newNode.setName("holefill_orphan");
+			newNode.setName(orphanNodeName);
 			newNode.setPalette(pal);
 			scenegraph::SceneGraphTransform transform;
 			transform.setWorldTranslation(glm::vec3(mn));
 			newNode.setTransform(0, transform);
 			sceneMgr->moveNodeToSceneGraph(newNode, 0);
 			++stats.orphanNodes;
+		}
+		const double orphanSecs = (double)(core::TimeProvider::systemMillis() - orphanStartMs) / 1000.0;
+		if (orphanVoxels.size() > 100000 || orphanSecs > 1.0) {
+			Log::info("3dprint applyHoleFills: orphan binning done in %.1fs (%zu voxels into %d node(s))",
+					  orphanSecs, orphanVoxels.size(), stats.orphanNodes);
 		}
 	}
 
@@ -3302,6 +3414,287 @@ void runErode(SceneManager *sceneMgr, int minCellSize) {
 	} else {
 		Log::info("3dprint erode: removed %lu voxel(s) across %lu node(s) in %.1fs -- kept exterior shell only.",
 				  (unsigned long)totalRemoved, (unsigned long)nodesTouched, totalSecs);
+	}
+}
+
+// Wall-thickening pass. For each cs=1 voxel V with state==kStateInterior that
+// has at least one face-neighbor with state==kStateSolid, plug V with a solid
+// voxel (kThickenColor). One invocation adds a single 1-voxel layer to the
+// inside of every interior-facing wall. The user can rerun for thicker walls.
+//
+// Two geometric cases this single rule covers:
+//   1. "Air gap inside a Solid cs=2 cell, on the interior side" -- when a wall
+//      has < 2 voxel-thick coverage on the interior face of its containing
+//      cs=2 cell, the empty cs=1 voxel is BFS-classified Interior and lies
+//      face-flush against the wall voxel. We plug it.
+//   2. "Wall is flush with the cs=2 boundary, no air inside the Solid cell" --
+//      the adjacent Interior cs=2 cell's nearest cs=1 voxel sits face-adjacent
+//      to a Solid wall voxel across the cs=2 boundary. We plug there instead.
+//
+// Pre-conditions, in order of importance:
+//   - Run after '3dprint fillholes' so the model is voxel-watertight and the
+//     cs=2 ext/int classification doesn't leak (otherwise thicken would lay
+//     voxels along leak paths instead of just on real interior walls).
+//   - Run before '3dprint erode' if both are wanted -- erode would strip the
+//     newly added interior layer.
+//
+// Undo is disabled inside this function: same precedent as fillholes/erode --
+// the rewrite scope is too large for memento snapshots.
+void runThicken(SceneManager *sceneMgr, int minCellSize) {
+	g_rssCapTripped.store(false);
+	logRSS("entry to runThicken");
+	const uint64_t totalStartMs = core::TimeProvider::systemMillis();
+
+	memento::ScopedMementoHandlerLock mementoLock(sceneMgr->mementoHandler());
+
+	core::DynamicArray<NodeInfo> nodes;
+	Level coarse;
+	const CoarseShellResult shell = buildCoarseShell(sceneMgr, "thicken", nodes, coarse);
+	if (!shell.ok) {
+		return;
+	}
+	const int coarseCellSize = shell.coarseCellSize;
+	const glm::ivec3 gridLower = shell.gridLower;
+	const glm::ivec3 gridUpper = shell.gridUpper;
+	if (minCellSize <= 0 || minCellSize >= coarseCellSize) {
+		minCellSize = 2;
+	}
+	if (shell.intCount == 0) {
+		Log::warn("3dprint thicken: no enclosed interior at coarse scale (cs=%d). The model has no sealed cavity, "
+				  "so there is no interior wall surface to thicken. Run '3dprint fillholes' first to seal the "
+				  "model. Aborting.",
+				  coarseCellSize);
+		return;
+	}
+
+	Level prev;
+	buildRefinedShell(coarse, minCellSize, gridLower, gridUpper, nodes, "thicken", prev);
+
+	// Build cs=2 ext/int frontiers for the chunked cs=1 driver. wrapSolid=true
+	// so the frontiers are solid-cell-adjacent and ext/int both contribute.
+	core::DynamicArray<size_t> chunkExtFront;
+	core::DynamicArray<size_t> chunkIntFront;
+	const uint64_t frontierStartMs = core::TimeProvider::systemMillis();
+	buildFrontiers(prev, chunkExtFront, chunkIntFront, /*wrapSolid=*/true);
+	const double frontierSecs = (double)(core::TimeProvider::systemMillis() - frontierStartMs) / 1000.0;
+	if (k3DPrintVerbose) {
+		Log::info("3dprint thicken: ext/int front built in %.1fs (ext=%zu int=%zu)",
+				  frontierSecs, chunkExtFront.size(), chunkIntFront.size());
+	}
+
+	// requireOppositeFront=false: thicken visits every interior wall surface,
+	// not just leak-contact points. A chunk anchored on an int-front cell deep
+	// inside a thick cavity does NOT need an ext-front in its bbox -- the cs=1
+	// BFS still classifies Interior cs=1 voxels correctly from the intFrontier
+	// alone, and the plug rule (Interior cs=1 with face-neighbor Solid) doesn't
+	// need ext-side disambiguation. Same rationale as erode and faceclassify;
+	// only fillholes requires both shells (it's specifically detecting ext<->int
+	// contact). Skipping chunks with requireOppositeFront=true left isolated
+	// gaps wherever the wall was thicker than the expanded chunk reach.
+	core::DynamicArray<ChunkBox> chunks = seedChunks(prev, chunkExtFront, chunkIntFront,
+													  /*requireOppositeFront=*/false);
+	if (chunks.empty()) {
+		Log::info("3dprint thicken: no thickenable interior wall surface found (no chunks seeded).");
+		return;
+	}
+
+	const Level &parent = prev;
+	core::DynamicArray<core::DynamicArray<glm::ivec3>> perChunkPlugs;
+	perChunkPlugs.resize(chunks.size());
+	std::atomic<int64_t> totalRawPlugs{0};
+	std::atomic<int64_t> totalBlockedPlugs{0};
+
+	runChunkedCs1Driver(chunks, parent, nodes, "thicken", core::TimeProvider::systemMillis(),
+		[&](Level &chunk, core::DynamicArray<glm::ivec3> &chunkHoles, int ci) {
+			(void)chunkHoles;
+			// Plug rule: cs=1 cell V with state in {kStateInterior, kStateBlocked}
+			// that has at least one face-neighbor with state==kStateSolid.
+			//
+			// Why Blocked: the cs=1 BFS marks a cell Blocked when ext-bfs and
+			// int-bfs meet inside it. Globally (post-fillholes) the model is
+			// voxel-watertight so there are no real leaks -- but the chunk's
+			// LOCAL view can still produce a phantom leak where its bbox cuts
+			// through a wall corner. The wall continues outside the bbox; the
+			// chunk sees only one side of it; ext-bfs walks around the missing
+			// piece into int territory. The int-bulk cell it touches first
+			// gets marked Blocked instead of staying Interior, so the strict
+			// "state == Interior" rule used to skip it. Including Blocked
+			// recovers those cells. The cs=2 cell filter (only Interior or
+			// Solid-with-Interior-neighbor cells are scanned) keeps this from
+			// over-plugging genuinely exterior cells.
+			//
+			// Skip Empty (probe-zone-unreachable; sealed bubbles) and Exterior.
+			//
+			// Three perf rules govern the loop layout below:
+			//   1. Confine the scan to the chunk's CORE (bbox shrunk by
+			//      kHolefillChunkOverlap each side). The overlap zone is shared
+			//      with adjacent chunks' cores, so emitting plugs there
+			//      duplicates work 5-8x. seedChunks already guarantees every
+			//      front cs=2 cell is inside some chunk's core, so plug
+			//      candidates near those cells are too.
+			//   2. Bound the cs=1 scan by parent cs=2 cells of interest. Plug
+			//      candidates only live in cs=2 cells classified Interior or
+			//      Solid-with-an-Interior-face-neighbor (after fillholes the
+			//      model is voxel-watertight, so other Solid cells provably
+			//      have no Interior cs=1 voxels inside them).
+			//   3. State array is X-major (toIdx = ix*dimY*dimZ + iy*dimZ + iz),
+			//      so the cache-friendly inner axis is z. Per cs=2 cell we
+			//      iterate at most 2x2x2 cs=1 voxels in (x,y,z) order; each
+			//      cs=1 cell uses chunk.toIdx() so the strides are correct.
+			core::DynamicArray<glm::ivec3> &out = perChunkPlugs[(size_t)ci];
+			// Upper-bound reserve: surface area of the chunk (cs=1 voxels).
+			const size_t surfaceUpperBound = (size_t)(chunk.dimX * chunk.dimY
+													  + chunk.dimY * chunk.dimZ
+													  + chunk.dimX * chunk.dimZ) * 2;
+			out.reserve(surfaceUpperBound);
+
+			const int cs2 = parent.cellSize;
+			const glm::ivec3 chunkLower = chunk.gridLower;
+			const glm::ivec3 chunkUpper = chunkLower + glm::ivec3(chunk.dimX - 1, chunk.dimY - 1, chunk.dimZ - 1);
+			// Core = bbox shrunk by kHolefillChunkOverlap each side. The chunk
+			// state array is still populated over the FULL bbox by chunkInitFromParent
+			// (so face-neighbour reads near the core boundary remain in-bbox); we
+			// only restrict the EMIT range.
+			const glm::ivec3 coreLower = chunkLower + glm::ivec3(kHolefillChunkOverlap);
+			const glm::ivec3 coreUpper = chunkUpper - glm::ivec3(kHolefillChunkOverlap);
+			const glm::ivec3 cs2Lower = toCellOrigin(coreLower, cs2);
+			const glm::ivec3 cs2Upper = toCellOrigin(coreUpper, cs2);
+			int64_t localCount = 0;
+			int64_t localBlocked = 0;
+			for (int cx = cs2Lower.x; cx <= cs2Upper.x; cx += cs2) {
+				for (int cy = cs2Lower.y; cy <= cs2Upper.y; cy += cs2) {
+					for (int cz = cs2Lower.z; cz <= cs2Upper.z; cz += cs2) {
+						const glm::ivec3 cs2Cell(cx, cy, cz);
+						const uint8_t parentState = parent.cellState(cs2Cell);
+
+						// Skip only cells that provably contain no INT cs=1 voxels:
+						// EXT (bulk-filled Exterior) and EMPTY/BLOCKED (probe-zone
+						// unreachable at cs=2). INT cells are bulk-filled Interior
+						// so they always have plug candidates at the boundary.
+						// SOLID cells contain a mix of cs=1 SOLID voxels and probe-
+						// zone empty voxels; the probe zone can be reached by the
+						// chunk's cs=1 BFS as Interior via *chains* of face-adjacent
+						// Solid cells (probe-zone connects across cs=2 face
+						// boundaries). So the cs=2 face-neighbor check we used to
+						// do here was too strict: a Solid cell whose face-neighbors
+						// at cs=2 are all SOLID/EXT can still have INT cs=1 voxels
+						// inside it, propagated via the chain. Drop that filter and
+						// let the per-cs=1-voxel rule handle correctness. Buried
+						// Solid cells cost a little extra iteration but emit
+						// nothing (their cs=1 voxels are SOLID or EXT, never INT),
+						// so it's a constant-factor slowdown only.
+						if (parentState != kStateInterior && parentState != kStateSolid) {
+							continue;
+						}
+
+						const int x0 = glm::max(cx, coreLower.x);
+						const int y0 = glm::max(cy, coreLower.y);
+						const int z0 = glm::max(cz, coreLower.z);
+						const int x1 = glm::min(cx + cs2 - 1, coreUpper.x);
+						const int y1 = glm::min(cy + cs2 - 1, coreUpper.y);
+						const int z1 = glm::min(cz + cs2 - 1, coreUpper.z);
+						for (int wx = x0; wx <= x1; ++wx) {
+							for (int wy = y0; wy <= y1; ++wy) {
+								for (int wz = z0; wz <= z1; ++wz) {
+									const glm::ivec3 worldPos(wx, wy, wz);
+									const uint8_t voxState = chunk.state[chunk.toIdx(worldPos)];
+									if (voxState != kStateInterior && voxState != kStateBlocked) {
+										continue;
+									}
+									bool hasSolidNeighbor = false;
+									for (const glm::ivec3 &off : voxel::arrayPathfinderFaces) {
+										const glm::ivec3 nb = worldPos + off;
+										if (!chunk.inBounds(nb)) {
+											continue;
+										}
+										if (chunk.state[chunk.toIdx(nb)] == kStateSolid) {
+											hasSolidNeighbor = true;
+											break;
+										}
+									}
+									if (hasSolidNeighbor) {
+										out.push_back(worldPos);
+										++localCount;
+										if (voxState == kStateBlocked) {
+											++localBlocked;
+										}
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+			totalRawPlugs.fetch_add(localCount, std::memory_order_relaxed);
+			totalBlockedPlugs.fetch_add(localBlocked, std::memory_order_relaxed);
+		});
+	logRSS("thicken: after chunked cs=1 scan");
+	if (totalBlockedPlugs.load(std::memory_order_relaxed) > 0) {
+		Log::info("3dprint thicken: raw plug breakdown -- %lld total, %lld from Blocked cells (recovered chunk-local phantom-leak voxels)",
+				  (long long)totalRawPlugs.load(std::memory_order_relaxed),
+				  (long long)totalBlockedPlugs.load(std::memory_order_relaxed));
+	}
+
+	// Aggregate + dedup (overlapping chunks may detect the same plug position).
+	// Even with chunk-core confinement, cells on a core boundary land in
+	// adjacent chunks too, so dedup is still needed -- but the ratio drops
+	// from ~5x to ~2x.
+	const uint64_t dedupStartMs = core::TimeProvider::systemMillis();
+	std::unordered_set<glm::ivec3, glm::hash<glm::ivec3>> uniquePlugs;
+	const size_t rawTotal = (size_t)totalRawPlugs.load(std::memory_order_relaxed);
+	uniquePlugs.reserve(rawTotal);
+	core::DynamicArray<glm::ivec3> allPlugs;
+	allPlugs.reserve(rawTotal);
+	for (const core::DynamicArray<glm::ivec3> &chunkList : perChunkPlugs) {
+		for (const glm::ivec3 &v : chunkList) {
+			if (uniquePlugs.insert(v).second) {
+				allPlugs.push_back(v);
+			}
+		}
+	}
+	const double dedupSecs = (double)(core::TimeProvider::systemMillis() - dedupStartMs) / 1000.0;
+	Log::info("3dprint thicken: %zu raw -> %zu unique plug voxel(s) from %zu chunk(s) in %.1fs",
+			  rawTotal, allPlugs.size(), chunks.size(), dedupSecs);
+	// Free the per-chunk lists and the dedup hash before applyHoleFills runs --
+	// each holds tens of millions of entries and we don't need them anymore.
+	perChunkPlugs.release();
+	{
+		std::unordered_set<glm::ivec3, glm::hash<glm::ivec3>> empty;
+		empty.swap(uniquePlugs);
+	}
+	logRSS("thicken: after dedup");
+
+	FillStats stats;
+	if (!allPlugs.empty()) {
+		// Distinct from fillholes' green so a model run through both passes is
+		// visually decomposable. Picked to read as "interior thickening".
+		static constexpr color::RGBA kThickenColor(40, 120, 255, 255);
+		const core::DynamicArray<glm::ivec3> emptyCells;
+		const uint64_t applyStartMs = core::TimeProvider::systemMillis();
+		stats = applyHoleFills(emptyCells, allPlugs, parent, nodes, sceneMgr,
+							   /*finalCellSize=*/parent.cellSize,
+							   /*fillColor=*/kThickenColor,
+							   /*orphanNodeName=*/"thicken_orphan");
+		const double applySecs = (double)(core::TimeProvider::systemMillis() - applyStartMs) / 1000.0;
+		Log::info("3dprint thicken: applyHoleFills done in %.1fs (filled=%lu orphan=%lu nodes=%d)",
+				  applySecs, (unsigned long)stats.totalFilled,
+				  (unsigned long)stats.orphanFilled, stats.orphanNodes);
+	}
+
+	const double totalSecs = (double)(core::TimeProvider::systemMillis() - totalStartMs) / 1000.0;
+	const uint64_t totalAdded = stats.totalFilled + stats.orphanFilled;
+	if (g_rssCapTripped.load(std::memory_order_relaxed)) {
+		Log::warn("3dprint thicken: aborted at %.1fs after %lu voxel(s) added -- RSS cap (%g GB) tripped. "
+				  "Result is partial. Free memory and rerun.",
+				  totalSecs, (unsigned long)totalAdded, kHolefillRSSCapGB);
+	} else if (totalAdded == 0) {
+		Log::info("3dprint thicken: no thickenable interior wall surface found in %.1fs.", totalSecs);
+	} else {
+		Log::info("3dprint thicken: added %lu voxel(s) (+%lu orphan voxel(s) in %d new node(s)) in %.1fs",
+				  (unsigned long)stats.totalFilled,
+				  (unsigned long)stats.orphanFilled,
+				  stats.orphanNodes,
+				  totalSecs);
 	}
 }
 

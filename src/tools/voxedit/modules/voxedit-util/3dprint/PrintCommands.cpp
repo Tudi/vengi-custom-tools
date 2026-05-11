@@ -121,12 +121,13 @@ static void runRecolor(SceneManager *sceneMgr, int packedRGB) {
 
 static void dispatch(SceneManager *sceneMgr, const command::CommandArgs &args) {
 	if (!args.has("subcommand")) {
-		Log::info("3dprint: usage: 3dprint <hello|fillholes|erode|regrid|faceclassify|holemap|debugfrontier|recolor|flatbase> [cellSize|maxHoleSize|colorIndex|slabThickness] [minSolidNeighbors|trimPercent] [debugColor]");
+		Log::info("3dprint: usage: 3dprint <hello|fillholes|erode|thicken|regrid|faceclassify|holemap|debugfrontier|recolor|flatbase> [cellSize|maxHoleSize|colorIndex|slabThickness] [minSolidNeighbors|trimPercent] [debugColor]");
 		Log::info("         debugColor: palette index (0-255) for newly placed voxels, or -1 for cyan marker (default -1)");
 		Log::info("         all three commands mark new voxels with cyan by default so additions are visually inspectable");
 		Log::info("         regrid: rebucket all model nodes into world-aligned cellSize^3 cells (default 128)");
 		Log::info("         faceclassify: recolor all voxels: orange=outer surface, blue=inner cavity surface, magenta=thin wall, gray=buried");
 		Log::info("         erode: hollow the model -- keep only exterior-facing voxels at cs=1 precision (run fillholes first)");
+		Log::info("         thicken: add a 1-voxel-thick layer to the inside of every interior-facing wall (blue; run fillholes first; rerun for thicker walls; run before erode)");
 		Log::info("         flatbase: voxel-perfect flat min-Y plane across all bottom nodes. Args: slabThickness=5, trimPercent=10, debugColor=-1");
 		return;
 	}
@@ -145,6 +146,13 @@ static void dispatch(SceneManager *sceneMgr, const command::CommandArgs &args) {
 		// default cs=2; the chunked cs=1 driver always runs after).
 		const int minCellSize = args.intVal("maxHoleSize", 0);
 		runErode(sceneMgr, minCellSize);
+		return;
+	}
+	if (sub == "thicken") {
+		// maxHoleSize arg slot reused as minCellSize (deepest dense refinement,
+		// default cs=2; the chunked cs=1 driver always runs after).
+		const int minCellSize = args.intVal("maxHoleSize", 0);
+		runThicken(sceneMgr, minCellSize);
 		return;
 	}
 	if (sub == "regrid") {
@@ -211,7 +219,7 @@ static void dispatch(SceneManager *sceneMgr, const command::CommandArgs &args) {
 
 void registerCommands(SceneManager *sceneMgr) {
 	command::Command::registerCommand("3dprint")
-		.addArg({"subcommand", command::ArgType::String, false, "", "hello|fillholes|erode|regrid|faceclassify|holemap|debugfrontier|recolor|flatbase"})
+		.addArg({"subcommand", command::ArgType::String, false, "", "hello|fillholes|erode|thicken|regrid|faceclassify|holemap|debugfrontier|recolor|flatbase"})
 		.addArg({"maxHoleSize", command::ArgType::Int, true, "1000", "fillholes: optional minCellSize override for the dense pass (default cs=2; chunked cs=1 always runs after). regrid: cellSize (default 128). faceclassify/holemap: minCellSize. flatbase: slabThickness (default 5)."})
 		.addArg({"minSolidNeighbors", command::ArgType::Int, true, "3",
 				 "Min solid 6-neighbors for a hole seed (fillholes). For flatbase: trimPercent (default 10)."})

@@ -44,6 +44,26 @@ void runHoleFill(SceneManager *sceneMgr, int minCellSize = 0);
 // across hundreds of nodes) makes the memento snapshot infeasible.
 void runErode(SceneManager *sceneMgr, int minCellSize = 0);
 
+// Thicken interior walls by one voxel layer. Plugs every cs=1 air voxel that
+// is BFS-classified Interior and face-adjacent to a wall voxel. Adds blue
+// (kThickenColor) voxels via the same applyHoleFills owner search that
+// fillholes uses, so plugs merge into the wall's owning node where possible
+// and become orphan node(s) elsewhere.
+//
+// One invocation = one voxel of added wall thickness on the interior side.
+// Run repeatedly for thicker walls.
+//
+// Pre-condition: model SHOULD be voxel-watertight (run '3dprint fillholes'
+// first) so the cs=2 ext/int classification is correct. If '3dprint erode'
+// is also wanted, run thicken BEFORE erode (erode would strip the layer).
+//
+// minCellSize controls the deepest dense refinement (default 2). The chunked
+// cs=1 driver always runs after; the action scans chunk state and emits plug
+// candidates.
+//
+// Undo is disabled inside this function: same precedent as fillholes/erode.
+void runThicken(SceneManager *sceneMgr, int minCellSize = 0);
+
 // Debug: paint the BFS frontier shell at a given cellSize. Single-level BFS:
 // orange = exterior frontier, blue = interior frontier. cellSize controls the
 // resolution of the wrap; pass 0 for "auto = modal regridded width" (typically 128).
