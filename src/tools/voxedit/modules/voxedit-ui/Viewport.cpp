@@ -336,12 +336,6 @@ void Viewport::renderViewport() {
 	ImVec2 cursorPos = ImGui::GetCursorPos();
 	const float headerSize = cursorPos.y;
 	if (setupFrameBuffer(contentSize)) {
-		const scenegraph::FrameIndex currentFrame = _sceneMgr->currentFrame();
-		const bool frameChanged = currentFrame != _lastFrameIdx;
-		_lastFrameIdx = currentFrame;
-		if ((_animationPlaying->boolVal() || frameChanged) && _sceneMgr->activeCameraNode()) {
-			_camera = voxelrender::toCamera(_camera.size(), _sceneMgr->sceneGraph(), *_sceneMgr->activeCameraNode(), currentFrame);
-		}
 		_camera.update(_app->deltaFrameSeconds());
 
 		renderToFrameBuffer();
@@ -573,6 +567,19 @@ void Viewport::update(double nowSeconds, command::CommandExecutionListener *list
 	_visible = false;
 	_cameraManipulated = false;
 	_nowSeconds = nowSeconds;
+
+	{
+		const scenegraph::FrameIndex currentFrame = _sceneMgr->currentFrame();
+		const bool frameChanged = currentFrame != _lastFrameIdx;
+		_lastFrameIdx = currentFrame;
+		const scenegraph::SceneGraphNodeCamera *activeCam = _sceneMgr->activeCameraNode();
+		if (activeCam && (frameChanged || _animationPlaying->boolVal() || _lastActiveCameraNodeId != activeCam->id())) {
+			_lastActiveCameraNodeId = activeCam->id();
+			_camera = voxelrender::toCamera(_camera.size(), _sceneMgr->sceneGraph(), *activeCam, currentFrame);
+		} else if (!activeCam) {
+			_lastActiveCameraNodeId = InvalidNodeId;
+		}
+	}
 
 	ui::ScopedStyle style;
 	style.setWindowRounding(0.0f);
@@ -1064,6 +1071,25 @@ bool Viewport::runBrushGizmo(const video::Camera &camera, float headerSize) {
 							   windowPos.y + (float)screenB.y / scale.y);
 				drawList->AddLine(a, b, lineColor, lineThickness);
 			}
+		}
+	}
+
+	if (state.operations & BrushGizmo_ScreenPolygon) {
+		if (state.screenPolygon != nullptr && state.screenPolygon->size() >= 2) {
+			const auto &points = *state.screenPolygon;
+			ImDrawList *drawList = ImGui::GetWindowDrawList();
+			const ImVec2 windowPos = ImGui::GetWindowPos();
+			const float offsetY = headerSize;
+			const glm::vec2 scale = dpiScale();
+			const int n = (int)points.size();
+			ImVec2 *imPoints = (ImVec2 *)alloca(sizeof(ImVec2) * n);
+			for (int i = 0; i < n; ++i) {
+				imPoints[i] = ImVec2(windowPos.x + points[i].x / scale.x,
+									 windowPos.y + offsetY + points[i].y / scale.y);
+			}
+			drawList->AddConcavePolyFilled(imPoints, n, ImGui::GetColorU32(ImVec4(style::color(style::ColorBrushGizmoPolygon))));
+			const glm::vec4 outlineColor = glm::vec4(glm::vec3(style::color(style::ColorBrushGizmoPolygon)), 0.8f);
+			drawList->AddPolyline(imPoints, n, ImGui::GetColorU32(ImVec4(outlineColor)), ImDrawFlags_Closed, 1.5f);
 		}
 	}
 

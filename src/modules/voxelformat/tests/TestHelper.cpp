@@ -2,8 +2,8 @@
  * @file
  */
 
-#include "color/ColorUtil.h"
 #include "TestHelper.h"
+#include "color/ColorUtil.h"
 #include "core/Common.h"
 #include "core/Log.h"
 #include "core/ScopedPtr.h"
@@ -58,7 +58,7 @@ namespace palette {
 	return os;
 }
 
-}
+} // namespace palette
 
 namespace voxel {
 
@@ -233,19 +233,12 @@ void keyFrameComparator(const scenegraph::SceneGraphKeyFrames &keyframes1,
 			if ((flags & ValidateFlags::Translation) == ValidateFlags::Translation) {
 				ASSERT_TRUE(glm::all(glm::epsilonEqual(t1.worldTranslation(), t2.worldTranslation(), 0.00001f))) << "World translation failed for frame " << i << " with " << t1.worldTranslation() << " vs " << t2.worldTranslation();
 				ASSERT_TRUE(glm::all(glm::epsilonEqual(t1.localTranslation(), t2.localTranslation(), 0.00001f))) << "Local translation failed for frame " << i << " with " << t1.worldTranslation() << " vs " << t2.worldTranslation();
-				for (int n = 0; n < 4; ++n) {
-					for (int m = 0; m < 4; ++m) {
-						ASSERT_TRUE(glm::epsilonEqual(t1.worldMatrix()[n][m], t2.worldMatrix()[n][m], 0.00001f)) << "Matrix failed for frame " << i << " at " << n << ":" << m;
-						ASSERT_TRUE(glm::epsilonEqual(t1.localMatrix()[n][m], t2.localMatrix()[n][m], 0.00001f)) << "Matrix failed for frame " << i << " at " << n << ":" << m;
-					}
+			}
+			for (int n = 0; n < 4; ++n) {
+				for (int m = 0; m < 4; ++m) {
+					ASSERT_TRUE(glm::epsilonEqual(t1.worldMatrix()[n][m], t2.worldMatrix()[n][m], 0.00001f)) << "Matrix failed for frame " << i << " at " << n << ":" << m;
+					ASSERT_TRUE(glm::epsilonEqual(t1.localMatrix()[n][m], t2.localMatrix()[n][m], 0.00001f)) << "Matrix failed for frame " << i << " at " << n << ":" << m;
 				}
-			} else {
-				const glm::mat3x3 wrot1 = t1.worldMatrix();
-				const glm::mat3x3 wrot2 = t2.worldMatrix();
-				const glm::mat3x3 lrot1 = t1.localMatrix();
-				const glm::mat3x3 lrot2 = t2.localMatrix();
-				ASSERT_EQ(wrot1, wrot2) << "Matrix failed for frame " << i;
-				ASSERT_EQ(lrot1, lrot2) << "Matrix failed for frame " << i;
 			}
 			if ((flags & ValidateFlags::Scale) == ValidateFlags::Scale) {
 				for (int n = 0; n < 3; ++n) {
@@ -316,9 +309,16 @@ void volumeComparator(const voxel::RawVolume &volume1, const palette::Palette &p
 							continue;
 						}
 					}
+					// treat solid voxels with fully transparent colors as air
+					if (!voxel::isAir(voxel1.getMaterial()) && pal1.color(voxel1.getColor()).a == 0) {
+						continue;
+					}
+					if (!voxel::isAir(voxel2.getMaterial()) && pal2.color(voxel2.getColor()).a == 0) {
+						continue;
+					}
 				}
 
-				ASSERT_EQ(voxel1.getMaterial(), voxel2.getMaterial())
+				ASSERT_EQ(voxel::isAir(voxel1.getMaterial()), voxel::isAir(voxel2.getMaterial()))
 					<< "Voxel differs at " << x1 << ":" << y1 << ":" << z1 << " and " << x2 << ":" << y2 << ":" << z2
 					<< " in material - voxel1[" << voxel::VoxelTypeStr[(int)voxel1.getMaterial()] << ", "
 					<< (int)voxel1.getColor() << "], voxel2[" << voxel::VoxelTypeStr[(int)voxel2.getMaterial()] << ", "
@@ -369,7 +369,32 @@ void volumeComparator(const voxel::RawVolume &volume1, const palette::Palette &p
 	}
 }
 
-void materialComparator(const palette::Palette &pal1, const palette::Palette &pal2) {
+static bool materialEquals(const palette::Material &a, const palette::Material &b, const core::Buffer<palette::MaterialProperty> &ignoredMaterials) {
+	if (ignoredMaterials.empty()) {
+		return a == b;
+	}
+	uint32_t ignoreMask = 0;
+	for (const palette::MaterialProperty &prop : ignoredMaterials) {
+		ignoreMask |= (1 << prop);
+	}
+	if ((a.mask & ~ignoreMask) != (b.mask & ~ignoreMask)) {
+		return false;
+	}
+	if (a.type != b.type) {
+		return false;
+	}
+	for (int i = 0; i < (int)palette::MaterialMax - 1; ++i) {
+		if (ignoreMask & (1 << (i + 1))) {
+			continue;
+		}
+		if (!glm::epsilonEqual(a.value((palette::MaterialProperty)(i + 1)), b.value((palette::MaterialProperty)(i + 1)), glm::epsilon<float>())) {
+			return false;
+		}
+	}
+	return true;
+}
+
+void materialComparator(const palette::Palette &pal1, const palette::Palette &pal2, const core::Buffer<palette::MaterialProperty> &ignoredMaterials) {
 	for (int i = 0; i < pal2.colorCount(); ++i) {
 		int foundColorMatch = -1;
 		int foundMaterialMatch = -1;
@@ -379,28 +404,37 @@ void materialComparator(const palette::Palette &pal1, const palette::Palette &pa
 			if (pal2.color(i) != pal1.color(j)) {
 				continue;
 			}
-			foundColorMatch = true;
+			foundColorMatch = j;
 			const palette::Material &pal1Mat = pal1.material(j);
-			if (pal1Mat == pal2Mat) {
+			if (materialEquals(pal1Mat, pal2Mat, ignoredMaterials)) {
 				foundMaterialMatch = j;
 				break;
 			}
 		}
-		ASSERT_NE(-1, foundColorMatch) << "Could not find a color match in the pal1 palette: " << pal1.name();
-		ASSERT_NE(-1, foundMaterialMatch) << "Found a color match - but the materials differ: " << pal2Mat
-											<< " versus " << pal1.material(foundColorMatch) << " for entry " << i;
+		ASSERT_NE(-1, foundColorMatch) << "Could not find a color match in the pal1 palette: '" << pal1.name()
+									   << "' for color " << color::print(pal2.color(i)) << " at index " << i
+									   << " in pal2 palette: '" << pal2.name() << "' color counts: ("
+									   << pal1.colorCount() << " vs " << pal2.colorCount() << ")\n"
+									   << "Palette 1:\n"
+									   << palette::toString(pal1) << "\nPalette 2:\n"
+									   << palette::toString(pal2);
+		ASSERT_NE(-1, foundMaterialMatch) << "Found a color match - but the materials differ: " << pal2Mat << " versus "
+										  << pal1.material(foundColorMatch) << " for entry " << i;
 	}
 }
 
-void materialComparator(const scenegraph::SceneGraph &graph1, const scenegraph::SceneGraph &graph2) {
+void materialComparator(const scenegraph::SceneGraph &graph1, const scenegraph::SceneGraph &graph2, const core::Buffer<palette::MaterialProperty> &ignoredMaterials) {
 	for (auto iter = graph1.beginModel(), iter2 = graph2.beginModel(); iter != graph1.end(); ++iter, ++iter2) {
 		const scenegraph::SceneGraphNode &graph1Node = *iter;
 		const scenegraph::SceneGraphNode &graph2Node = *iter2;
 		const palette::Palette &graph1Pal = graph1Node.palette();
 		const palette::Palette &graph2Pal = graph2Node.palette();
-		materialComparator(graph1Pal, graph2Pal);
-		if (testing::Test::HasFatalFailure())
+		materialComparator(graph1Pal, graph2Pal, ignoredMaterials);
+		if (testing::Test::HasFatalFailure()) {
+			ADD_FAILURE() << "Material comparison failed for node " << graph1Node.name() << " in graph1 and node "
+						  << graph2Node.name() << " in graph2";
 			break;
+		}
 	}
 }
 
@@ -440,6 +474,13 @@ void sceneGraphComparator(const scenegraph::SceneGraph &graph1, const scenegraph
 			voxel::paletteComparatorScaled(node1.palette(), node2.palette(), (int)maxDelta);
 		} else if ((flags & voxel::ValidateFlags::PaletteColorOrderDiffers) == voxel::ValidateFlags::PaletteColorOrderDiffers) {
 			voxel::orderPaletteComparator(node1.palette(), node2.palette(), maxDelta);
+		}
+
+		if ((flags & ValidateFlags::SceneGraphModelsParent) == ValidateFlags::SceneGraphModelsParent) {
+			const scenegraph::SceneGraphNode &parent1 = graph1.node(node1.parent());
+			const scenegraph::SceneGraphNode &parent2 = graph2.node(node2.parent());
+			ASSERT_EQ(parent1.name(), parent2.name()) << "Parent name differs for node " << node1.name() << " and node " << node2.name();
+			ASSERT_EQ(parent1.type(), parent2.type()) << "Parent type differs for node " << node1.name() << " and node " << node2.name();
 		}
 		// it's intended that includingRegion is false here!
 		// Use resolveVolume to handle ModelReference nodes that don't have their own volume

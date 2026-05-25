@@ -2,10 +2,8 @@
  * @file
  */
 
-#include "voxelformat/FormatThumbnail.h"
-#include "color/ColorUtil.h"
 #include "GoxFormat.h"
-#include "app/Async.h"
+#include "color/ColorUtil.h"
 #include "core/Common.h"
 #include "core/FourCC.h"
 #include "core/Log.h"
@@ -17,7 +15,6 @@
 #include "io/MemoryReadStream.h"
 #include "io/Stream.h"
 #include "io/StreamUtil.h"
-#include "math/Axis.h"
 #include "palette/Palette.h"
 #include "palette/PaletteLookup.h"
 #include "scenegraph/SceneGraph.h"
@@ -25,9 +22,10 @@
 #include "scenegraph/SceneGraphNodeCamera.h"
 #include "voxel/RawVolume.h"
 #include "voxel/Voxel.h"
+#include "voxelformat/FormatThumbnail.h"
+#include "math/SDF.h"
 #include "voxelutil/VolumeCropper.h"
 #include "voxelutil/VolumeMerger.h"
-#include "voxelutil/VolumeRotator.h"
 #include "voxelutil/VolumeVisitor.h"
 #include "voxelutil/VoxelUtil.h"
 #include <glm/gtc/type_ptr.hpp>
@@ -116,7 +114,8 @@ void GoxFormat::loadChunk_ValidateCRC(io::SeekableReadStream &stream) {
 	stream.readUInt32(crc);
 }
 
-bool GoxFormat::loadChunk_DictEntry(const GoxChunk &c, io::SeekableReadStream &stream, char *key, char *value, int &valueSize) {
+bool GoxFormat::loadChunk_DictEntry(const GoxChunk &c, io::SeekableReadStream &stream, char *key, char *value,
+									int &valueSize) {
 	const int64_t endPos = c.streamStartPos + c.length;
 	if (stream.pos() >= endPos) {
 		return false;
@@ -189,10 +188,99 @@ image::ImagePtr GoxFormat::loadScreenshot(const core::String &filename, const io
 	return image::ImagePtr();
 }
 
+voxel::RawVolume *GoxFormat::loadShape(const core::String &shapeName, color::RGBA shapeColor, const float box[4][4],
+									   const palette::Palette &palette) {
+	typedef float (*SdfFunc)(const glm::vec3 &, const glm::vec3 &);
+	SdfFunc sdf = nullptr;
+	if (shapeName == "sphere") {
+		sdf = math::sdf::goxSphere;
+	} else if (shapeName == "cube") {
+		sdf = math::sdf::goxCube;
+	} else if (shapeName == "cylinder") {
+		sdf = math::sdf::goxCylinder;
+	} else {
+		Log::warn("Unknown goxel shape: %s", shapeName.c_str());
+		return nullptr;
+	}
+
+	// Extract size (half-extents) from box column vector lengths
+	const glm::vec3 size(glm::length(glm::vec3(box[0][0], box[0][1], box[0][2])),
+						 glm::length(glm::vec3(box[1][0], box[1][1], box[1][2])),
+						 glm::length(glm::vec3(box[2][0], box[2][1], box[2][2])));
+	if (size.x < 0.5f || size.y < 0.5f || size.z < 0.5f) {
+		Log::warn("Shape box too small");
+		return nullptr;
+	}
+
+	// Build inverse transform: scale box by 1/size then invert
+	glm::mat4 mat;
+	for (int i = 0; i < 4; i++) {
+		for (int j = 0; j < 4; j++) {
+			mat[i][j] = box[i][j];
+		}
+	}
+	mat[0] /= size.x;
+	mat[1] /= size.y;
+	mat[2] /= size.z;
+	const glm::mat4 invMat = glm::inverse(mat);
+
+	// Compute AABB by transforming the 8 corners of the [-1,1] cube through the box
+	glm::vec3 aabbMin(FLT_MAX);
+	glm::vec3 aabbMax(-FLT_MAX);
+	const glm::vec3 corners[8] = {{-1, -1, -1}, {1, -1, -1}, {-1, 1, -1}, {1, 1, -1},
+								  {-1, -1, 1},	{1, -1, 1},	 {-1, 1, 1},  {1, 1, 1}};
+	for (int i = 0; i < 8; i++) {
+		glm::vec4 wp = glm::vec4(0.0f);
+		for (int j = 0; j < 4; j++) {
+			wp[j] = box[0][j] * corners[i].x + box[1][j] * corners[i].y + box[2][j] * corners[i].z + box[3][j];
+		}
+		aabbMin = glm::min(aabbMin, glm::vec3(wp));
+		aabbMax = glm::max(aabbMax, glm::vec3(wp));
+	}
+
+	// Convert goxel AABB (Z-up) to vengi (Y-up) with Y negation
+	const int minX = (int)glm::floor(aabbMin.x);
+	const int minY = (int)glm::floor(aabbMin.z);
+	const int minZ = (int)glm::floor(-aabbMax.y);
+	const int maxX = (int)glm::ceil(aabbMax.x);
+	const int maxY = (int)glm::ceil(aabbMax.z);
+	const int maxZ = (int)glm::ceil(-aabbMin.y);
+
+	const voxel::Region region(minX, minY, minZ, maxX, maxY, maxZ);
+	if (!region.isValid()) {
+		Log::warn("Invalid shape region");
+		return nullptr;
+	}
+
+	palette::PaletteLookup palLookup(palette);
+	const uint8_t palIdx =
+		palLookup.findClosestIndex(flattenRGB(shapeColor.r, shapeColor.g, shapeColor.b, shapeColor.a));
+	const voxel::Voxel voxel = voxel::createVoxel(palette, palIdx);
+
+	voxel::RawVolume *vol = new voxel::RawVolume(region);
+	for (int vy = minY; vy <= maxY; vy++) {
+		for (int vz = minZ; vz <= maxZ; vz++) {
+			for (int vx = minX; vx <= maxX; vx++) {
+				// Convert vengi pos back to goxel pos for SDF evaluation
+				// goxX = vengiX, goxY = -vengiZ, goxZ = vengiY
+				const glm::vec3 goxP((float)vx + 0.5f, (float)(-vz) + 0.5f, (float)vy + 0.5f);
+				const glm::vec3 p = glm::vec3(invMat * glm::vec4(goxP, 1.0f));
+				if (sdf(p, size) >= 0.0f) {
+					vol->setVoxel(vx, vy, vz, voxel);
+				}
+			}
+		}
+	}
+
+	Log::debug("Generated shape '%s' with %i voxels", shapeName.c_str(),
+			   (maxX - minX + 1) * (maxY - minY + 1) * (maxZ - minZ + 1));
+	return vol;
+}
+
 bool GoxFormat::loadChunk_LAYR(State &state, const GoxChunk &c, io::SeekableReadStream &stream,
 							   scenegraph::SceneGraph &sceneGraph, const palette::Palette &palette) {
 	const int size = (int)sceneGraph.size();
-	voxel::RawVolume *modelVolume = new voxel::RawVolume(voxel::Region(0, 0, 0, 1, 1, 1));
+	voxel::RawVolume *modelVolume = nullptr;
 	uint32_t blockCount;
 
 	if ((stream.readUInt32(blockCount)) != 0) {
@@ -225,7 +313,9 @@ bool GoxFormat::loadChunk_LAYR(State &state, const GoxChunk &c, io::SeekableRead
 		int w = img->width();
 		int h = img->height();
 		core_assert(w == 64 && h == 64 && bpp == 4);
-		(void)bpp;(void)w;(void)h;
+		(void)bpp;
+		(void)w;
+		(void)h;
 
 		int32_t x, y, z;
 		if (stream.readInt32(x) != 0) {
@@ -255,19 +345,23 @@ bool GoxFormat::loadChunk_LAYR(State &state, const GoxChunk &c, io::SeekableRead
 			delete modelVolume;
 			return false;
 		}
-		const voxel::Region blockRegion(x, z, y, x + (BlockSize - 1), z + (BlockSize - 1), y + (BlockSize - 1));
+		// goxel Z-up to vengi Y-up: vengiX=goxX, vengiY=goxZ, vengiZ=-goxY
+		const int vengiZ0 = -y - (BlockSize - 1);
+		const voxel::Region blockRegion(x, z, vengiZ0, x + (BlockSize - 1), z + (BlockSize - 1), -y);
 		core_assert(blockRegion.isValid());
 		voxel::RawVolume *blockVolume = new voxel::RawVolume(blockRegion);
-		core::AtomicBool empty {true};
+		core::AtomicBool empty{true};
 		palette::PaletteLookup palLookup(palette);
-		auto fn = [blockVolume, rgba, &palLookup, &palette, x, y, z, this, &empty](int start, int end) {
+		auto fn = [blockVolume, rgba, &palLookup, &palette, x, z, vengiZ0, this, &empty](int start, int end) {
 			voxel::RawVolume::Sampler sampler(blockVolume);
-			sampler.setPosition(x, z + start, y);
+			sampler.setPosition(x, z + start, vengiZ0);
 			for (int z1 = start; z1 < end; ++z1) {
 				voxel::RawVolume::Sampler sampler2 = sampler;
 				for (int y1 = 0; y1 < BlockSize; ++y1) {
 					voxel::RawVolume::Sampler sampler3 = sampler2;
-					const int stride = (z1 * BlockSize + y1) * BlockSize;
+					// Reverse goxel Y: y1=0 maps to highest vengi Z, y1=15 to lowest
+					const int gy = BlockSize - 1 - y1;
+					const int stride = (z1 * BlockSize + gy) * BlockSize;
 					for (int x1 = 0; x1 < BlockSize; ++x1) {
 						// x running fastest
 						const int pxIdx = (stride + x1) * 4;
@@ -293,13 +387,17 @@ bool GoxFormat::loadChunk_LAYR(State &state, const GoxChunk &c, io::SeekableRead
 		// this will remove empty blocks and the final volume might have a smaller region.
 		// TODO: VOXELFORMAT: we should remove this once we have sparse volumes support
 		if (!empty) {
-			voxel::Region destReg(modelVolume->region());
-			if (!destReg.containsRegion(blockRegion)) {
-				destReg.accumulate(blockRegion);
-				voxel::RawVolume *newVolume = new voxel::RawVolume(destReg);
-				newVolume->copyInto(*modelVolume);
-				delete modelVolume;
-				modelVolume = newVolume;
+			if (modelVolume == nullptr) {
+				modelVolume = new voxel::RawVolume(blockRegion);
+			} else {
+				voxel::Region destReg(modelVolume->region());
+				if (!destReg.containsRegion(blockRegion)) {
+					destReg.accumulate(blockRegion);
+					voxel::RawVolume *newVolume = new voxel::RawVolume(destReg);
+					newVolume->copyInto(*modelVolume);
+					delete modelVolume;
+					modelVolume = newVolume;
+				}
 			}
 			voxelutil::mergeVolumes(modelVolume, blockVolume, blockRegion, blockRegion);
 		}
@@ -312,6 +410,10 @@ bool GoxFormat::loadChunk_LAYR(State &state, const GoxChunk &c, io::SeekableRead
 	scenegraph::KeyFrameIndex keyFrameIdx = 0;
 	scenegraph::SceneGraphNode node(scenegraph::SceneGraphNodeType::Model);
 	node.setName(core::String::format("model %i", size));
+	// Shape layer data
+	core::String shapeName;
+	color::RGBA shapeColor(0);
+	float shapeMat[4][4] = {};
 	while (loadChunk_DictEntry(c, stream, dictKey, dictValue, valueLength)) {
 		if (!strcmp(dictKey, "name")) {
 			// "name" 255 chars max
@@ -320,14 +422,18 @@ bool GoxFormat::loadChunk_LAYR(State &state, const GoxChunk &c, io::SeekableRead
 			// "visible" (bool)
 			visible = *(const bool *)dictValue;
 		} else if (!strcmp(dictKey, "mat")) {
-			// "mat" (4x4 matrix)
-			scenegraph::SceneGraphTransform transform;
+			// "mat" (4x4 matrix) - also used as shape box for shape layers
 			io::MemoryReadStream subStream(dictValue, sizeof(float) * 16);
 			glm::mat4 mat(0.0f);
-			// TODO: VOXELFORMAT: axis
 			for (int i = 0; i < 16; ++i) {
 				subStream.readFloat(mat[i / 4][i % 4]);
+				shapeMat[i / 4][i % 4] = mat[i / 4][i % 4];
 			}
+			// goxel Z-up to vengi Y-up: swap Y/Z, negate goxel Y to preserve handedness
+			const float tmp = mat[3][1];
+			mat[3][1] = mat[3][2];
+			mat[3][2] = -tmp;
+			scenegraph::SceneGraphTransform transform;
 			transform.setWorldMatrix(mat);
 			node.setTransform(keyFrameIdx, transform);
 		} else if (!strcmp(dictKey, "img-path") || !strcmp(dictKey, "id")) {
@@ -341,33 +447,50 @@ bool GoxFormat::loadChunk_LAYR(State &state, const GoxChunk &c, io::SeekableRead
 			int32_t v;
 			subStream.readInt32(v);
 			node.setProperty(dictKey, core::string::toString(v));
+		} else if (!strcmp(dictKey, "marker_color")) {
+			if (valueLength == 4) {
+				node.setColor(color::RGBA((uint8_t)dictValue[0], (uint8_t)dictValue[1], (uint8_t)dictValue[2],
+										  (uint8_t)dictValue[3]));
+			}
+		} else if (!strcmp(dictKey, "shape")) {
+			shapeName = dictValue;
 		} else if (!strcmp(dictKey, "color")) {
-			io::MemoryReadStream subStream(dictValue, sizeof(uint32_t));
-			uint32_t color;
-			subStream.readUInt32(color);
-			node.setColor(color::RGBA(color));
-		} else if (!strcmp(dictKey, "box") || !strcmp(dictKey, "shape")) {
-			// "box" 4x4 bounding box float
-			// "shape" - currently unsupported TODO
+			if (valueLength == 4) {
+				shapeColor = color::RGBA((uint8_t)dictValue[0], (uint8_t)dictValue[1], (uint8_t)dictValue[2],
+										 (uint8_t)dictValue[3]);
+			}
+		} else if (!strcmp(dictKey, "box")) {
+			// optional bounding box - not used for shape rasterization
 		} else {
 			Log::debug("LAYR chunk with key: %s and size %i", dictKey, valueLength);
 		}
 	}
 
-	voxel::RawVolume *mirrored = voxelutil::mirrorAxis(modelVolume, math::Axis::X);
-	delete modelVolume;
-	if (voxel::RawVolume *cropped = voxelutil::cropVolume(mirrored)) {
-		delete mirrored;
-		const glm::ivec3 mins = cropped->region().getLowerCorner();
-		cropped->translate(-mins);
+	// Generate voxels for shape layers (shape transform is in mat)
+	if (blockCount == 0 && !shapeName.empty()) {
+		modelVolume = loadShape(shapeName, shapeColor, shapeMat, palette);
+		// Shape position is baked into the volume; reset node transform
+		scenegraph::SceneGraphTransform transform;
+		node.setTransform(keyFrameIdx, transform);
+	}
+
+	if (modelVolume == nullptr) {
+		modelVolume = new voxel::RawVolume(voxel::Region(0, 0, 0, 0, 0, 0));
+	}
+
+	if (voxel::RawVolume *cropped = voxelutil::cropVolume(modelVolume)) {
+		delete modelVolume;
+		modelVolume = cropped;
+	}
+
+	{
+		const glm::ivec3 mins = modelVolume->region().getLowerCorner();
+		modelVolume->translate(-mins);
 
 		scenegraph::SceneGraphTransform &transform = node.transform(keyFrameIdx);
-		transform.setWorldTranslation(mins);
+		transform.setWorldTranslation(glm::vec3(mins) + transform.worldTranslation());
 
-		node.setVolume(cropped);
-	} else {
-		node.setVolume(mirrored);
-		mirrored = nullptr;
+		node.setVolume(modelVolume);
 	}
 	node.setVisible(visible);
 	node.setPalette(palette);
@@ -543,7 +666,7 @@ bool GoxFormat::loadChunk_LIGH(State &state, const GoxChunk &c, io::SeekableRead
 		}
 	}
 	Log::debug("Loaded LIGH chunk with pitch: %f, yaw: %f, intensity: %f, fixed: %i, ambient: %f, shadow: %f", pitch,
-		yaw, intensity, fixed, ambient, shadow);
+			   yaw, intensity, fixed, ambient, shadow);
 	return true;
 }
 
@@ -730,7 +853,7 @@ bool GoxFormat::saveChunk_CAMR(io::SeekableWriteStream &stream, const scenegraph
 }
 
 bool GoxFormat::saveChunk_PREV(const scenegraph::SceneGraph &sceneGraph, io::SeekableWriteStream &stream,
-							  const SaveContext &savectx) {
+							   const SaveContext &savectx) {
 	ThumbnailContext ctx;
 	ctx.outputSize = glm::ivec2(128);
 	const image::ImagePtr &image = createThumbnail(sceneGraph, savectx.thumbnailCreator, ctx);
@@ -761,7 +884,8 @@ bool GoxFormat::saveChunk_MATE(io::SeekableWriteStream &stream, const scenegraph
 		wrapBool(saveChunk_DictColor(stream, "color", rgba));
 		const palette::Material &material = palette.material(i);
 		const color::RGBA emitRGBA = palette.emitColor(i);
-		const glm::vec3 &emitColor = glm::clamp(color::fromRGBA(emitRGBA) * material.value(palette::MaterialProperty::MaterialEmit), 0.0f, 1.0f);
+		const glm::vec3 &emitColor =
+			glm::clamp(color::fromRGBA(emitRGBA) * material.value(palette::MaterialProperty::MaterialEmit), 0.0f, 1.0f);
 		wrapBool(saveChunk_DictFloat(stream, "metallic", material.value(palette::MaterialProperty::MaterialMetal)))
 		wrapBool(saveChunk_DictFloat(stream, "roughness", material.value(palette::MaterialProperty::MaterialRoughness)))
 		wrapBool(saveChunk_DictVec3(stream, "emission", emitColor))
@@ -803,7 +927,8 @@ bool GoxFormat::saveChunk_LAYR(io::SeekableWriteStream &stream, const scenegraph
 					Log::debug("Saved LAYR chunk %i at %i:%i:%i", blockUid, x, y, z);
 					wrapBool(stream.writeUInt32(blockUid++))
 					wrapBool(stream.writeInt32(x))
-					wrapBool(stream.writeInt32(z))
+					// vengi Y-up to goxel Z-up: goxX=vengiX, goxY=-vengiZ, goxZ=vengiY
+					wrapBool(stream.writeInt32(-z - (BlockSize - 1)))
 					wrapBool(stream.writeInt32(y))
 					wrapBool(stream.writeUInt32(0))
 					--layerBlocks;
@@ -816,11 +941,22 @@ bool GoxFormat::saveChunk_LAYR(io::SeekableWriteStream &stream, const scenegraph
 			return false;
 		}
 		wrapBool(saveChunk_DictString(stream, "name", node.name()))
+		// the load path crops and sets translation = crop lower corner + mat translation
+		// the mat translation needs to be in goxel's Z-up coordinate system
 		glm::mat4 mat(1.0f);
+		{
+			const glm::vec3 &wt = node.transform(0).worldTranslation();
+			// vengi Y-up to goxel Z-up: goxX=vengiX, goxY=-vengiZ, goxZ=vengiY
+			mat[3] = glm::vec4(wt.x, -wt.z, wt.y, 1.0f);
+		}
 		wrapBool(saveChunk_DictMat4(stream, "mat", mat))
 		wrapBool(saveChunk_DictInt(stream, "id", layerId))
 		const color::RGBA layerRGBA = node.color();
-		wrapBool(saveChunk_DictColor(stream, "color", layerRGBA.rgba))
+		wrapBool(saveChunk_DictEntryHeader(stream, "marker_color", 4))
+		wrapBool(stream.writeUInt8(layerRGBA.r))
+		wrapBool(stream.writeUInt8(layerRGBA.g))
+		wrapBool(stream.writeUInt8(layerRGBA.b))
+		wrapBool(stream.writeUInt8(layerRGBA.a))
 #if 0
 		wrapBool(saveChunk_DictEntry(stream, "base_id", &layer->base_id))
 		wrapBool(saveChunk_DictEntry(stream, "material", &material_idx))
@@ -844,11 +980,11 @@ bool GoxFormat::saveChunk_BL16(io::SeekableWriteStream &stream, const scenegraph
 		glm::ivec3 mins, maxs;
 		calcMinsMaxs(region, glm::ivec3(BlockSize), mins, maxs);
 
-		voxel::RawVolume *mirrored = voxelutil::mirrorAxis(sceneGraph.resolveVolume(node), math::Axis::X);
+		const voxel::RawVolume *vol = sceneGraph.resolveVolume(node);
 		for (int by = mins.y; by <= maxs.y; by += BlockSize) {
 			for (int bz = mins.z; bz <= maxs.z; bz += BlockSize) {
 				for (int bx = mins.x; bx <= maxs.x; bx += BlockSize) {
-					if (isEmptyBlock(mirrored, glm::ivec3(BlockSize), bx, by, bz)) {
+					if (isEmptyBlock(vol, glm::ivec3(BlockSize), bx, by, bz)) {
 						continue;
 					}
 					GoxScopedChunkWriter scoped(stream, FourCC('B', 'L', '1', '6'));
@@ -856,29 +992,32 @@ bool GoxFormat::saveChunk_BL16(io::SeekableWriteStream &stream, const scenegraph
 													bz + BlockSize - 1);
 					const size_t size = (size_t)BlockSize * BlockSize * BlockSize * 4;
 					uint32_t *data = (uint32_t *)core_malloc(size);
-					int offset = 0;
+					core_memset(data, 0, size);
 					const palette::Palette &palette = node.palette();
-					auto func = [&](int, int, int, const voxel::Voxel &voxel) {
+					// vengi Y-up to goxel Z-up with handedness fix:
+					// goxel data[goxZ][goxY][goxX] where goxY = -(vengiZ - bz) + (BlockSize-1)
+					auto func = [&](int x, int y, int z, const voxel::Voxel &voxel) {
 						if (voxel::isAir(voxel.getMaterial())) {
-							data[offset++] = 0;
-						} else {
-							data[offset++] = palette.color(voxel.getColor());
+							return;
 						}
+						const int lx = x - bx;
+						const int ly = y - by; // vengi Y = goxel Z
+						const int lz = z - bz; // vengi Z = -goxel Y
+						const int goxY = BlockSize - 1 - lz;
+						const int offset = lx + goxY * BlockSize + ly * BlockSize * BlockSize;
+						data[offset] = palette.color(voxel.getColor());
 					};
-					voxelutil::visitVolume(*mirrored, blockRegion, func, voxelutil::VisitAll(),
-										   voxelutil::VisitorOrder::YZX);
+					voxelutil::visitVolume(*vol, blockRegion, func, voxelutil::VisitAll());
 
 					image::Image image2("##");
-					if (!image2.loadRGBA((const uint8_t*)data, 64, 64)) {
+					if (!image2.loadRGBA((const uint8_t *)data, 64, 64)) {
 						Log::error("Could not load image data");
 						core_free(data);
-						delete mirrored;
 						return false;
 					}
 					core_free(data);
 					if (!image2.writePNG(stream)) {
 						Log::error("Could not write png into gox stream");
-						delete mirrored;
 						return false;
 					}
 					Log::debug("Saved BL16 chunk %i", blocks);
@@ -886,7 +1025,6 @@ bool GoxFormat::saveChunk_BL16(io::SeekableWriteStream &stream, const scenegraph
 				}
 			}
 		}
-		delete mirrored;
 	}
 	return true;
 }

@@ -31,10 +31,12 @@
 #include "math/Ray.h"
 #include "memento/MementoHandler.h"
 #include "metric/MetricFacade.h"
+#include "palette/Material.h"
 #include "palette/NormalPalette.h"
 #include "palette/Palette.h"
 #include "palette/PaletteCompleter.h"
 #include "palette/PaletteLookup.h"
+#include "palette/PaletteView.h"
 #include "scenegraph/FrameTransform.h"
 #include "scenegraph/SceneGraph.h"
 #include "scenegraph/SceneGraphAnimation.h"
@@ -45,7 +47,6 @@
 #include "scenegraph/SceneGraphUtil.h"
 #include "scenegraph/SceneUtil.h"
 #include "video/Camera.h"
-#include "voxedit-util/ModelNodeSettings.h"
 #include "voxedit-util/modifier/SceneModifiedFlags.h"
 #include "voxedit-util/network/protocol/SceneStateMessage.h"
 #include "voxedit-util/network/ServerNetwork.h"
@@ -73,11 +74,11 @@
 #include "voxelutil/Picking.h"
 #include "voxelutil/Raycast.h"
 #include "voxelutil/VolumeCropper.h"
+#include "voxelutil/VolumeSelect.h"
 #include "voxelutil/VolumeRescaler.h"
 #include "voxelutil/VolumeResizer.h"
 #include "voxelutil/VolumeRotator.h"
 #include "voxelutil/VolumeSplitter.h"
-#include "voxelutil/VolumeSelect.h"
 #include "voxelutil/VolumeVisitor.h"
 #include "voxelutil/VolumeMerger.h"
 #include "voxelutil/VoxelUtil.h"
@@ -850,6 +851,50 @@ int SceneManager::nodeColorToNewNode(int nodeId, const voxel::Voxel voxelColor) 
 	copyNode(node, newNode, false, true);
 	newNode.setVolume(newVolume);
 	newNode.setName(core::String::format("color: %i", (int)voxelColor.getColor()));
+	return moveNodeToSceneGraph(newNode, node.parent());
+}
+
+int SceneManager::nodeColorToNewNode(int nodeId, const core::Buffer<uint8_t> &paletteIndices) {
+	if (paletteIndices.empty()) {
+		return InvalidNodeId;
+	}
+	if (paletteIndices.size() == 1u) {
+		return nodeColorToNewNode(nodeId, voxel::createVoxel(_sceneGraph.node(nodeId).palette(), paletteIndices[0]));
+	}
+	scenegraph::SceneGraphNode &node = _sceneGraph.node(nodeId);
+	voxel::RawVolume *v = _sceneGraph.resolveVolume(node);
+	if (v == nullptr) {
+		return InvalidNodeId;
+	}
+	core::BitSet<palette::PaletteMaxColors> wanted;
+	core::String nameSuffix;
+	for (uint8_t idx : paletteIndices) {
+		wanted.set(idx, true);
+		if (!nameSuffix.empty()) {
+			nameSuffix.append(",");
+		}
+		nameSuffix.append(core::String::format("%i", (int)idx));
+	}
+	const voxel::Region &region = v->region();
+	voxel::RawVolume *newVolume = new voxel::RawVolume(region);
+	voxel::RawVolumeWrapper wrapper = _modifierFacade.createRawVolumeWrapper(v);
+	auto func = [&](int32_t x, int32_t y, int32_t z, const voxel::Voxel &voxel) {
+		newVolume->setVoxel(x, y, z, voxel);
+		wrapper.setVoxel(x, y, z, voxel::Voxel());
+	};
+	auto condition = [&wanted](const auto &sampler) {
+		const voxel::Voxel &voxel = sampler.voxel();
+		if (voxel::isAir(voxel.getMaterial())) {
+			return false;
+		}
+		return wanted[voxel.getColor()];
+	};
+	voxelutil::visitVolumeParallel(wrapper, func, condition);
+	modified(nodeId, wrapper.dirtyRegion());
+	scenegraph::SceneGraphNode newNode(scenegraph::SceneGraphNodeType::Model);
+	copyNode(node, newNode, false, true);
+	newNode.setVolume(newVolume);
+	newNode.setName(core::String::format("colors: %s", nameSuffix.c_str()));
 	return moveNodeToSceneGraph(newNode, node.parent());
 }
 
@@ -2511,7 +2556,7 @@ void SceneManager::selectionUnselect(int nodeId) {
 	// Only re-extract where voxels actually had FlagOutline set
 	const voxel::Region dirtyRegion = selectionCalculateRegion(*node);
 	node->clearSelection();
-	_modifierFacade.selectBrush().setBox3DSelectionRegion(voxel::Region::InvalidRegion);
+	_modifierFacade.selectBrush().box3D().setSelectionRegion(voxel::Region::InvalidRegion);
 	modified(nodeId, dirtyRegion.isValid() ? dirtyRegion : node->region(), SceneModifiedFlags::NoUndo);
 }
 
@@ -2526,7 +2571,7 @@ void SceneManager::selectionSelectAll(int nodeId) {
 	}
 	node->select(volume->region());
 	if (_modifierFacade.selectBrush().selectMode() == SelectMode::Box3D) {
-		_modifierFacade.selectBrush().setBox3DSelectionRegion(volume->region());
+		_modifierFacade.selectBrush().box3D().setSelectionRegion(volume->region());
 	}
 	// Mark mesh dirty to trigger re-extraction with updated FlagOutline
 	modified(nodeId, node->region(), SceneModifiedFlags::NoUndo);
@@ -2593,7 +2638,7 @@ void SceneManager::selectionSetBounds(int nodeId, const voxel::Region &region) {
 	node->select(clamped);
 	SelectBrush &selectBrush = _modifierFacade.selectBrush();
 	if (selectBrush.selectMode() == SelectMode::Box3D) {
-		selectBrush.setBox3DSelectionRegion(clamped);
+		selectBrush.box3D().setSelectionRegion(clamped);
 	}
 	modified(nodeId, dirtyRegion, SceneModifiedFlags::NoUndo);
 }
@@ -2604,19 +2649,19 @@ void SceneManager::selectionSetEllipse(int nodeId) {
 		return;
 	}
 	SelectBrush &brush = _modifierFacade.selectBrush();
-	if (!brush.ellipseValid()) {
+	if (!brush.circle().valid()) {
 		return;
 	}
-	const glm::ivec3 &center = brush.ellipseCenter();
-	const int radiusU = brush.ellipseRadiusU();
-	const int radiusV = brush.ellipseRadiusV();
-	const int depth = brush.ellipseDepth();
-	const voxel::FaceNames face = brush.ellipseFace();
+	const glm::ivec3 &center = brush.circle().center();
+	const int radiusU = brush.circle().radiusU();
+	const int radiusV = brush.circle().radiusV();
+	const int depth = brush.circle().depth();
+	const voxel::FaceNames face = brush.circle().face();
 	int uAxis;
 	int vAxis;
-	SelectBrush::ellipseAxes(face, uAxis, vAxis);
+	select::Circle::ellipseAxes(face, uAxis, vAxis);
 	const int faceAxisIdx = math::getIndexForAxis(voxel::faceToAxis(face));
-	const bool is3D = brush.ellipse3D();
+	const bool is3D = brush.circle().is3D();
 	const bool positiveNormal = voxel::isPositiveFace(face);
 
 	// Calculate the bounding region of the new ellipse
@@ -2639,7 +2684,7 @@ void SceneManager::selectionSetEllipse(int nodeId) {
 
 	// Clear only the positions flagged by the previous ellipse (not all selections)
 	voxel::Region dirtyRegion = ellipseRegion;
-	core::DynamicArray<glm::ivec3> &history = brush.ellipseHistory();
+	core::DynamicArray<glm::ivec3> &history = brush.circle().history();
 	for (const glm::ivec3 &pos : history) {
 		const voxel::Voxel &v = volume->voxel(pos);
 		if (!voxel::isAir(v.getMaterial())) {
@@ -2654,8 +2699,8 @@ void SceneManager::selectionSetEllipse(int nodeId) {
 	// Apply the new ellipse selection and record positions
 	auto selectFunc = [&](int x, int y, int z, const voxel::Voxel &v) {
 		const glm::ivec3 pos(x, y, z);
-		if (SelectBrush::insideSelection(pos, center, radiusU, radiusV, depth, is3D,
-										 uAxis, vAxis, faceAxisIdx, positiveNormal)) {
+		if (select::Circle::insideSelection(pos, center, radiusU, radiusV, depth, is3D,
+										  uAxis, vAxis, faceAxisIdx, positiveNormal)) {
 			voxel::Voxel modified = v;
 			modified.setFlags(modified.getFlags() | voxel::FlagOutline);
 			volume->setVoxel(x, y, z, modified);
@@ -2678,25 +2723,26 @@ void SceneManager::selectionFinalizeLasso(int nodeId) {
 		return;
 	}
 	SelectBrush &brush = _modifierFacade.selectBrush();
-	if (!brush.lassoAccumulating() || brush.lassoPath().size() < 3) {
+	select::PolygonLasso &lasso = brush.polygonLasso();
+	if (!lasso.accumulating() || lasso.path().size() < 3) {
 		return;
 	}
-	// Copy path and axes before invalidating the brush (invalidateLasso clears them)
-	const core::DynamicArray<glm::ivec3> path = brush.lassoPath();
-	const int uAxis = brush.lassoUAxis();
-	const int vAxis = brush.lassoVAxis();
-	const int wAxis = brush.lassoFaceAxisIdx();
-	const bool positiveNormal = voxel::isPositiveFace(brush.lassoFace());
+	// Copy path and axes before invalidating the strategy (invalidate() clears them)
+	const core::DynamicArray<glm::ivec3> path = lasso.path();
+	const int uAxis = lasso.uAxis();
+	const int vAxis = lasso.vAxis();
+	const int wAxis = lasso.faceAxisIdx();
+	const bool positiveNormal = voxel::isPositiveFace(lasso.face());
 
 	voxel::RawVolume *volume = node->volume();
 	voxel::Region dirtyRegion = voxel::Region::InvalidRegion;
 
 	// Restore edge history voxels first so they appear in the dirty region.
 	// This ensures undo also reverts edge marks outside the polygon perimeter.
-	if (brush.hasPendingChanges()) {
-		dirtyRegion.accumulate(brush.revertChanges(volume));
+	if (lasso.hasPendingChanges()) {
+		dirtyRegion.accumulate(lasso.revertChanges(volume));
 	}
-	brush.invalidateLasso();
+	lasso.invalidate();
 
 	auto selectFunc = [&](int x, int y, int z, const voxel::Voxel &v) {
 		const glm::ivec3 pos(x, y, z);
@@ -2719,22 +2765,24 @@ void SceneManager::selectionFinalizeLasso(int nodeId) {
 
 void SceneManager::selectionCancelLasso(int nodeId) {
 	SelectBrush &brush = _modifierFacade.selectBrush();
-	if (brush.hasPendingChanges()) {
+	select::PolygonLasso &lasso = brush.polygonLasso();
+	if (lasso.hasPendingChanges()) {
 		scenegraph::SceneGraphNode *node = sceneGraphModelNode(nodeId);
 		if (node != nullptr) {
 			voxel::RawVolume *volume = node->volume();
-			const voxel::Region dirtyRegion = brush.revertChanges(volume);
+			const voxel::Region dirtyRegion = lasso.revertChanges(volume);
 			if (dirtyRegion.isValid()) {
 				modified(nodeId, dirtyRegion, SceneModifiedFlags::NoUndo);
 			}
 		}
 	}
-	brush.invalidateLasso();
+	lasso.invalidate();
 }
 
 void SceneManager::selectionLassoUndoVertex(int nodeId) {
 	SelectBrush &brush = _modifierFacade.selectBrush();
-	if (!brush.lassoAccumulating() || brush.lassoPath().size() < 2) {
+	select::PolygonLasso &lasso = brush.polygonLasso();
+	if (!lasso.accumulating() || lasso.path().size() < 2) {
 		return;
 	}
 	scenegraph::SceneGraphNode *node = sceneGraphModelNode(nodeId);
@@ -2745,14 +2793,14 @@ void SceneManager::selectionLassoUndoVertex(int nodeId) {
 	voxel::Region dirtyRegion = voxel::Region::InvalidRegion;
 
 	// Restore all existing edge marks to their original state
-	if (brush.hasPendingChanges()) {
-		dirtyRegion.accumulate(brush.revertChanges(volume));
+	if (lasso.hasPendingChanges()) {
+		dirtyRegion.accumulate(lasso.revertChanges(volume));
 	}
 
 	// Drop the last vertex and redraw the remaining edges
-	brush.popLastLassoPathEntry();
-	if (brush.lassoPath().size() >= 2) {
-		brush.redrawEdgesOnVolume(volume, volume->region(), dirtyRegion);
+	lasso.popLastPathEntry();
+	if (lasso.path().size() >= 2) {
+		lasso.redrawEdgesOnVolume(volume, volume->region(), dirtyRegion);
 	}
 
 	if (dirtyRegion.isValid()) {
@@ -3911,19 +3959,33 @@ void SceneManager::construct() {
 		}).setHelp(_("Scale the given node up")).setArgumentCompleter(nodeCompleter(_sceneGraph));
 
 	command::Command::registerCommand("colortomodel")
-		.addArg({"index", command::ArgType::Int, true, "", "Palette color index"})
+		.addArg({"index", command::ArgType::String, true, "", "Palette color index, or a comma-separated list of indices"})
 		.addArg({"nodeid", command::ArgType::String, true, "", "Node ID or UUID to create"})
 		.setHandler([&] (const command::CommandArgs& args) {
 			const int nodeId = toNodeId(args, activeNode());
 			if (args.has("index")) {
-				const uint8_t index = (uint8_t)args.intVal("index");
-				const voxel::Voxel voxel = voxel::createVoxel(activePalette(), index);
-				nodeColorToNewNode(nodeId, voxel);
+				const core::String &indexArg = args.str("index");
+				core::DynamicArray<core::String> tokens;
+				core::string::splitString(indexArg, tokens, ",");
+				core::Buffer<uint8_t> indices;
+				indices.reserve(tokens.size());
+				for (const core::String &token : tokens) {
+					const core::String trimmed = core::string::trim(token);
+					if (trimmed.empty()) {
+						continue;
+					}
+					indices.push_back((uint8_t)trimmed.toInt());
+				}
+				if (indices.empty()) {
+					Log::warn("No valid palette index given for colortomodel");
+					return;
+				}
+				nodeColorToNewNode(nodeId, indices);
 			} else {
 				const voxel::Voxel voxel = _modifierFacade.cursorVoxel();
 				nodeColorToNewNode(nodeId, voxel);
 			}
-		}).setHelp(_("Move the voxels of the current selected palette index or the given index into a new node"));
+		}).setHelp(_("Move the voxels of the current selected palette index, the given index or a comma-separated list of indices into a new node"));
 
 	command::Command::registerCommand("abortaction")
 		.setHandler([&] (const command::CommandArgs& args) {
@@ -3969,21 +4031,6 @@ void SceneManager::construct() {
 		.setHandler([&] (const command::CommandArgs& args) {
 			nodeGroupDeselectColor(_modifierFacade.cursorVoxel().getColor());
 		}).setHelp(_("Deselect all voxels matching the active palette color"));
-
-	command::Command::registerCommand("finalizelasso")
-		.setHandler([&] (const command::CommandArgs& args) {
-			selectionFinalizeLasso(sceneGraph().activeNode());
-		}).setHelp(_("Close the lasso polygon and apply the selection to enclosed surface voxels"));
-
-	command::Command::registerCommand("cancellasso")
-		.setHandler([&] (const command::CommandArgs& args) {
-			selectionCancelLasso(sceneGraph().activeNode());
-		}).setHelp(_("Discard the in-progress lasso polygon without applying any selection"));
-
-	command::Command::registerCommand("undolassovertex")
-		.setHandler([&] (const command::CommandArgs& args) {
-			selectionLassoUndoVertex(sceneGraph().activeNode());
-		}).setHelp(_("Remove the last placed lasso vertex and redraw edges"));
 
 	command::Command::registerCommand("selectonlycolor")
 		.setHandler([&] (const command::CommandArgs& args) {
@@ -4370,6 +4417,20 @@ void SceneManager::construct() {
 			}
 		}).setHelp(_("Pick the current selected color from current cursor voxel"));
 
+	command::Command::registerCommand("pickmaterial")
+		.setHandler([&] (const command::CommandArgs& args) {
+			if (_traceViaMouse && !voxel::isAir(hitCursorVoxel().getMaterial())) {
+				const voxel::Voxel& voxel = hitCursorVoxel();
+				if (voxel.getColor() == _modifierFacade.cursorVoxel().getColor()) {
+					return;
+				}
+				palette::Palette &palette = activePalette();
+				const palette::Material &material = palette.material(voxel.getColor());
+				palette.setMaterial(_modifierFacade.cursorVoxel().getColor(), material);
+				return;
+			}
+		}).setHelp(_("Pick the current selected material from current cursor voxel"));
+
 	command::Command::registerCommand("flip")
 		.addArg({"axis", command::ArgType::String, false, "", "Axis to flip around: x|y|z"})
 		.setHandler([&] (const command::CommandArgs& args) {
@@ -4649,6 +4710,35 @@ void SceneManager::construct() {
 			camera->setTarget(refPos);
 			camera->setRotationType(video::CameraRotationType::Target);
 		}).setHelp(_("Set the camera orbit target to the reference point position"));
+
+	command::Command::registerCommand("camera_position")
+		.addArg({"x", command::ArgType::Float, false, "", "X position"})
+		.addArg({"y", command::ArgType::Float, false, "", "Y position"})
+		.addArg({"z", command::ArgType::Float, false, "", "Z position"})
+		.setHandler([&] (const command::CommandArgs& args) {
+			video::Camera *camera = activeCamera();
+			if (camera == nullptr) {
+				Log::error("No active camera found");
+				return;
+			}
+			const glm::vec3 pos(args.floatVal("x"), args.floatVal("y"), args.floatVal("z"));
+			camera->setWorldPosition(pos);
+		}).setHelp(_("Set the camera world position"));
+
+	command::Command::registerCommand("camera_target")
+		.addArg({"x", command::ArgType::Float, false, "", "X target position"})
+		.addArg({"y", command::ArgType::Float, false, "", "Y target position"})
+		.addArg({"z", command::ArgType::Float, false, "", "Z target position"})
+		.setHandler([&] (const command::CommandArgs& args) {
+			video::Camera *camera = activeCamera();
+			if (camera == nullptr) {
+				Log::error("No active camera found");
+				return;
+			}
+			const glm::vec3 target(args.floatVal("x"), args.floatVal("y"), args.floatVal("z"));
+			camera->setTarget(target);
+			camera->setRotationType(video::CameraRotationType::Target);
+		}).setHelp(_("Set the camera orbit target position"));
 
 	command::Command::registerCommand("camera_projection")
 		.addArg({"mode", command::ArgType::String, true, "", "Projection mode: perspective|orthogonal (toggles if not specified)"})
@@ -5059,7 +5149,13 @@ bool SceneManager::update(double nowSeconds) {
 	_camMovement.update(_nowSeconds, camera, _sceneGraph, frameIdx);
 	_modifierFacade.update(nowSeconds, camera);
 
+	_sceneGraph.updateTransforms();
 	updateDirtyRendererStates();
+
+	// Flush pending brush changes before mesh extraction to ensure the volume
+	// is in its final state. This prevents stale/partial mesh extraction that
+	// occurs when extractions read from a volume that's about to be modified.
+	_modifierFacade.flushPendingBrushChanges();
 
 	_sceneRenderer->update();
 	setGridResolution(_gridSize->intVal());
@@ -6138,8 +6234,12 @@ bool SceneManager::nodeQuantizeColors(scenegraph::SceneGraphNode &node, const co
 
 	// quantize to target count
 	color::RGBA quantizedColors[palette::PaletteMaxColors];
-	const color::ColorReductionType reductionType =
-		color::toColorReductionType(core::getVar(cfg::CoreColorReduction)->strVal().c_str());
+	const core::VarPtr &var = core::getVar(cfg::CoreColorReduction);
+	const color::ColorReductionType reductionType = color::toColorReductionType(var->strVal().c_str());
+	if (reductionType == color::ColorReductionType::Max) {
+		Log::warn("Invalid color reduction type '%s'", var->strVal().c_str());
+		return false;
+	}
 	const int quantizedCount = color::quantize(quantizedColors, (size_t)targetColorCount, inputColors, (size_t)selectedCount, reductionType);
 	if (quantizedCount <= 0) {
 		return false;
@@ -6252,6 +6352,21 @@ bool SceneManager::nodeRemoveAlpha(scenegraph::SceneGraphNode &node, uint8_t pal
 	_mementoHandler.markPaletteChange(_sceneGraph, node);
 	nodeUpdateVoxelType(node.id(), palIdx, voxel::VoxelType::Generic);
 	return true;
+}
+
+bool SceneManager::nodeResetMaterial(scenegraph::SceneGraphNode &node, uint8_t palIdx) {
+	palette::Palette &palette = node.palette();
+	palette.setMaterial(palIdx, {});
+	palette.markSave();
+	_mementoHandler.markPaletteChange(_sceneGraph, node);
+	return true;
+}
+
+bool SceneManager::nodeResetMaterial(int nodeId, uint8_t palIdx) {
+	if (scenegraph::SceneGraphNode *node = sceneGraphNode(nodeId)) {
+		return nodeResetMaterial(*node, palIdx);
+	}
+	return false;
 }
 
 bool SceneManager::nodeRemoveAlpha(int nodeId, uint8_t palIdx) {

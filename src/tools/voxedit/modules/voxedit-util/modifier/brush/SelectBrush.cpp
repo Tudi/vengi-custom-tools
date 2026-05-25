@@ -3,68 +3,42 @@
  */
 
 #include "SelectBrush.h"
-#include "LUASelectionMode.h"
 #include "voxedit-util/SceneManager.h"
-#include "core/collection/DynamicMap.h"
 #include "scenegraph/SceneGraph.h"
-#include "math/Axis.h"
-#include "palette/Palette.h"
-#include "voxedit-util/modifier/ModifierVolumeWrapper.h"
-#include "voxel/Face.h"
-#include "voxel/RawVolume.h"
-#include "voxel/Voxel.h"
-#include "voxelutil/VolumeSelect.h"
-#include "voxelutil/VolumeVisitor.h"
-#include <glm/geometric.hpp>
 
 namespace voxedit {
 
-void SelectBrush::ellipseAxes(voxel::FaceNames face, int &uAxis, int &vAxis) {
-	const math::Axis axis = voxel::faceToAxis(face);
-	const int faceAxisIdx = math::getIndexForAxis(axis);
-	// The two perpendicular axes in order
-	uAxis = (faceAxisIdx + 1) % 3;
-	vAxis = (faceAxisIdx + 2) % 3;
+SelectBrush::SelectBrush(SceneManager *sceneManager)
+	: Super(BrushType::Select, ModifierType::Override, ModifierType::Override | ModifierType::Erase),
+	  _sceneManager(sceneManager), _lassoStrategy(sceneManager), _polygonLassoStrategy(sceneManager),
+	  _scriptStrategy(sceneManager) {
+	setBrushClamping(true);
+	_strategies[(int)SelectMode::All] = &_selectAll;
+	_strategies[(int)SelectMode::Surface] = &_selectSurface;
+	_strategies[(int)SelectMode::SameColor] = &_selectSameColor;
+	_strategies[(int)SelectMode::FuzzyColor] = &_fuzzyColorStrategy;
+	_strategies[(int)SelectMode::Connected] = &_selectConnected;
+	_strategies[(int)SelectMode::FlatSurface] = &_flatSurfaceStrategy;
+	_strategies[(int)SelectMode::Box3D] = &_box3DStrategy;
+	_strategies[(int)SelectMode::Circle] = &_circleStrategy;
+	_strategies[(int)SelectMode::Lasso] = &_lassoStrategy;
+	_strategies[(int)SelectMode::PolygonLasso] = &_polygonLassoStrategy;
+	_strategies[(int)SelectMode::Paint] = &_paintStrategy;
+	_strategies[(int)SelectMode::Script] = &_scriptStrategy;
 }
 
-bool SelectBrush::insideSelection(const glm::ivec3 &pos, const glm::ivec3 &center, int radiusU, int radiusV, int depth,
-								  bool is3D, int uAxis, int vAxis, int faceAxisIdx, bool positiveNormal) {
-	if (radiusU <= 0 || radiusV <= 0) {
-		return false;
-	}
-	// Signed depth: how far behind the surface the position is
-	// For positive faces, "behind" is the negative direction; for negative faces, positive
-	const int dd = positiveNormal ? (center[faceAxisIdx] - pos[faceAxisIdx]) : (pos[faceAxisIdx] - center[faceAxisIdx]);
-	if (dd < 0) {
-		return false;
-	}
-	if (is3D && depth > 0) {
-		const double du = (double)(pos[uAxis] - center[uAxis]);
-		const double dv = (double)(pos[vAxis] - center[vAxis]);
-		const double ddd = (double)dd;
-		return (du * du) / ((double)radiusU * radiusU) + (dv * dv) / ((double)radiusV * radiusV) +
-				   (ddd * ddd) / ((double)depth * depth) <=
-			   1.0;
-	}
-	// 2D ellipse + flat depth check (also used as fallback when 3D with depth=0)
-	if (!insideEllipse(pos, center, radiusU, radiusV, uAxis, vAxis)) {
-		return false;
-	}
-	return dd <= depth;
-}
-
-bool SelectBrush::insideEllipse(const glm::ivec3 &pos, const glm::ivec3 &center, int radiusU, int radiusV, int uAxis,
-								int vAxis) {
-	if (radiusU <= 0 || radiusV <= 0) {
-		return false;
-	}
-	const double du = (double)(pos[uAxis] - center[uAxis]);
-	const double dv = (double)(pos[vAxis] - center[vAxis]);
-	return (du * du) / ((double)radiusU * radiusU) + (dv * dv) / ((double)radiusV * radiusV) <= 1.0;
+select::AABBBrushState SelectBrush::buildState(const BrushContext &ctx) const {
+	select::AABBBrushState state;
+	state.aabbMode = _aabbMode;
+	state.aabbFace = _aabbFace;
+	state.aabbFirstPos = applyGridResolution(_aabbFirstPos, ctx.gridResolution);
+	state.cursorPosition = currentCursorPosition(ctx);
+	state.radius = radius();
+	return state;
 }
 
 bool SelectBrush::active() const {
-	if (_selectMode == SelectMode::Lasso && _lassoAccumulating) {
+	if (activeStrategy()->active()) {
 		return true;
 	}
 	return Super::active();
@@ -72,135 +46,90 @@ bool SelectBrush::active() const {
 
 void SelectBrush::reset() {
 	Super::reset();
-	_lassoPath.clear();
-	_lassoEdgeHistory.clear();
-	_lassoRubberBandHistory.clear();
-	_lassoAccumulating = false;
-	_paintAccumulating = false;
-	_paintHadSelection = false;
-	_paintDirtyRegion = voxel::Region::InvalidRegion;
+	for (int i = 0; i < (int)SelectMode::Max; ++i) {
+		_strategies[i]->reset();
+	}
 	_sceneModifiedFlags = SceneModifiedFlags::All;
-	_paintFinalUndoRegion = voxel::Region::InvalidRegion;
-	_box3DSelectionRegion = voxel::Region::InvalidRegion;
 }
 
 void SelectBrush::onSceneChange() {
 	Super::onSceneChange();
-	_lassoPath.clear();
-	_lassoEdgeHistory.clear();
-	_lassoRubberBandHistory.clear();
-	_lassoAccumulating = false;
-	_paintAccumulating = false;
-	_paintHadSelection = false;
-	_paintDirtyRegion = voxel::Region::InvalidRegion;
-	_sceneModifiedFlags = SceneModifiedFlags::All;
-	_box3DSelectionRegion = voxel::Region::InvalidRegion;
+	reset();
 }
 
 void SelectBrush::abort(BrushContext &ctx) {
-	if (_selectMode == SelectMode::Lasso && _lassoAccumulating) {
-		_lassoPath.clear();
-		_lassoAccumulating = false;
-		_sceneModifiedFlags = SceneModifiedFlags::All;
-	}
-	if (_selectMode == SelectMode::Paint && _paintAccumulating) {
-		_paintAccumulating = false;
-		_paintHadSelection = false;
-		_paintDirtyRegion = voxel::Region::InvalidRegion;
-		_sceneModifiedFlags = SceneModifiedFlags::All;
-	}
+	activeStrategy()->abort(ctx);
+	_sceneModifiedFlags = activeStrategy()->_modifiedFlags;
 	Super::abort(ctx);
 }
 
 bool SelectBrush::hasPendingChanges() const {
-	// Whenever we're accumulating a lasso polygon, we draw edges and the rubber-band
-	// line directly on the real volume (no preview copy). Returning true here makes
-	// PreviewManager skip allocation so Modifier::render() calls executeBrush on the
-	// real node every frame - the 32^3 preview allocation cap never applies.
-	if (_lassoAccumulating) {
-		return true;
+	if (_selectMode == SelectMode::Paint) {
+		return _paintStrategy.hasPendingChanges();
 	}
-	if (_paintAccumulating && _paintDirtyRegion.isValid()) {
-		return true;
+	if (_selectMode == SelectMode::PolygonLasso) {
+		return _polygonLassoStrategy.hasPendingChanges();
 	}
-	return false;
+	return Super::hasPendingChanges();
 }
 
 voxel::Region SelectBrush::revertChanges(voxel::RawVolume *volume) {
-	voxel::Region dirtyRegion = voxel::Region::InvalidRegion;
-	// Revert rubber-band first. Its entries may have captured edge-marked voxels at
-	// overlap points; reverting edges afterwards restores the true original state.
-	for (auto *entry : _lassoRubberBandHistory) {
-		volume->setVoxel(entry->key, entry->value);
-		dirtyRegion.accumulate(entry->key);
+	if (_selectMode == SelectMode::PolygonLasso) {
+		return _polygonLassoStrategy.revertChanges(volume);
 	}
-	_lassoRubberBandHistory.clear();
-	for (auto *entry : _lassoEdgeHistory) {
-		volume->setVoxel(entry->key, entry->value);
-		dirtyRegion.accumulate(entry->key);
-	}
-	_lassoEdgeHistory.clear();
-	return dirtyRegion;
-}
-
-void SelectBrush::endBrush(BrushContext &ctx) {
-	if (_selectMode == SelectMode::Paint && _paintAccumulating) {
-		_paintAccumulating = false;
-		_paintFinalUndoRegion = _paintDirtyRegion;
-		_paintDirtyRegion = voxel::Region::InvalidRegion;
-		_sceneModifiedFlags = SceneModifiedFlags::All;
-	}
-	Super::endBrush(ctx);
-}
-
-voxel::Region SelectBrush::consumePendingUndoRegion() {
-	voxel::Region region = _paintFinalUndoRegion;
-	_paintFinalUndoRegion = voxel::Region::InvalidRegion;
-	return region;
+	return Super::revertChanges(volume);
 }
 
 bool SelectBrush::onDeactivated() {
-	// A mid-accumulation lasso has FlagOutline marks on the real volume (edge and
-	// rubber-band lines). Revert them instead of letting commit() execute a partial
-	// polygon - otherwise the orphaned marks stay as a "selection" after brush switch.
-	if (_lassoAccumulating && _sceneManager != nullptr) {
+	// A mid-accumulation PolygonLasso has FlagOutline marks on the real volume (edge
+	// and rubber-band lines). Revert them via SceneManager so we get a clean dirty
+	// region; otherwise the orphaned marks would stay as a phantom selection after
+	// the brush switch.
+	if (_selectMode == SelectMode::PolygonLasso && _polygonLassoStrategy.accumulating() && _sceneManager != nullptr) {
 		_sceneManager->selectionCancelLasso(_sceneManager->sceneGraph().activeNode());
 	}
 	return Super::onDeactivated();
 }
 
+void SelectBrush::endBrush(BrushContext &ctx) {
+	activeStrategy()->endBrush(ctx);
+	_sceneModifiedFlags = activeStrategy()->_modifiedFlags;
+	Super::endBrush(ctx);
+}
+
+voxel::Region SelectBrush::consumePendingUndoRegion() {
+	if (_selectMode == SelectMode::Paint) {
+		return _paintStrategy.consumeFinalUndoRegion();
+	}
+	return Super::consumePendingUndoRegion();
+}
+
 void SelectBrush::update(const BrushContext &ctx, double nowSeconds) {
 	Super::update(ctx, nowSeconds);
-	// Between clicks in lasso polygon mode, _aabbMode is false but the brush stays
-	// active via active(). Trigger preview refresh when the cursor moves so the
-	// rubber-band preview line updates in real time.
-	if (_selectMode == SelectMode::Lasso && _lassoAccumulating && !_aabbMode) {
-		if (ctx.cursorPosition != _lastLassoCursorPos) {
-			_lastLassoCursorPos = ctx.cursorPosition;
-			markDirty();
-		}
+	activeStrategy()->update(ctx, nowSeconds);
+	// During polygon-lasso accumulation _aabbMode is false but the brush stays active
+	// via active(). Trigger preview refresh when the cursor moves so the rubber-band
+	// segment updates in real time.
+	if (_selectMode == SelectMode::PolygonLasso && _polygonLassoStrategy.accumulating()) {
+		markDirty();
 	}
 }
 
 void SelectBrush::setSelectMode(SelectMode mode) {
 	if (_selectMode != mode) {
-		// Revert any in-progress lasso edge/rubber-band marks on the real volume
-		// before switching modes. Without this, FlagOutline on those voxels stays
-		// as an orphaned selection after the mode change.
-		if (_selectMode == SelectMode::Lasso && _lassoAccumulating && _sceneManager != nullptr) {
-			_sceneManager->selectionCancelLasso(_sceneManager->sceneGraph().activeNode());
-		}
 		if (_selectMode == SelectMode::Paint) {
 			setAABBMode();
-			_paintAccumulating = false;
-			_paintDirtyRegion = voxel::Region::InvalidRegion;
 			_sceneModifiedFlags = SceneModifiedFlags::All;
 		}
-		_ellipseValid = false;
-		_lassoAccumulating = false;
-		_lassoPath.clear();
-		_lassoEdgeHistory.clear();
-		_lassoRubberBandHistory.clear();
+		// Revert any in-progress polygon-lasso edge/rubber-band marks on the real
+		// volume before switching modes. Without this, FlagOutline on those voxels
+		// stays as an orphaned selection after the mode change.
+		if (_selectMode == SelectMode::PolygonLasso && _polygonLassoStrategy.accumulating() &&
+			_sceneManager != nullptr) {
+			_sceneManager->selectionCancelLasso(_sceneManager->sceneGraph().activeNode());
+		}
+		activeStrategy()->reset();
+		_circleStrategy.reset();
 		if (mode == SelectMode::Paint) {
 			setSingleMode();
 			if (_radius == 0) {
@@ -213,7 +142,7 @@ void SelectBrush::setSelectMode(SelectMode mode) {
 
 void SelectBrush::setLuaSelectionMode(int index, LUASelectionMode *mode) {
 	_luaSelectionModeIndex = index;
-	_activeLuaSelectionMode = mode;
+	_scriptStrategy.setActiveLuaMode(mode);
 	if (index >= 0 && mode != nullptr) {
 		_selectMode = SelectMode::Script;
 	} else if (_selectMode == SelectMode::Script) {
@@ -222,498 +151,70 @@ void SelectBrush::setLuaSelectionMode(int index, LUASelectionMode *mode) {
 }
 
 bool SelectBrush::needsAdditionalAction(const BrushContext &ctx) const {
-	// Circle, Connected, SameColor, Surface, FuzzyColor, FlatSurface use their own
-	// selection logic -they don't benefit from the 3-click AABB workflow.
-	// Only All and Box3D use the standard AABB region.
-	if (_selectMode != SelectMode::All && _selectMode != SelectMode::Box3D) {
-		return false;
+	if (activeStrategy()->needsAdditionalAction(ctx)) {
+		return Super::needsAdditionalAction(ctx);
 	}
-	// TODO: this must be forwarded to the lua selection mode implementations instead of hardcoded here.
-	return Super::needsAdditionalAction(ctx);
+	return false;
 }
 
 bool SelectBrush::beginBrush(const BrushContext &ctx) {
-	if (_selectMode == SelectMode::Lasso) {
-		if (_lassoAccumulating) {
-			const glm::ivec3 &cursor = applyGridResolution(ctx.cursorPosition, ctx.gridResolution);
-			// Close the polygon when clicking near the first vertex
-			if (_lassoPath.size() >= 3) {
-				const glm::ivec3 &firstPt = _lassoPath[0];
-				const int du = glm::abs(cursor[_lassoUAxis] - firstPt[_lassoUAxis]);
-				const int dv = glm::abs(cursor[_lassoVAxis] - firstPt[_lassoVAxis]);
-				if (du <= LassoCloseThresholdVoxels && dv <= LassoCloseThresholdVoxels) {
-					_lassoAccumulating = false;
-					_aabbFace = ctx.cursorFace;
-					_aabbMode = true;
-					return true;
-				}
-			}
-			// Add the next vertex to the polygon
-			_lassoPath.push_back(cursor);
-			_aabbFace = ctx.cursorFace;
-			_aabbMode = true;
-			return true;
-		}
-		// Start a new lasso polygon
-		_lassoPath.clear();
-		_lassoEdgeHistory.clear();
-		_lassoRubberBandHistory.clear();
-		_lassoPath.reserve(LassoPathInitialReserve);
-		_lassoPath.push_back(applyGridResolution(ctx.cursorPosition, ctx.gridResolution));
-		_lassoFace = ctx.cursorFace;
-		ellipseAxes(_lassoFace, _lassoUAxis, _lassoVAxis);
-		_lassoFaceAxisIdx = math::getIndexForAxis(voxel::faceToAxis(_lassoFace));
-		_lassoAccumulating = true;
-		_aabbFace = ctx.cursorFace;
-		_aabbMode = true;
+	const select::AABBBrushState state = buildState(ctx);
+	if (activeStrategy()->beginBrush(ctx, state)) {
+		_sceneModifiedFlags = activeStrategy()->_modifiedFlags;
+		// When the strategy handles beginBrush itself (e.g. Lasso), Super::beginBrush
+		// is not called, so _aabbFace must be set here for buildState() to work.
+		_aabbFace = ctx.cursorFace != voxel::FaceNames::Max ? ctx.cursorFace : voxel::FaceNames::PositiveY;
 		return true;
-	}
-	if (_selectMode == SelectMode::Circle) {
-		_ellipseValid = false;
-		_ellipseHistory.clear();
-	}
-	if (_selectMode == SelectMode::Paint) {
-		_paintAccumulating = true;
-		_paintHadSelection = false;
-		_paintDirtyRegion = voxel::Region::InvalidRegion;
-		_paintFinalUndoRegion = voxel::Region::InvalidRegion;
-		_sceneModifiedFlags = SceneModifiedFlags::NoUndo;
 	}
 	return Super::beginBrush(ctx);
 }
 
+bool SelectBrush::isSimplePreview() const {
+	return activeStrategy()->isSimplePreview();
+}
+
 voxel::Region SelectBrush::calcRegion(const BrushContext &ctx) const {
-	if (_selectMode == SelectMode::Script) {
-		return ctx.targetVolumeRegion;
+	const select::AABBBrushState state = buildState(ctx);
+	const voxel::Region strategyRegion = activeStrategy()->calcRegion(ctx, state);
+	if (strategyRegion.isValid()) {
+		return strategyRegion;
 	}
-	if (_selectMode == SelectMode::Circle && _aabbMode && _aabbFace != voxel::FaceNames::Max) {
-		const glm::ivec3 center = applyGridResolution(_aabbFirstPos, ctx.gridResolution);
-		const glm::ivec3 current = currentCursorPosition(ctx);
-		int uAxis;
-		int vAxis;
-		ellipseAxes(_aabbFace, uAxis, vAxis);
-		const int du = glm::abs(current[uAxis] - center[uAxis]);
-		const int dv = glm::abs(current[vAxis] - center[vAxis]);
-		const int r = glm::max(du, dv);
-		glm::ivec3 mins = center;
-		glm::ivec3 maxs = center;
-		mins[uAxis] -= r;
-		maxs[uAxis] += r;
-		mins[vAxis] -= r;
-		maxs[vAxis] += r;
-		// Limit face-normal axis by depth -only extend behind the surface
-		const math::Axis faceAxis = voxel::faceToAxis(_aabbFace);
-		const int faceAxisIdx = math::getIndexForAxis(faceAxis);
-		if (voxel::isPositiveFace(_aabbFace)) {
-			// Behind a positive face = negative direction
-			mins[faceAxisIdx] = center[faceAxisIdx] - _ellipseDepth;
-			maxs[faceAxisIdx] = center[faceAxisIdx];
-		} else {
-			// Behind a negative face = positive direction
-			mins[faceAxisIdx] = center[faceAxisIdx];
-			maxs[faceAxisIdx] = center[faceAxisIdx] + _ellipseDepth;
-		}
-		voxel::Region circleRegion(mins, maxs);
-		circleRegion.cropTo(ctx.targetVolumeRegion);
-		return circleRegion;
-	}
-	// For lasso accumulation, the rubber-band is drawn directly on the real volume
-	// (no preview copy). hasPendingChanges() returns true so PreviewManager bails out
-	// and Modifier::render() calls executeBrush on the real node. The region returned
-	// here is just the bbox passed into drawLassoEdgeSurface for column scanning, so
-	// it must span the full volume W-range to find surface voxels at any height.
-	if (_selectMode == SelectMode::Lasso && _lassoAccumulating && !_lassoPath.empty()) {
-		const glm::ivec3 &lastPt = _lassoPath.back();
-		const glm::ivec3 &cursor = ctx.cursorPosition;
-		glm::ivec3 mins = glm::min(lastPt, cursor);
-		glm::ivec3 maxs = glm::max(lastPt, cursor);
-		mins[_lassoFaceAxisIdx] = ctx.targetVolumeRegion.getLowerCorner()[_lassoFaceAxisIdx];
-		maxs[_lassoFaceAxisIdx] = ctx.targetVolumeRegion.getUpperCorner()[_lassoFaceAxisIdx];
-		voxel::Region rubberBandRegion(mins, maxs);
-		rubberBandRegion.cropTo(ctx.targetVolumeRegion);
-		return rubberBandRegion;
-	}
-	// All, Box3D, and Paint use the parent's region calculation.
-	// All other modes flood-fill or visit the full volume.
-	if (_selectMode != SelectMode::All && _selectMode != SelectMode::Box3D && _selectMode != SelectMode::Paint) {
-		return ctx.targetVolumeRegion;
-	}
+	// Strategy returned InvalidRegion - use the parent AABB region
 	return Super::calcRegion(ctx);
 }
 
 void SelectBrush::generate(scenegraph::SceneGraph &sceneGraph, ModifierVolumeWrapper &wrapper, const BrushContext &ctx,
 						   const voxel::Region &region) {
-	// Delegate to lua selection mode if active
-	if (_selectMode == SelectMode::Script && _activeLuaSelectionMode != nullptr) {
-		_activeLuaSelectionMode->execute(sceneGraph, wrapper, ctx, region, _aabbFirstPos, _aabbFace);
-		if (_sceneManager) {
-			const voxelgenerator::LuaDirtyRegions &dirtyRegions = _activeLuaSelectionMode->dirtyRegions();
-			Log::debug("SelectBrush::generate: %i dirty regions after lua execution", (int)dirtyRegions.size());
-			for (const auto &entry : dirtyRegions) {
-				const int dirtyNodeId = entry->key;
-				const voxel::Region &dirtyRegion = entry->value;
-				if (dirtyRegion.isValid()) {
-					Log::debug("SelectBrush::generate: forwarding dirty region for node %i: %s",
-							   dirtyNodeId, dirtyRegion.toString().c_str());
-					_sceneManager->modified(dirtyNodeId, dirtyRegion);
-				}
-			}
-		}
-		return;
-	}
-
 	voxel::Region selectionRegion = region;
 	if (_brushClamping) {
 		selectionRegion.cropTo(ctx.targetVolumeRegion);
 	}
-
-	// Clear box region by default; Box3D case sets it below
-	_box3DSelectionRegion = voxel::Region::InvalidRegion;
-
-	auto func = [&wrapper](int x, int y, int z, const voxel::Voxel &voxel) {
-		if (wrapper.modifierType() == ModifierType::Erase) {
-			wrapper.removeFlagAt(x, y, z, voxel::FlagOutline);
-		} else {
-			wrapper.setFlagAt(x, y, z, voxel::FlagOutline);
-		}
-	};
-
-	switch (_selectMode) {
-	case SelectMode::All: {
-		voxelutil::VisitSolid condition;
-		voxelutil::visitVolumeParallel(wrapper, selectionRegion, func, condition);
-		break;
+	// Reset Box3D selection region before each generate so that the previous
+	// Box3D selection doesn't persist as a masking region in ModifierVolumeWrapper
+	// when a different strategy is active.
+	if (_selectMode != SelectMode::Box3D) {
+		_box3DStrategy.reset();
 	}
-	case SelectMode::Surface: {
-		voxelutil::visitSurfaceVolumeParallel(wrapper, func);
-		break;
-	}
-	case SelectMode::SameColor: {
-		const voxel::Voxel &referenceVoxel = ctx.hitCursorVoxel;
-		if (voxel::isAir(referenceVoxel.getMaterial())) {
-			return;
-		}
-		voxelutil::VisitVoxelColor condition = voxelutil::VisitVoxelColor(referenceVoxel);
-		voxelutil::visitVolumeParallel(wrapper, selectionRegion, func, condition);
-		break;
-	}
-	case SelectMode::FuzzyColor: {
-		const voxel::Voxel &referenceVoxel = ctx.hitCursorVoxel;
-		if (voxel::isAir(referenceVoxel.getMaterial())) {
-			return;
-		}
-		const palette::Palette &palette = wrapper.node().palette();
-		voxelutil::VisitVoxelFuzzyColor condition(palette, referenceVoxel.getColor(), _colorThreshold);
-		voxelutil::visitVolumeParallel(wrapper, selectionRegion, func, condition);
-		break;
-	}
-	case SelectMode::Connected: {
-		const voxel::Voxel &referenceVoxel = ctx.hitCursorVoxel;
-		if (voxel::isAir(referenceVoxel.getMaterial())) {
-			return;
-		}
-		const glm::ivec3 &startPos = ctx.cursorPosition;
-		if (wrapper.modifierType() == ModifierType::Erase) {
-			wrapper.removeFlagAt(startPos.x, startPos.y, startPos.z, voxel::FlagOutline);
-		} else {
-			wrapper.setFlagAt(startPos.x, startPos.y, startPos.z, voxel::FlagOutline);
-		}
-		voxelutil::visitConnectedByCondition(wrapper, startPos, func);
-		break;
-	}
-	case SelectMode::FlatSurface: {
-		if (ctx.cursorFace == voxel::FaceNames::Max) {
-			return;
-		}
-		const glm::ivec3 &startPos = ctx.cursorPosition;
-		if (voxel::isAir(wrapper.voxel(startPos).getMaterial())) {
-			return;
-		}
-		voxelutil::visitFlatSurface(wrapper, startPos, ctx.cursorFace, _flatDeviation, func);
-		break;
-	}
-	case SelectMode::Circle: {
-		// Use _aabbFace (the face from the initial click) rather than ctx.cursorFace
-		// which can change during the drag as the cursor moves across faces
-		const voxel::FaceNames face = _aabbFace;
-		if (face == voxel::FaceNames::Max) {
-			return;
-		}
-		const glm::ivec3 center(_aabbFirstPos);
-		int uAxis;
-		int vAxis;
-		ellipseAxes(face, uAxis, vAxis);
-		const int faceAxisIdx = math::getIndexForAxis(voxel::faceToAxis(face));
-		// During initial drag, both radii are the same (circle), depth defaults to 1
-		const int du = glm::abs(ctx.cursorPosition[uAxis] - center[uAxis]);
-		const int dv = glm::abs(ctx.cursorPosition[vAxis] - center[vAxis]);
-		const int radius = glm::max(du, dv);
-		const int radiusU = radius;
-		const int radiusV = radius;
-		const int depth = _ellipseDepth;
-		const bool is3D = _ellipse3D;
-		const bool positiveNormal = voxel::isPositiveFace(face);
-		auto inBounds = [&](int x, int y, int z) {
-			const glm::ivec3 pos(x, y, z);
-			return insideSelection(pos, center, radiusU, radiusV, depth, is3D, uAxis, vAxis, faceAxisIdx,
-								   positiveNormal);
-		};
-		if (_previewMode) {
-			// In preview mode, remove voxels outside the selection from the preview copy
-			// so the ghost overlay shows only the selection shape
-			voxel::RawVolume *vol = wrapper.volume();
-			const voxel::Region &r = vol->region();
-			const voxel::Voxel air;
-			for (int z = r.getLowerZ(); z <= r.getUpperZ(); ++z) {
-				for (int y = r.getLowerY(); y <= r.getUpperY(); ++y) {
-					for (int x = r.getLowerX(); x <= r.getUpperX(); ++x) {
-						if (!inBounds(x, y, z)) {
-							vol->setVoxel(x, y, z, air);
-						}
-					}
-				}
-			}
-		} else {
-			_ellipseHistory.clear();
-			auto circleFunc = [&](int x, int y, int z, const voxel::Voxel &v) {
-				if (inBounds(x, y, z)) {
-					func(x, y, z, v);
-					_ellipseHistory.push_back(glm::ivec3(x, y, z));
-				}
-			};
-			if (depth > 1) {
-				// Visit all solid voxels in the ellipse bounding region.
-				// visitSurfaceVolume would skip interior voxels.
-				voxelutil::VisitSolid condition;
-				voxelutil::visitVolume(wrapper, selectionRegion, circleFunc, condition);
-			} else {
-				voxelutil::visitSurfaceVolume(wrapper, circleFunc);
-			}
-			// Cache ellipse parameters for slider adjustment
-			_ellipseCenter = center;
-			_ellipseRadiusU = radiusU;
-			_ellipseRadiusV = radiusV;
-			_ellipseDepth = depth;
-			_ellipse3D = is3D;
-			_ellipseFace = face;
-			_ellipseValid = true;
-		}
-		break;
-	}
-	case SelectMode::Box3D: {
-		voxelutil::VisitSolid condition;
-		voxelutil::visitVolumeParallel(wrapper, selectionRegion, func, condition);
-		// Store the exact box region so ModifierVolumeWrapper::skip() allows
-		// editing any position inside the box (including air voxels)
-		if (wrapper.modifierType() == ModifierType::Erase) {
-			_box3DSelectionRegion = voxel::Region::InvalidRegion;
-		} else {
-			_box3DSelectionRegion = selectionRegion;
-		}
-		break;
-	}
-	case SelectMode::Lasso: {
-		if (_lassoFace == voxel::FaceNames::Max || _lassoPath.empty()) {
-			return;
-		}
-		const int uAxis = _lassoUAxis;
-		const int vAxis = _lassoVAxis;
-		const int wAxis = _lassoFaceAxisIdx;
-		const bool positiveNormal = voxel::isPositiveFace(_lassoFace);
-
-		// Restore history voxels into the wrapper and add them to the dirty region so
-		// the NoUndo marks are included in any subsequent undo entry.
-		auto restoreHistory = [&](LassoHistoryMap &history) {
-			for (auto *entry : history) {
-				wrapper.volume()->setVoxel(entry->key, entry->value);
-				wrapper.addToDirtyRegion(entry->key);
-			}
-			history.clear();
-		};
-		// Bresenham step count for one UV segment - exactly the number of voxels
-		// drawLassoEdgeSurface will push into a history map for that segment.
-		auto bresenhamLength = [uAxis, vAxis](const glm::ivec3 &startPt, const glm::ivec3 &endPt) {
-			return (size_t)(glm::max(glm::abs(endPt[uAxis] - startPt[uAxis]),
-									 glm::abs(endPt[vAxis] - startPt[vAxis])) + 1);
-		};
-		auto captureFunc = [&](LassoHistoryMap &history) {
-			return [&history, &func](int x, int y, int z, const voxel::Voxel &v) {
-				const glm::ivec3 pos(x, y, z);
-				// Store original voxel only on first encounter so overlapping segments
-				// don't overwrite the true original with an already-marked voxel.
-				if (history.find(pos) == history.end()) {
-					history.put(pos, v);
-				}
-				func(x, y, z, v);
-			};
-		};
-
-		if (_lassoAccumulating) {
-			const int vertexCount = (int)_lassoPath.size();
-			// Rubber-band + edges draw directly on the real volume (no preview copy).
-			// hasPendingChanges() returns true while accumulating, so PreviewManager
-			// skips allocation and this branch runs on the real node volume every frame
-			// - sidestepping the 32^3 preview cap that would otherwise hide the line on
-			// long diagonals. Revert rubber-band first (may have captured edge-marked
-			// voxels at overlaps), then edges, so the volume is back to its original
-			// state before we redraw both layers.
-			restoreHistory(_lassoRubberBandHistory);
-			restoreHistory(_lassoEdgeHistory);
-			// Reserve both histories up front so the DynamicMap pre-allocates one
-			// node block for the expected count instead of allocating on first insert.
-			size_t edgeReserve = 0u;
-			for (int edgeIdx = 1; edgeIdx < vertexCount; ++edgeIdx) {
-				edgeReserve += bresenhamLength(_lassoPath[edgeIdx - 1], _lassoPath[edgeIdx]);
-			}
-			_lassoEdgeHistory.reserve(edgeReserve);
-			auto edgeFunc = captureFunc(_lassoEdgeHistory);
-			// W-axis scan spans the full target volume so surface voxels at any height
-			// are covered across all committed edges.
-			for (int edgeIdx = 1; edgeIdx < vertexCount; ++edgeIdx) {
-				voxelutil::drawLassoEdgeSurface([&](const glm::ivec3 &pos) { return wrapper.voxel(pos); },
-												_lassoPath[edgeIdx - 1], _lassoPath[edgeIdx], uAxis, vAxis, wAxis,
-												positiveNormal, ctx.targetVolumeRegion, edgeFunc);
-			}
-			// Rubber-band captures whatever the volume looks like after the edge pass;
-			// on overlap points, reverting it restores the edge-marked state, and
-			// reverting the edge history afterwards restores the true original.
-			if (ctx.cursorFace != voxel::FaceNames::Max && vertexCount >= 1) {
-				const glm::ivec3 &lastVertex = _lassoPath[vertexCount - 1];
-				_lassoRubberBandHistory.reserve(bresenhamLength(lastVertex, ctx.cursorPosition));
-				auto rubberBandFunc = captureFunc(_lassoRubberBandHistory);
-				voxelutil::drawLassoEdgeSurface([&](const glm::ivec3 &pos) { return wrapper.voxel(pos); },
-												lastVertex, ctx.cursorPosition, uAxis, vAxis, wAxis,
-												positiveNormal, ctx.targetVolumeRegion, rubberBandFunc);
-			}
-			_sceneModifiedFlags = SceneModifiedFlags::NoUndo;
-			return;
-		}
-
-		// Polygon closed: apply selection to surface voxels inside the polygon.
-		_sceneModifiedFlags = SceneModifiedFlags::All;
-		if (_lassoPath.size() < 3) {
-			return;
-		}
-		if (!_previewMode) {
-			// Restore rubber-band + edge history voxels BEFORE applying selection so
-			// their positions are included in the dirty region. This ensures the undo
-			// entry covers ALL transient marks (inside and outside the polygon) and
-			// undo reverts cleanly. Rubber-band first so edge-marked overlap points
-			// get restored to the true original by the edge revert that follows.
-			restoreHistory(_lassoRubberBandHistory);
-			restoreHistory(_lassoEdgeHistory);
-		}
-		// Flood-fill from seeds rasterized along every polygon edge, walking 26-connected
-		// surface voxels that project inside the polygon. Disjoint structures sharing
-		// the (u, v) silhouette (e.g. a tower behind the rooftop) are no longer swept
-		// in by the 2D point-in-polygon filter alone.
-		voxelutil::lassoFloodFillSurface(wrapper, _lassoPath, uAxis, vAxis, wAxis, positiveNormal,
-										 ctx.targetVolumeRegion, func);
-		if (!_previewMode) {
-			_lassoPath.clear();
-		}
-		break;
-	}
-	case SelectMode::Paint: {
-		const glm::ivec3 center = ctx.cursorPosition;
-		const int rad = radius();
-		const int radSq = rad * rad;
-		if (!_paintDirtyRegion.isValid() && !_paintHadSelection) {
-			const int activeNodeId = sceneGraph.activeNode();
-			if (sceneGraph.hasNode(activeNodeId)) {
-				_paintHadSelection = sceneGraph.node(activeNodeId).hasSelection();
-			}
-		}
-		const bool growOnly = _paintGrowRegion && wrapper.modifierType() != ModifierType::Erase
-			&& (_paintHadSelection || _paintDirtyRegion.isValid());
-		voxelutil::VisitSolid condition;
-		auto paintFunc = [&](int x, int y, int z, const voxel::Voxel &voxel) {
-			const int dx = x - center.x;
-			const int dy = y - center.y;
-			const int dz = z - center.z;
-			if (dx * dx + dy * dy + dz * dz > radSq) {
-				return;
-			}
-			if (growOnly) {
-				bool hasSelectedNeighbor = false;
-				for (const glm::ivec3 &off : ::voxel::arrayPathfinderFaces) {
-					const glm::ivec3 npos(x + off.x, y + off.y, z + off.z);
-					if (ctx.targetVolumeRegion.containsPoint(npos)) {
-						const ::voxel::Voxel &neighborVoxel = wrapper.voxel(npos);
-						if (!::voxel::isAir(neighborVoxel.getMaterial()) &&
-							(neighborVoxel.getFlags() & ::voxel::FlagOutline)) {
-							hasSelectedNeighbor = true;
-							break;
-						}
-					}
-				}
-				if (!hasSelectedNeighbor) {
-					return;
-				}
-			}
-			func(x, y, z, voxel);
-		};
-		voxelutil::visitVolume(wrapper, selectionRegion, paintFunc, condition);
-		_paintDirtyRegion.accumulate(selectionRegion);
-		break;
-	}
-	case SelectMode::Script:
-	case SelectMode::Max:
-		return;
-	}
+	const select::AABBBrushState state = buildState(ctx);
+	activeStrategy()->generate(sceneGraph, wrapper, ctx, selectionRegion, state);
+	_sceneModifiedFlags = activeStrategy()->_modifiedFlags;
 }
 
-void SelectBrush::redrawEdgesOnVolume(voxel::RawVolume *volume, const voxel::Region &region, voxel::Region &outDirty) {
-	const int vertexCount = (int)_lassoPath.size();
-	if (vertexCount < 2) {
-		return;
-	}
-	const int uAxis = _lassoUAxis;
-	const int vAxis = _lassoVAxis;
-	const int wAxis = _lassoFaceAxisIdx;
-	const bool positiveNormal = voxel::isPositiveFace(_lassoFace);
-
-	size_t edgeReserve = 0u;
-	for (int edgeIdx = 1; edgeIdx < vertexCount; ++edgeIdx) {
-		const glm::ivec3 &startPt = _lassoPath[edgeIdx - 1];
-		const glm::ivec3 &endPt = _lassoPath[edgeIdx];
-		edgeReserve += (size_t)(glm::max(glm::abs(endPt[uAxis] - startPt[uAxis]),
-										 glm::abs(endPt[vAxis] - startPt[vAxis])) + 1);
-	}
-	_lassoEdgeHistory.reserve(edgeReserve);
-	auto edgeFunc = [&](int x, int y, int z, const voxel::Voxel &v) {
-		const glm::ivec3 pos(x, y, z);
-		if (_lassoEdgeHistory.find(pos) == _lassoEdgeHistory.end()) {
-			_lassoEdgeHistory.put(pos, v);
-		}
-		voxel::Voxel flagged = v;
-		flagged.setFlags(flagged.getFlags() | voxel::FlagOutline);
-		volume->setVoxel(pos, flagged);
-		outDirty.accumulate(pos);
-	};
-	auto readVoxel = [&](const glm::ivec3 &pos) { return volume->voxel(pos); };
-	for (int edgeIdx = 1; edgeIdx < vertexCount; ++edgeIdx) {
-		voxelutil::drawLassoEdgeSurface(readVoxel, _lassoPath[edgeIdx - 1], _lassoPath[edgeIdx], uAxis, vAxis, wAxis,
-										positiveNormal, region, edgeFunc);
-	}
+bool SelectBrush::wantBrushGizmo(const BrushContext &ctx) const {
+	return activeStrategy()->wantBrushGizmo(ctx);
 }
 
-void SelectBrush::invalidateLasso() {
-	_lassoAccumulating = false;
-	_lassoPath.clear();
-	_lassoEdgeHistory.clear();
-	_lassoRubberBandHistory.clear();
+void SelectBrush::brushGizmoState(const BrushContext &ctx, BrushGizmoState &state) const {
+	activeStrategy()->brushGizmoState(ctx, state);
 }
 
-void SelectBrush::popLastLassoPathEntry() {
-	if (!_lassoPath.empty()) {
-		_lassoPath.pop();
+bool SelectBrush::applyBrushGizmo(BrushContext &ctx, const glm::mat4 &matrix, const glm::mat4 &deltaMatrix,
+								  uint32_t operation) {
+	if (activeStrategy()->applyBrushGizmo(ctx, matrix, deltaMatrix, operation)) {
+		markDirty();
+		return true;
 	}
-}
-
-void SelectBrush::invalidateEllipse() {
-	_ellipseValid = false;
-	_ellipseHistory.clear();
+	return false;
 }
 
 } // namespace voxedit

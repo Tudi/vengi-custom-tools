@@ -24,26 +24,26 @@ void main(void) {
 	v_normal = normal.xyz;
 	v_flags = 0u;
 
-#if r_renderoutline == 1
-	v_flags |= FLAGOUTLINE;
-	if ((a_flags & FLAGOUTLINE) != 0u) {
-		v_flags |= FLAGOUTLINEPULSE;
-	}
-#else
-	if ((a_flags & FLAGOUTLINE) != 0u) {
+	if (u_vert_renderoutline != 0) {
 		v_flags |= FLAGOUTLINE;
+		if ((a_flags & FLAGOUTLINE) != 0u) {
+			v_flags |= FLAGOUTLINEPULSE;
+		}
+	} else {
+		if ((a_flags & FLAGOUTLINE) != 0u) {
+			v_flags |= FLAGOUTLINE;
+		}
 	}
-#endif
 
 	if (normalIndex > 0) { // NO_NORMAL
 		v_flags |= FLAGHASNORMALPALETTECOLOR;
-#if r_normals != 0
-		// Map the normal components back to [0, 1] range
-		float rf = (normal.x + 1.0) / 2.0;
-		float gf = (normal.y + 1.0) / 2.0;
-		float bf = (normal.z + 1.0) / 2.0;
-		materialColor = vec4(rf, gf, bf, materialColor.a);
-#endif
+		if (u_shownormals != 0) {
+			// Map the normal components back to [0, 1] range
+			float rf = (normal.x + 1.0) / 2.0;
+			float gf = (normal.y + 1.0) / 2.0;
+			float bf = (normal.z + 1.0) / 2.0;
+			materialColor = vec4(rf, gf, bf, materialColor.a);
+		}
 	}
 
 	if (u_gray != 0) {
@@ -61,10 +61,8 @@ void main(void) {
 	v_glow = glowColor;
 	v_ambientocclusion = aovalues[a_ao];
 
-#if cl_shadowmap == 1
 	v_lightspacepos = pos.xyz;
 	v_viewz = (u_viewprojection * vec4(v_lightspacepos, 1.0)).w;
-#endif // cl_shadowmap
 
 	gl_Position = u_viewprojection * pos;
 }

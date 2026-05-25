@@ -51,7 +51,7 @@ void MeshState::construct() {
 	const core::VarDef voxRenderMeshMode(cfg::VoxelMeshMode, (int)voxel::SurfaceExtractionType::Binary,
 										 (int)voxel::SurfaceExtractionType::Cubic,
 										 (int)voxel::SurfaceExtractionType::Binary, N_("Mesh mode"),
-										 N_("0 = cubes, 1 = marching cubes, 2 = binary mesher"), core::CV_SHADER);
+										 N_("0 = cubes, 1 = marching cubes, 2 = binary mesher"));
 	core::Var::registerVar(voxRenderMeshMode);
 	const core::VarDef voxMeshAlloc(cfg::VoxelMeshAlloc, 0, 0, 1,
 									N_("Mesh allocation strategy"),
@@ -277,9 +277,17 @@ bool MeshState::runScheduledExtractions(size_t maxExtraction) {
 				continue;
 			}
 			if (v->isEmpty(finalRegion)) {
-				const glm::ivec3 &mins = extractRegion.region.getLowerCorner();
-				results[i] = {mins, idx, voxel::ChunkMesh(0, 0, false)};
-				continue;
+				// All surface extractors peek at neighbors one voxel outside the
+				// region (e.g. the cubic extractor checks voxelLeft at offset-1).
+				// If the region itself is empty but there are solid voxels just
+				// outside, we still need to run the extractor to generate boundary
+				// faces. Check the expanded region to catch this case.
+				const voxel::Region expandedRegion(finalRegion.getLowerCorner() - 1, finalRegion.getUpperCorner() + 1);
+				if (v->isEmpty(expandedRegion)) {
+					const glm::ivec3 &mins = extractRegion.region.getLowerCorner();
+					results[i] = {mins, idx, voxel::ChunkMesh(0, 0, false)};
+					continue;
+				}
 			}
 
 			const palette::Palette &pal = palette(resolveIdx(idx));
@@ -351,8 +359,13 @@ bool MeshState::scheduleRegionExtraction(int idx, const voxel::Region &region) {
 	// the given region mesh size ranges
 	// the boundaries are special - that's why we take care of this with
 	// the offset of 1 - see the cubic surface extractor docs
-	const glm::ivec3 &l = (region.getLowerCorner() - meshSizeMinusOne) / meshSize;
-	const glm::ivec3 &u = (region.getUpperCorner() + 1) / meshSize;
+	// Use floor division (not C++ truncation) so that negative coordinates
+	// correctly map to the chunk with the lower index.
+	auto floorDiv = [](int a, int b) { return (a / b) - (a % b != 0 && (a ^ b) < 0); };
+	const glm::ivec3 lv = region.getLowerCorner() - meshSizeMinusOne;
+	const glm::ivec3 uv = region.getUpperCorner() + 1;
+	const glm::ivec3 l(floorDiv(lv.x, s), floorDiv(lv.y, s), floorDiv(lv.z, s));
+	const glm::ivec3 u(floorDiv(uv.x, s), floorDiv(uv.y, s), floorDiv(uv.z, s));
 
 	bool deletedMesh = false;
 	Log::debug("modified region: %s", region.toString().c_str());
@@ -473,7 +486,12 @@ core::Buffer<voxel::RawVolume *> MeshState::shutdown() {
 }
 
 void MeshState::resetReferences() {
-	for (int idx : _activeIndices) {
+	for (int i = (int)_activeIndices.size() - 1; i >= 0; --i) {
+		const int idx = _activeIndices[i];
+		if (_volumeData[idx]._reference != -1 && _volumeData[idx]._rawVolume == nullptr) {
+			_activeIndices[i] = _activeIndices.back();
+			_activeIndices.pop();
+		}
 		_volumeData[idx]._reference = -1;
 	}
 }
@@ -492,6 +510,9 @@ void MeshState::setReference(int idx, int referencedIdx) {
 	ensureSize(idx);
 	VolumeData &state = _volumeData[idx];
 	state._reference = referencedIdx;
+	if (referencedIdx != -1 && state._rawVolume == nullptr) {
+		_activeIndices.push_back(idx);
+	}
 }
 
 bool MeshState::hidden(int idx) const {

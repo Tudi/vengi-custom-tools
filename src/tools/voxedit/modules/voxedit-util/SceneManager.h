@@ -208,6 +208,7 @@ protected:
 
 	int nodeColorToNewNode(int nodeId, const voxel::Voxel voxelColor);
 	int nodeColorToNewNode(const voxel::Voxel voxelColor);
+	int nodeColorToNewNode(int nodeId, const core::Buffer<uint8_t> &paletteIndices);
 	void nodeCrop(int nodeId);
 	void nodeSplitObjects(int nodeId);
 	void nodeScaleDown(int nodeId);
@@ -287,6 +288,7 @@ protected:
 	 * representation of the palette)
 	 */
 	bool nodeRemoveAlpha(scenegraph::SceneGraphNode &node, uint8_t palIdx);
+	bool nodeResetMaterial(scenegraph::SceneGraphNode &node, uint8_t palIdx);
 	/**
 	 * @param[in] palIdx The visual palette index (this is **not** the real color index, but the index of the visual
 	 * representation of the palette)
@@ -316,6 +318,7 @@ public:
 	 * @brief Update the cursor position used for tracing
 	 */
 	void setMousePos(int x, int y);
+	const glm::ivec2 &mousePos() const;
 	void setMouseLook(bool active);
 	void setMouseDelta(int dx, int dy);
 
@@ -638,6 +641,8 @@ public:
 	 * representation of the palette)
 	 */
 	bool nodeRemoveAlpha(int nodeId, uint8_t palIdx);
+	bool nodeResetMaterial(int nodeId, uint8_t palIdx);
+
 	/**
 	 * @param[in] palIdx The visual palette index (this is **not** the real color index, but the index of the visual
 	 * representation of the palette)
@@ -765,6 +770,10 @@ inline voxelgenerator::LUAApi &SceneManager::luaApi() {
 
 inline bool SceneManager::lsystemRunning() const {
 	return _lsystemRunning;
+}
+
+inline const glm::ivec2 &SceneManager::mousePos() const {
+	return _mouseCursor;
 }
 
 using SceneManagerPtr = core::SharedPtr<SceneManager>;

@@ -349,6 +349,10 @@ bool compileShader(Id id, ShaderType shaderType, const core::String &source, con
 	return false;
 }
 
+bool loadShaderSPIRV(Id id, ShaderType shaderType, const uint8_t *spirv, size_t spirvSize, const core::String &name) {
+	return false;
+}
+
 bool linkShader(Id program, Id vert, Id frag, Id geom, const core::String &name) {
 	return false;
 }
@@ -366,14 +370,6 @@ void waitShader(MemoryBarrierType wait) {
 
 bool runShader(Id program, const glm::uvec3 &workGroups, MemoryBarrierType wait) {
 	return false;
-}
-
-int fetchUniforms(Id program, ShaderUniforms &uniforms, const core::String &name) {
-	return -1;
-}
-
-int fetchAttributes(Id program, ShaderAttributes &attributes, const core::String &name) {
-	return -1;
 }
 
 void setObjectName(Id handle, ObjectNameType type, const core::String &name) {
@@ -404,14 +400,7 @@ void *mapBuffer(Id handle, BufferType type, AccessMode mode) {
 void unmapBuffer(Id handle, BufferType type) {
 }
 
-void setUniformBufferBinding(Id program, uint32_t blockIndex, uint32_t blockBinding) {
-}
-
 void setUniformi(int location, int value) {
-}
-
-int32_t getUniformBufferOffset(Id program, const char *name) {
-	return -1;
 }
 
 } // namespace video

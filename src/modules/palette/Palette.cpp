@@ -145,8 +145,13 @@ glm::vec4 Palette::color4(uint8_t i) const {
 }
 
 void Palette::reduce(uint8_t targetColors) {
-	color::ColorReductionType reductionType =
-		color::toColorReductionType(core::getVar(cfg::CoreColorReduction)->strVal().c_str());
+	const core::VarPtr &var = core::getVar(cfg::CoreColorReduction);
+	const core::String &strVal = var->strVal();
+	color::ColorReductionType reductionType = color::toColorReductionType(strVal.c_str());
+	if (reductionType == color::ColorReductionType::Max) {
+		Log::warn("Invalid color reduction type '%s'", strVal.c_str());
+		reductionType = color::ColorReductionType::MedianCut;
+	}
 	color::RGBA oldcolors[PaletteMaxColors];
 	core_memcpy(oldcolors, _colors, sizeof(oldcolors));
 	_colorCount = color::quantize(_colors, targetColors, oldcolors, _colorCount, reductionType);
@@ -155,8 +160,13 @@ void Palette::reduce(uint8_t targetColors) {
 
 void Palette::quantize(const color::RGBA *inputColors, const size_t inputColorCount, int targetColors) {
 	Log::debug("quantize %i colors", (int)inputColorCount);
-	color::ColorReductionType reductionType =
-		color::toColorReductionType(core::getVar(cfg::CoreColorReduction)->strVal().c_str());
+	const core::VarPtr &var = core::getVar(cfg::CoreColorReduction);
+	const core::String &strVal = var->strVal();
+	color::ColorReductionType reductionType = color::toColorReductionType(strVal.c_str());
+	if (reductionType == color::ColorReductionType::Max) {
+		Log::warn("Invalid color reduction type '%s'", strVal.c_str());
+		reductionType = color::ColorReductionType::MedianCut;
+	}
 	const size_t maxColors = targetColors > 0 ? (size_t)targetColors : lengthof(_colors);
 	_colorCount = color::quantize(_colors, maxColors, inputColors, inputColorCount, reductionType);
 	markDirty();
@@ -1187,7 +1197,7 @@ void Palette::setAlpha(uint8_t paletteColorIdx, float factor) {
 	if (factor < 0.0f || factor > 1.0f) {
 		Log::warn("Unexpected alpha factor %f for palette color %i", factor, paletteColorIdx);
 	}
-	_colors[paletteColorIdx].a = (float)_colors[paletteColorIdx].a * glm::clamp(factor, 0.0f, 1.0f);
+	_colors[paletteColorIdx].a = (uint8_t)(((float)_colors[paletteColorIdx].a * glm::clamp(factor, 0.0f, 1.0f)) + 0.5f);
 	markDirty();
 }
 

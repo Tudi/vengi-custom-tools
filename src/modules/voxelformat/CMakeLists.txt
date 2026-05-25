@@ -2,8 +2,9 @@ set(LIB voxelformat)
 
 set(EXTERNAL_SRCS
 	external/ogt_vox.h
+	external/cgltf.h
+	external/cgltf_write.h
 	external/tiny_obj_loader.h
-	external/tiny_gltf.h
 	external/ufbx.h external/ufbx.c
 	external/ufbx_write.h external/ufbx_write.c
 	external/libvxl.h external/libvxl.c
@@ -272,6 +273,7 @@ set(TEST_FILES
 	"tests/bug636/legs.hva"
 	"tests/chr_knight.fbx"
 	"tests/chr_knight.gox"
+	"tests/gox-shape-3-layers.gox"
 	"tests/chr_knight.qb"
 	"tests/chr_knight.qbcl"
 	"tests/chr_oldman.vengi"
@@ -431,6 +433,7 @@ set(TEST_FILES
 	"tests/voxlap5.kv6"
 	"tests/vox-to-kv6-broken.vox"
 	"voxedit/chr_knight.vengi"
+	"voxedit/aquarium.vengi"
 )
 
 gtest_suite_begin(tests-${LIB} TEMPLATE ${ROOT_DIR}/src/modules/core/tests/main.cpp.in)
@@ -450,6 +453,7 @@ set(BENCHMARK_FILES
 	tests/chr_knight.qb
 	tests/chr_knight.qbcl
 	tests/chr_knight.gox
+	tests/gox-shape-3-layers.gox
 	voxedit/chr_knight.vengi
 )
 

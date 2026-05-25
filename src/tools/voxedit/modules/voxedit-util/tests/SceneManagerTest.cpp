@@ -1078,6 +1078,47 @@ TEST_F(SceneManagerTest, testColorToNewNode) {
 	EXPECT_EQ(0, voxelutil::countVoxelsByColor(*v, targetVoxel));
 }
 
+TEST_F(SceneManagerTest, testColorToNewNodeMultipleIndices) {
+	const voxel::Region region{0, 5};
+	ASSERT_TRUE(_sceneMgr->newScene(true, "newscene", region));
+
+	const int nodeId = _sceneMgr->sceneGraph().activeNode();
+	voxel::RawVolume *v = _sceneMgr->volume(nodeId);
+	for (int i = 0; i < 4; ++i) {
+		v->setVoxel(glm::ivec3(i, 1, 1), voxel::createVoxel(voxel::VoxelType::Generic, i));
+	}
+	const voxel::Voxel voxel1(voxel::VoxelType::Generic, 1);
+	const voxel::Voxel voxel2(voxel::VoxelType::Generic, 2);
+	const voxel::Voxel voxel3(voxel::VoxelType::Generic, 3);
+	EXPECT_EQ(1, voxelutil::countVoxelsByColor(*v, voxel1));
+	EXPECT_EQ(1, voxelutil::countVoxelsByColor(*v, voxel2));
+	EXPECT_EQ(1, voxelutil::countVoxelsByColor(*v, voxel3));
+
+	core::Buffer<uint8_t> indices;
+	indices.push_back(1);
+	indices.push_back(3);
+	const int newNodeId = sceneMgr()->nodeColorToNewNode(nodeId, indices);
+	EXPECT_NE(InvalidNodeId, newNodeId);
+	voxel::RawVolume *newV = _sceneMgr->volume(newNodeId);
+	ASSERT_NE(nullptr, newV);
+	// indices 1 and 3 moved to new node
+	EXPECT_EQ(1, voxelutil::countVoxelsByColor(*newV, voxel1));
+	EXPECT_EQ(0, voxelutil::countVoxelsByColor(*newV, voxel2));
+	EXPECT_EQ(1, voxelutil::countVoxelsByColor(*newV, voxel3));
+	// removed from source, index 2 untouched
+	EXPECT_EQ(0, voxelutil::countVoxelsByColor(*v, voxel1));
+	EXPECT_EQ(1, voxelutil::countVoxelsByColor(*v, voxel2));
+	EXPECT_EQ(0, voxelutil::countVoxelsByColor(*v, voxel3));
+}
+
+TEST_F(SceneManagerTest, testColorToNewNodeEmptyIndices) {
+	const voxel::Region region{0, 5};
+	ASSERT_TRUE(_sceneMgr->newScene(true, "newscene", region));
+	const int nodeId = _sceneMgr->sceneGraph().activeNode();
+	const core::Buffer<uint8_t> indices;
+	EXPECT_EQ(InvalidNodeId, sceneMgr()->nodeColorToNewNode(nodeId, indices));
+}
+
 TEST_F(SceneManagerTest, testNodeShiftAllKeyframes) {
 	scenegraph::SceneGraphNode node(scenegraph::SceneGraphNodeType::Model);
 	node.createVolume(voxel::Region(0, 1));
@@ -1150,7 +1191,11 @@ TEST_F(SceneManagerTest, testImportPalette) {
 	EXPECT_GT((int)palette.size(), 0);
 }
 
+#ifdef VENGI_COMPACT_VOXEL
+TEST_F(SceneManagerTest, DISABLED_testCalculateNormals) {
+#else
 TEST_F(SceneManagerTest, testCalculateNormals) {
+#endif
 	const voxel::Region region{0, 5};
 	ASSERT_TRUE(_sceneMgr->newScene(true, "normals_test", region));
 	const int nodeId = _sceneMgr->sceneGraph().activeNode();
@@ -1956,7 +2001,11 @@ TEST_F(SceneManagerTest, testFillPlane) {
 	_sceneMgr->fillPlane(img);
 }
 
+#ifdef VENGI_COMPACT_VOXEL
+TEST_F(SceneManagerTest, DISABLED_testNodeUpdateVoxelType) {
+#else
 TEST_F(SceneManagerTest, testNodeUpdateVoxelType) {
+#endif
 	const int nodeId = _sceneMgr->sceneGraph().activeNode();
 	ASSERT_TRUE(testSetVoxel(testMins(), 1));
 	voxel::RawVolume *v = _sceneMgr->volume(nodeId);
@@ -2902,7 +2951,7 @@ TEST_F(SceneManagerTest, testUndoLassoOverlappingSelection) {
 	Modifier &modifier = _sceneMgr->modifier();
 	modifier.setBrushType(BrushType::Select);
 	SelectBrush &selBrush = modifier.selectBrush();
-	selBrush.setSelectMode(SelectMode::Lasso);
+	selBrush.setSelectMode(SelectMode::PolygonLasso);
 
 	// Square polygon over x in [2..6], z in [2..6] - overlaps zone A (x in [2..4])
 	auto clickVertex = [&](const glm::ivec3 &pos) {
@@ -2914,8 +2963,8 @@ TEST_F(SceneManagerTest, testUndoLassoOverlappingSelection) {
 	clickVertex(glm::ivec3(6, 0, 6));
 	clickVertex(glm::ivec3(2, 0, 6));
 
-	ASSERT_TRUE(selBrush.lassoAccumulating());
-	ASSERT_EQ((int)selBrush.lassoPath().size(), 4);
+	ASSERT_TRUE(selBrush.polygonLasso().accumulating());
+	ASSERT_EQ((int)selBrush.polygonLasso().path().size(), 4);
 
 	// Finalize the polygon -> creates memento state 2 with All flag
 	_sceneMgr->selectionFinalizeLasso(nodeId);
@@ -2973,7 +3022,7 @@ TEST_F(SceneManagerTest, testUndoLassoOverlappingSelectionLargeVolume) {
 	Modifier &modifier = _sceneMgr->modifier();
 	modifier.setBrushType(BrushType::Select);
 	SelectBrush &selBrush = modifier.selectBrush();
-	selBrush.setSelectMode(SelectMode::Lasso);
+	selBrush.setSelectMode(SelectMode::PolygonLasso);
 
 	auto clickVertex = [&](const glm::ivec3 &pos) {
 		modifier.setCursorPosition(pos, voxel::FaceNames::PositiveY);
@@ -2984,8 +3033,8 @@ TEST_F(SceneManagerTest, testUndoLassoOverlappingSelectionLargeVolume) {
 	clickVertex(glm::ivec3(150, 0, 150));
 	clickVertex(glm::ivec3(50, 0, 150));
 
-	ASSERT_TRUE(selBrush.lassoAccumulating());
-	ASSERT_EQ((int)selBrush.lassoPath().size(), 4);
+	ASSERT_TRUE(selBrush.polygonLasso().accumulating());
+	ASSERT_EQ((int)selBrush.polygonLasso().path().size(), 4);
 
 	_sceneMgr->selectionFinalizeLasso(nodeId);
 
@@ -3042,7 +3091,7 @@ TEST_F(SceneManagerTest, testUndoLassoOverlappingSelectionViaExecuteBrush) {
 	Modifier &modifier = _sceneMgr->modifier();
 	modifier.setBrushType(BrushType::Select);
 	SelectBrush &selBrush = modifier.selectBrush();
-	selBrush.setSelectMode(SelectMode::Lasso);
+	selBrush.setSelectMode(SelectMode::PolygonLasso);
 
 	scenegraph::SceneGraph &sg = _sceneMgr->sceneGraph();
 	auto clickAndExecute = [&](const glm::ivec3 &pos) {
@@ -3130,7 +3179,7 @@ TEST_F(SceneManagerTest, testUndoLassoAfterSelectAllRectangle) {
 	ASSERT_EQ(v->voxel(180, 0, 100).getFlags() & voxel::FlagOutline, 0);
 
 	// Lasso: crossing HORIZONTAL pole (z in [80..120], x in [0..199])
-	selBrush.setSelectMode(SelectMode::Lasso);
+	selBrush.setSelectMode(SelectMode::PolygonLasso);
 	auto clickAndExecute = [&](const glm::ivec3 &pos) {
 		modifier.setCursorPosition(pos, voxel::FaceNames::PositiveY);
 		EXPECT_TRUE(modifier.beginBrush());

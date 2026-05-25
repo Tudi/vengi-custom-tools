@@ -15,7 +15,6 @@
 #include "core/collection/DynamicArray.h"
 #include "core/collection/Map.h"
 #include "core/concurrent/Atomic.h"
-#include "core/concurrent/Lock.h"
 #include "io/Archive.h"
 #include "meshoptimizer.h"
 #include "palette/NormalPalette.h"
@@ -140,7 +139,7 @@ void MeshFormat::addToPosMap(PosMap &posMap, const voxel::Region &region, color:
 	if (rgba.a <= AlphaThreshold) {
 		return;
 	}
-	const int idx = region.index(pos);
+	const int64_t idx = region.index(pos);
 	auto iter = posMap.find(idx);
 	if (iter == posMap.end()) {
 		posMap.emplace(idx, {area, rgba, normalIdx, materialIdx});
@@ -177,9 +176,9 @@ void MeshFormat::transformTris(const voxel::Region &region, const MeshTriCollect
 	palette::NormalPaletteLookup normalLookup(normalPalette);
 	const int parallel = app::for_parallel_size(0, tris.size());
 	core::DynamicArray<PosMap> localMaps;
-	localMaps.reserve(parallel);
+	localMaps.resize(parallel);
 	for (int i = 0; i < parallel; ++i) {
-		localMaps.emplace_back((int)posMap.capacity());
+		localMaps[i].reserve(((int)tris.size() / parallel) + 1);
 	}
 	core::AtomicInt mapIdx(0);
 	auto fn = [&tris, &region, &normalLookup, &localMaps, &mapIdx, &meshMaterialArray, this](int start, int end) {
@@ -221,9 +220,9 @@ void MeshFormat::transformTrisAxisAligned(const voxel::Region &region, const Mes
 	palette::NormalPaletteLookup normalLookup(normalPalette);
 	const int parallel = app::for_parallel_size(0, tris.size());
 	core::DynamicArray<PosMap> localMaps;
-	localMaps.reserve(parallel);
+	localMaps.resize(parallel);
 	for (int i = 0; i < parallel; ++i) {
-		localMaps.emplace_back((int)posMap.capacity());
+		localMaps[i].reserve(((int)tris.size() / parallel) + 1);
 	}
 	core::AtomicInt mapIdx(0);
 	auto fn = [&tris, &normalLookup, region, &localMaps, &mapIdx, &meshMaterialArray, this](int start, int end) {
@@ -600,8 +599,18 @@ int MeshFormat::voxelizeNode(const core::UUID &uuid, const core::String &name, s
 	const bool fillHollow = core::getVar(cfg::VoxformatFillHollow)->boolVal();
 	const int maxVoxels = vdim.x * vdim.y * vdim.z;
 	if (axisAligned) {
-		Log::debug("max voxels: %i (%i:%i:%i)", maxVoxels, vdim.x, vdim.y, vdim.z);
-		PosMap posMap(maxVoxels);
+		// estimate capacity from triangle bounding volumes (each axis-aligned tri covers a 2D area)
+		int64_t estimatedVoxels = 0;
+		for (const voxelformat::MeshTri &tri : tris) {
+			const glm::ivec3 mins = tri.roundedMins();
+			const glm::ivec3 maxs = tri.roundedMaxs() + glm::ivec3(glm::round(glm::abs(glm::normalize(tri.normal()))));
+			const glm::ivec3 size = glm::max(maxs - mins, glm::ivec3(1));
+			estimatedVoxels += (int64_t)size.x * size.y * size.z;
+		}
+		const int posMapCapacity = (int)core_min((int64_t)maxVoxels, estimatedVoxels);
+		Log::debug("max voxels: %i, estimated: %i (%i:%i:%i)", maxVoxels, posMapCapacity, vdim.x, vdim.y, vdim.z);
+		PosMap posMap;
+		posMap.reserve(posMapCapacity);
 		transformTrisAxisAligned(region, tris, posMap, meshMaterialArray, normalPalette);
 		tris.release();
 		node.createVolume(region);
@@ -712,7 +721,8 @@ int MeshFormat::voxelizeNode(const core::UUID &uuid, const core::String &name, s
 			return InvalidNodeId;
 		}
 
-		PosMap posMap(maxVoxels);
+		PosMap posMap;
+		posMap.reserve(subdivided.size());
 		transformTris(region, subdivided, posMap, meshMaterialArray, normalPalette);
 		subdivided.release();
 		node.createVolume(region);

@@ -1,5 +1,5 @@
 
-layout(std140) uniform u_frag {
+layout(std140, binding = 1) uniform u_frag {
 	mediump vec3 u_lightdir;
 	lowp vec3 u_diffuse_color;
 	lowp vec3 u_ambient_color;
@@ -8,22 +8,23 @@ layout(std140) uniform u_frag {
 	mat4 u_cascades[4];
 	vec4 u_selectiontint;
 	uint u_timemillis;
+	float u_gamma;
+	int u_checkerboard;
+	int u_debug_shadow;
+	int u_debug_cascade;
+	int u_tonemapping;
+	int u_renderoutline;
+	int u_shadowmap;
 };
 
 layout(location = 0) $out vec4 o_color;
 layout(location = 1) $out vec4 o_glow;
 
-#ifndef cl_gamma
-#define cl_gamma 1.0
-#endif
-
-#if cl_shadowmap == 1
-
 $in vec3 v_lightspacepos;
 $in float v_viewz;
 $constant MaxDepthBuffers 4
 
-uniform sampler2DArrayShadow u_shadowmap;
+layout(binding = 2) uniform sampler2DArrayShadow u_shadowmaptex;
 
 /**
  * perform percentage-closer shadow map lookup
@@ -36,7 +37,7 @@ float sampleShadowPCF(in float bias, in int cascade, in vec2 uv, in float compar
 	for (int x = -r; x <= r; x++) {
 		for (int y = -r; y <= r; y++) {
 			vec2 off = vec2(x, y) / u_depthsize;
-			result += texture(u_shadowmap, vec4(uv + off, cascade, compareDepth));
+			result += texture(u_shadowmaptex, vec4(uv + off, cascade, compareDepth));
 		}
 	}
 	const float size = 2.0 * float(r) + 1.0;
@@ -54,6 +55,9 @@ vec3 calculateShadowUVZ(in vec4 lightspacepos, in int cascade) {
 }
 
 vec3 shadow(in vec4 lightspacepos, in float bias, in vec3 normal, in vec3 lightDir, vec3 color, in vec3 diffuse, in vec3 ambient) {
+	if (u_shadowmap == 0) {
+		return color * (ambient + diffuse);
+	}
 	int cascade = int(dot(vec4(greaterThan(vec4(v_viewz), u_distances)), vec4(1)));
 	cascade = clamp(cascade, 0, MaxDepthBuffers - 1);
 	float cascadeNear = (cascade == 0) ? 0.0 : u_distances[cascade - 1];
@@ -89,53 +93,38 @@ vec3 shadow(in vec4 lightspacepos, in float bias, in vec3 normal, in vec3 lightD
 	// Use a smaller bias since we already applied normal offset
 	float slopeBias = depthBias * (0.1 + slopeScale * 0.4);
 	float shadow = sampleShadowPCF(slopeBias, cascade, uv.xy, uv.z);
-#if cl_debug_cascade
-	if (cascade == 0) {
-		color.r = 0.0;
-		color.g = 1.0;
-		color.b = 0.0;
-	} else if (cascade == 1) {
-		color.r = 0.0;
-		color.g = 1.0;
-		color.b = 1.0;
-	} else if (cascade == 2) {
-		color.r = 0.0;
-		color.g = 0.0;
-		color.b = 1.0;
-	} else if (cascade == 3) {
-		color.r = 0.0;
-		color.g = 0.5;
-		color.b = 0.5;
-	} else {
-		color.r = 1.0;
+	if (u_debug_cascade != 0) {
+		if (cascade == 0) {
+			color.r = 0.0;
+			color.g = 1.0;
+			color.b = 0.0;
+		} else if (cascade == 1) {
+			color.r = 0.0;
+			color.g = 1.0;
+			color.b = 1.0;
+		} else if (cascade == 2) {
+			color.r = 0.0;
+			color.g = 0.0;
+			color.b = 1.0;
+		} else if (cascade == 3) {
+			color.r = 0.0;
+			color.g = 0.5;
+			color.b = 0.5;
+		} else {
+			color.r = 1.0;
+		}
 	}
-#endif // cl_debug_cascade
-#if cl_debug_shadow == 1
-	// shadow only rendering
-	return vec3(shadow);
-#else // cl_debug_shadow
+	if (u_debug_shadow != 0) {
+		// shadow only rendering
+		return vec3(shadow);
+	}
 	vec3 lightvalue = ambient + (diffuse * shadow);
 	return color * lightvalue;
-#endif // cl_debug_shadow
 }
 
 vec3 shadow(in float bias, in vec3 normal, in vec3 lightDir, vec3 color, in vec3 diffuse, in vec3 ambient) {
 	return shadow(vec4(v_lightspacepos, 1.0), bias, normal, lightDir, color, diffuse, ambient);
 }
-
-#else // cl_shadowmap == 1
-
-vec3 shadow(in vec4 lightspacepos, in float bias, in vec3 normal, in vec3 lightDir, in vec3 color, in vec3 diffuse, in vec3 ambient) {
-	return color * (ambient + diffuse);
-}
-
-vec3 shadow(in float bias, in vec3 normal, in vec3 lightDir, in vec3 color, in vec3 diffuse, in vec3 ambient) {
-	return color * (ambient + diffuse);
-}
-
-#endif // cl_shadowmap == 1
-
-#if r_checkerboard == 1
 
 // https://thebookofshaders.com
 float checker(in vec2 pos, float strength) {
@@ -145,24 +134,19 @@ float checker(in vec2 pos, float strength) {
 }
 
 vec3 checkerBoardColor(in vec3 normal, in vec3 pos, in vec3 color) {
-	float checkerBoardFactor = 1.0;
-	if (abs(normal.y) >= 0.999) {
-		checkerBoardFactor = checker(pos.xz, 0.2);
-	} else if (abs(normal.x) >= 0.999) {
-		checkerBoardFactor = checker(pos.yz, 0.2);
-	} else if (abs(normal.z) >= 0.999) {
-		checkerBoardFactor = checker(pos.xy, 0.2);
+	if (u_checkerboard != 0) {
+		float checkerBoardFactor = 1.0;
+		if (abs(normal.y) >= 0.999) {
+			checkerBoardFactor = checker(pos.xz, 0.2);
+		} else if (abs(normal.x) >= 0.999) {
+			checkerBoardFactor = checker(pos.yz, 0.2);
+		} else if (abs(normal.z) >= 0.999) {
+			checkerBoardFactor = checker(pos.xy, 0.2);
+		}
+		return color * checkerBoardFactor;
 	}
-	return color * checkerBoardFactor;
-}
-
-#else // r_checkerboard == 1
-
-vec3 checkerBoardColor(in vec3 normal, in vec3 pos, in vec3 color) {
 	return color;
 }
-
-#endif // r_checkerboard == 1
 
 
 vec4 darken(vec4 color) {

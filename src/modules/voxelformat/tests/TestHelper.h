@@ -57,14 +57,16 @@ enum class ValidateFlags {
 	PaletteColorsScaled = 1024, // palette color count must match - but the colors might be slightly different - see
 								// the maxDelta parameters in the tests
 
-	SceneGraphModels = 2048, // disable this for single volume formats
+	SceneGraphModels = 2048,	   // disable this for single volume formats
+	SceneGraphModelsParent = 4096, // only compare the parent node of the models - but not the children - used for
+								   // formats that don't support multiple models or a scene graph
 
 	Transform = Animations | Scale | Pivot | Translation,
-	All = Palette | Color | Transform | SceneGraphModels,										   // no region here
-	Mesh = Color | Animations | Scale | Pivot | Translation | SceneGraphModels | IgnoreHollow,
-	AllPaletteMinMatchingColors = PaletteMinMatchingColors | Color | Transform | SceneGraphModels, // no region here
-	AllPaletteColorOrderDiffers = PaletteColorOrderDiffers | Color | Transform | SceneGraphModels, // no region here
-	AllPaletteColorsScaled = PaletteColorsScaled | Color | Transform | SceneGraphModels,		   // no region here
+	All = Palette | Color | Transform | SceneGraphModels | SceneGraphModelsParent, // no region here
+	Mesh = Color | Animations | Scale | Pivot | Translation | SceneGraphModels | SceneGraphModelsParent | IgnoreHollow,
+	AllPaletteMinMatchingColors = PaletteMinMatchingColors | Color | Transform | SceneGraphModels | SceneGraphModelsParent, // no region here
+	AllPaletteColorOrderDiffers = PaletteColorOrderDiffers | Color | Transform | SceneGraphModels | SceneGraphModelsParent, // no region here
+	AllPaletteColorsScaled = PaletteColorsScaled | Color | Transform | SceneGraphModels | SceneGraphModelsParent,		   // no region here
 	Max
 };
 CORE_ENUM_BIT_OPERATIONS(ValidateFlags);
@@ -79,7 +81,9 @@ void colorComparatorDistance(color::RGBA c1, color::RGBA c2, float maxDelta = 0.
 void keyFrameComparator(const scenegraph::SceneGraphKeyFrames &keyframes1, const scenegraph::SceneGraphKeyFrames &keyframes2, ValidateFlags flags);
 void volumeComparator(const voxel::RawVolume& volume1, const palette::Palette &pal1, const voxel::RawVolume& volume2, const palette::Palette &pal2, ValidateFlags flags, float maxDelta = 0.001f);
 void sceneGraphComparator(const scenegraph::SceneGraph &graph1, const scenegraph::SceneGraph &graph2, ValidateFlags flags, float maxDelta = 0.001f);
-void materialComparator(const scenegraph::SceneGraph &graph1, const scenegraph::SceneGraph &graph2);
-void materialComparator(const palette::Palette &pal1, const palette::Palette &pal2);
+
+// this also allows you to skip some material properties, because a format might not support it.
+void materialComparator(const scenegraph::SceneGraph &graph1, const scenegraph::SceneGraph &graph2, const core::Buffer<palette::MaterialProperty> &ignoredMaterials = {});
+void materialComparator(const palette::Palette &pal1, const palette::Palette &pal2, const core::Buffer<palette::MaterialProperty> &ignoredMaterials = {});
 
 }

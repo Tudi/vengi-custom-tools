@@ -36,10 +36,6 @@
 
 namespace video {
 
-#ifndef MAX_SHADER_VAR_NAME
-#define MAX_SHADER_VAR_NAME 128
-#endif
-
 #define SANITY_CHECKS_GL 0
 
 namespace _priv {
@@ -683,70 +679,6 @@ void setupFeatures(GLVersion version) {
 #else
 	renderState().features[core::enumVal(Feature::TextureHalfFloat)] = renderState().features[core::enumVal(Feature::TextureFloat)];
 #endif
-}
-
-int fillUniforms(Id program, ShaderUniforms& uniformMap, const core::String& shaderName, bool block) {
-	GLenum activeEnum;
-	GLenum activeMaxLengthEnum;
-	if (block) {
-		activeEnum = GL_ACTIVE_UNIFORM_BLOCKS;
-		activeMaxLengthEnum = GL_ACTIVE_UNIFORM_BLOCK_MAX_NAME_LENGTH;
-	} else {
-		activeEnum = GL_ACTIVE_UNIFORMS;
-		activeMaxLengthEnum = GL_ACTIVE_UNIFORM_MAX_LENGTH;
-	}
-	GLint numUniforms = 0;
-	glGetProgramiv(program, activeEnum, &numUniforms);
-	GLint uniformNameSize = 0;
-	glGetProgramiv(program, activeMaxLengthEnum, &uniformNameSize);
-	char name[4096];
-	if (uniformNameSize + 1 >= (int)sizeof(name)) {
-		return 0;
-	}
-
-	const char *shaderNameC = shaderName.c_str();
-	for (int i = 0; i < numUniforms; i++) {
-		Uniform uniform;
-		if (block) {
-			core_assert(glGetActiveUniformBlockName != nullptr);
-			glGetActiveUniformBlockName(program, i, uniformNameSize, nullptr, name);
-			core_assert(glGetUniformBlockIndex != nullptr);
-			uint32_t location = glGetUniformBlockIndex(program, name);
-			if (location == GL_INVALID_INDEX) {
-				Log::debug("Could not get uniform block location for %s is %i (shader %s)", name, location, shaderNameC);
-				continue;
-			}
-			uniform.location = location;
-			Log::debug("Got uniform location for %s is %i (shader %s)", name, location, shaderNameC);
-		} else {
-			GLint size = 0;
-			GLenum type = 0;
-			core_assert(glGetActiveUniform != nullptr);
-			glGetActiveUniform(program, i, uniformNameSize, nullptr, &size, &type, name);
-			core_assert(glGetUniformLocation != nullptr);
-			int32_t location = glGetUniformLocation(program, name);
-			if (location < 0) {
-				Log::debug("Could not get uniform location for %s is %i (shader %s)", name, location, shaderNameC);
-				continue;
-			}
-			uniform.location = location;
-			Log::debug("Got uniform location for %s is %i (shader %s)", name, location, shaderNameC);
-		}
-		char* array = SDL_strchr(name, '[');
-		if (array != nullptr) {
-			*array = '\0';
-		}
-		uniform.block = block;
-		if (block) {
-			core_assert(glGetUniformBlockIndex != nullptr);
-			uniform.blockIndex = glGetUniformBlockIndex(program, name);
-			core_assert(glGetActiveUniformBlockiv != nullptr);
-			glGetActiveUniformBlockiv(program, uniform.location, GL_UNIFORM_BLOCK_DATA_SIZE, &uniform.size);
-			uniform.blockBinding = i;
-		}
-		uniformMap.put(core::String(name), uniform);
-	}
-	return numUniforms;
 }
 
 }
@@ -1470,19 +1402,6 @@ void deleteProgram(Id &id) {
 	if (rendererState().pendingProgramHandle == id) {
 		rendererState().pendingProgramHandle = InvalidId;
 	}
-	// Clear cached uniform buffer bindings for this program to prevent memory leak
-	// Keys are (program << 32 | blockIndex), so we need to remove all with matching program
-	const uint64_t programMask = static_cast<uint64_t>(id) << 32;
-	const uint64_t programBits = 0xFFFFFFFF00000000ULL;
-	core::DynamicArray<uint64_t> keysToRemove;
-	for (auto it = rendererState().uniformBufferBindings.begin(); it != rendererState().uniformBufferBindings.end(); ++it) {
-		if (((*it)->key & programBits) == programMask) {
-			keysToRemove.push_back((*it)->key);
-		}
-	}
-	for (uint64_t key : keysToRemove) {
-		rendererState().uniformBufferBindings.remove(key);
-	}
 	id = InvalidId;
 }
 
@@ -1553,6 +1472,12 @@ void deleteTextures(uint8_t amount, Id *ids) {
 		}
 		ids[i] = InvalidId;
 	}
+}
+
+void registerShaderBindings(Id program, const ShaderResourceBinding *bindings, int count) {
+	(void)program;
+	(void)bindings;
+	(void)count;
 }
 
 void setObjectName(Id handle, ObjectNameType type, const core::String &name) {
@@ -2187,7 +2112,7 @@ void uploadTexture(Id texture, int width, int height, const uint8_t *data, int i
 			glTextureStorage1D(texture, levels, f.internalFormat, width);
 			checkError();
 			if (data) {
-				glTextureSubImage1D(texture, 0, 0, width, f.dataFormat, f.dataType, (const GLvoid *)data);
+				glTextureSubImage1D(texture, 0, 0, width, f.dataFormat, f.dataType, (const void *)data);
 				checkError();
 			}
 		} else if (type == TextureType::Texture2D) {
@@ -2196,7 +2121,7 @@ void uploadTexture(Id texture, int width, int height, const uint8_t *data, int i
 			glTextureStorage2D(texture, levels, f.internalFormat, width, height);
 			checkError();
 			if (data) {
-				glTextureSubImage2D(texture, 0, 0, 0, width, height, f.dataFormat, f.dataType, (const GLvoid *)data);
+				glTextureSubImage2D(texture, 0, 0, 0, width, height, f.dataFormat, f.dataType, (const void *)data);
 				checkError();
 			}
 		} else if (type == TextureType::Texture2DMultisample) {
@@ -2206,7 +2131,7 @@ void uploadTexture(Id texture, int width, int height, const uint8_t *data, int i
 			glTextureStorage2DMultisample(texture, samples, f.internalFormat, width, height, false);
 			checkError();
 			if (data) {
-				glTextureSubImage2D(texture, 0, 0, 0, width, height, f.dataFormat, f.dataType, (const GLvoid *)data);
+				glTextureSubImage2D(texture, 0, 0, 0, width, height, f.dataFormat, f.dataType, (const void *)data);
 				checkError();
 			}
 		} else if (type == TextureType::Texture2DMultisampleArray) {
@@ -2218,7 +2143,7 @@ void uploadTexture(Id texture, int width, int height, const uint8_t *data, int i
 			checkError();
 			if (data) {
 				glTextureSubImage3D(texture, 0, 0, 0, 0, width, height, index, f.dataFormat, f.dataType,
-									(const GLvoid *)data);
+									(const void *)data);
 				checkError();
 			}
 		} else {
@@ -2228,7 +2153,7 @@ void uploadTexture(Id texture, int width, int height, const uint8_t *data, int i
 			checkError();
 			if (data) {
 				glTextureSubImage3D(texture, 0, 0, 0, 0, width, height, index, f.dataFormat, f.dataType,
-									(const GLvoid *)data);
+									(const void *)data);
 				checkError();
 			}
 		}
@@ -2245,10 +2170,10 @@ void uploadTexture(Id texture, int width, int height, const uint8_t *data, int i
 		if (type == TextureType::Texture1D) {
 			core_assert(height == 1);
 			core_assert(glTexImage1D != nullptr);
-			glTexImage1D(glType, 0, f.internalFormat, width, 0, f.dataFormat, f.dataType, (const GLvoid *)data);
+			glTexImage1D(glType, 0, f.internalFormat, width, 0, f.dataFormat, f.dataType, (const void *)data);
 		} else if (type == TextureType::Texture2D) {
 			core_assert(glTexImage2D != nullptr);
-			glTexImage2D(glType, 0, f.internalFormat, width, height, 0, f.dataFormat, f.dataType, (const GLvoid *)data);
+			glTexImage2D(glType, 0, f.internalFormat, width, height, 0, f.dataFormat, f.dataType, (const void *)data);
 			checkError();
 		} else if (type == TextureType::Texture2DMultisample) {
 			core_assert(samples > 0);
@@ -2262,7 +2187,7 @@ void uploadTexture(Id texture, int width, int height, const uint8_t *data, int i
 		} else {
 			core_assert(glTexImage3D != nullptr);
 			glTexImage3D(glType, 0, f.internalFormat, width, height, index, 0, f.dataFormat, f.dataType,
-						 (const GLvoid *)data);
+						 (const void *)data);
 			checkError();
 		}
 		if (wantMipmaps && levels > 1) {
@@ -2286,7 +2211,7 @@ void drawElements(Primitive mode, size_t numIndices, DataType type, void *offset
 	const GLenum glType = _priv::DataTypes[core::enumVal(type)];
 	video::validate(rendererState().programHandle);
 	core_assert(glDrawElements != nullptr);
-	glDrawElements(glMode, (GLsizei)numIndices, glType, (GLvoid *)offset);
+	glDrawElements(glMode, (GLsizei)numIndices, glType, (void *)offset);
 	checkError();
 }
 
@@ -2402,6 +2327,46 @@ bool compileShader(Id id, ShaderType shaderType, const core::String &source, con
 		}
 	}
 	deleteShader(id);
+	return false;
+}
+
+bool loadShaderSPIRV(Id id, ShaderType shaderType, const uint8_t *spirv, size_t spirvSize, const core::String &name) {
+	video_trace_scoped(LoadShaderSPIRV);
+	(void)shaderType;
+	if (id == InvalidId) {
+		return false;
+	}
+	if (!FLEXT_ARB_gl_spirv) {
+		Log::debug("GL_ARB_gl_spirv not available");
+		return false;
+	}
+	const GLuint lid = (GLuint)id;
+	video::checkError();
+	glShaderBinary(1, &lid, GL_SHADER_BINARY_FORMAT_SPIR_V_ARB, spirv, (GLsizei)spirvSize);
+	if (video::checkError(false)) {
+		Log::warn("glShaderBinary failed for %s", name.c_str());
+		return false;
+	}
+	glSpecializeShaderARB(lid, "main", 0, nullptr, nullptr);
+	if (video::checkError(false)) {
+		Log::warn("glSpecializeShaderARB failed for %s", name.c_str());
+		return false;
+	}
+	GLint status = 0;
+	glGetShaderiv(lid, GL_COMPILE_STATUS, &status);
+	video::checkError();
+	if (status == GL_TRUE) {
+		Log::debug("SPIR-V shader loaded successfully: %s", name.c_str());
+		return true;
+	}
+	GLint infoLogLength = 0;
+	glGetShaderiv(lid, GL_INFO_LOG_LENGTH, &infoLogLength);
+	if (infoLogLength > 1) {
+		GLchar *strInfoLog = new GLchar[infoLogLength + 1];
+		glGetShaderInfoLog(lid, infoLogLength, nullptr, strInfoLog);
+		Log::warn("SPIR-V specialization failed for %s: %s", name.c_str(), strInfoLog);
+		delete[] strInfoLog;
+	}
 	return false;
 }
 
@@ -2557,52 +2522,6 @@ bool linkShader(Id program, Id vert, Id frag, Id geom, const core::String &name)
 	}
 
 	return true;
-}
-
-int fetchUniforms(Id program, ShaderUniforms &uniforms, const core::String &name) {
-	video_trace_scoped(FetchUniforms);
-	int uniformsCnt = _priv::fillUniforms(program, uniforms, name, false);
-	int uniformBlocksCnt = _priv::fillUniforms(program, uniforms, name, true);
-
-	if (limiti(Limit::MaxUniformBufferSize) > 0) {
-		for (auto *e : uniforms) {
-			if (!e->value.block) {
-				continue;
-			}
-			if (e->value.size > limiti(Limit::MaxUniformBufferSize)) {
-				Log::error("Max uniform buffer size exceeded for uniform %s at location %i (max is %i)", e->key.c_str(),
-						   e->value.location, limiti(Limit::MaxUniformBufferSize));
-			} else if (e->value.size <= 0) {
-				Log::error("Failed to query size of uniform buffer %s at location %i (max is %i)", e->key.c_str(),
-						   e->value.location, limiti(Limit::MaxUniformBufferSize));
-			}
-		}
-	}
-	return uniformsCnt + uniformBlocksCnt;
-}
-
-int fetchAttributes(Id program, ShaderAttributes &attributes, const core::String &name) {
-	video_trace_scoped(FetchAttributes);
-	char varName[MAX_SHADER_VAR_NAME];
-	int numAttributes = 0;
-	const GLuint lid = (GLuint)program;
-	core_assert(glGetProgramiv != nullptr);
-	glGetProgramiv(lid, GL_ACTIVE_ATTRIBUTES, &numAttributes);
-	checkError();
-
-	for (int i = 0; i < numAttributes; ++i) {
-		GLsizei length;
-		GLint size;
-		GLenum type;
-		core_assert(glGetActiveAttrib != nullptr);
-		glGetActiveAttrib(lid, i, MAX_SHADER_VAR_NAME - 1, &length, &size, &type, varName);
-		video::checkError();
-		core_assert(glGetAttribLocation != nullptr);
-		const int location = glGetAttribLocation(lid, varName);
-		attributes.put(varName, location);
-		Log::debug("attribute location for %s is %i (shader %s)", varName, location, name.c_str());
-	}
-	return numAttributes;
 }
 
 void destroyContext(RendererContext &context) {
@@ -2836,52 +2755,6 @@ bool init(int windowWidth, int windowHeight, float scaleFactor) {
 					  BlendMode::OneMinusSourceAlpha);
 
 	return true;
-}
-
-void setUniformBufferBinding(Id program, uint32_t blockIndex, uint32_t blockBinding) {
-	core_assert(glUniformBlockBinding != nullptr);
-	// Use a combined key: (program << 32 | blockIndex)
-	const uint64_t key = (static_cast<uint64_t>(program) << 32) | blockIndex;
-	uint32_t cachedBinding = 0;
-	if (rendererState().uniformBufferBindings.get(key, cachedBinding)) {
-		if (cachedBinding == blockBinding) {
-			return; // binding already set, avoid redundant call
-		}
-	}
-	glUniformBlockBinding(program, (GLuint)blockIndex, (GLuint)blockBinding);
-	checkError();
-	rendererState().uniformBufferBindings.put(key, blockBinding);
-}
-
-int32_t getUniformBufferOffset(Id program, const char *name) {
-	GLuint index;
-	const GLchar *uniformNames[1];
-	uniformNames[0] = name;
-	core_assert(glGetUniformIndices != nullptr);
-	glGetUniformIndices(program, 1, uniformNames, &index);
-	checkError();
-	if (index == GL_INVALID_INDEX) {
-		Log::error("Could not query uniform index for %s", name);
-		return -1;
-	}
-	GLint offset;
-	core_assert(glGetActiveUniformsiv != nullptr);
-	glGetActiveUniformsiv(program, 1, &index, GL_UNIFORM_OFFSET, &offset);
-	checkError();
-	GLint type;
-	glGetActiveUniformsiv(program, 1, &index, GL_UNIFORM_TYPE, &type);
-	checkError();
-	GLint size;
-	glGetActiveUniformsiv(program, 1, &index, GL_UNIFORM_SIZE, &size); // array length, not actual type size;
-	checkError();
-	GLint matrixStride;
-	glGetActiveUniformsiv(program, 1, &index, GL_UNIFORM_MATRIX_STRIDE, &matrixStride);
-	checkError();
-	GLint arrayStride;
-	glGetActiveUniformsiv(program, 1, &index, GL_UNIFORM_ARRAY_STRIDE, &arrayStride);
-	checkError();
-	Log::debug("%s: offset: %i, type: %i, size: %i, matrixStride: %i, arrayStride: %i", name, offset, type, size, matrixStride, arrayStride);
-	return offset;
 }
 
 void traceVideoBegin(const char *name) {

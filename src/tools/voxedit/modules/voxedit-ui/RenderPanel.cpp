@@ -36,6 +36,9 @@ void RenderPanel::renderMenuBar(const scenegraph::SceneGraph &sceneGraph) {
 		}
 		ImGui::Dummy(ImVec2(20, 0));
 		if (_pathTracer.started()) {
+			if (ImGui::Button(_("Sync camera"))) {
+				_pathTracer.restart(sceneGraph, _sceneMgr->activeCamera());
+			}
 			if (ImGui::Button(_("Stop path tracer"))) {
 				_pathTracer.stop();
 			}
@@ -100,6 +103,20 @@ void RenderPanel::updateSettings(const char *id, const scenegraph::SceneGraph &s
 		changed += ImGui::Checkbox(_("High Quality BVH"), &params.highqualitybvh);
 		ImGui::TooltipTextUnformatted(_("High quality bounding volume hierarchy"));
 		changed += ImGui::Checkbox(_("Denoise"), &params.denoise);
+
+		changed += ImGui::SliderFloat(_("Aperture"), &state.aperture, 0.0f, 0.5f);
+		ImGui::TooltipTextUnformatted(_("Lens aperture for depth of field. 0 means pinhole (no DOF)."));
+		changed += ImGui::SliderFloat(_("Sun intensity"), &state.sunIntensity, 0.0f, 10.0f);
+		changed += ImGui::SliderFloat(_("Sun area"), &state.sunArea, 0.0f, 5.0f);
+		ImGui::TooltipTextUnformatted(_("Sun disk size. 1.0 is about 43.5 degrees."));
+		changed += ImGui::SliderAngle(_("Sun elevation"), &state.sunElevation, 0.0f, 90.0f);
+		changed += ImGui::SliderAngle(_("Sun azimuth"), &state.sunAzimuth, 0.0f, 360.0f);
+		changed += ImGui::Checkbox(_("Sun disk"), &state.sunDisk);
+		ImGui::TooltipTextUnformatted(_("Show visible sun disk in the sky."));
+		ImGui::SliderFloat(_("Exposure"), &state.exposure, -5.0f, 5.0f);
+		ImGui::TooltipTextUnformatted(_("Exposure compensation in stops for tonemapping."));
+		ImGui::Checkbox(_("Filmic"), &state.filmic);
+		ImGui::TooltipTextUnformatted(_("Use filmic tonemapping for softer highlight rolloff."));
 
 		if (ImGui::Button(_("Reset all"))) {
 			params = yocto::trace_params();

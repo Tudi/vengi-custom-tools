@@ -16,11 +16,8 @@
 #include "core/Enum.h"
 #include "core/Singleton.h"
 #include "core/StringUtil.h"
-#include "ShaderManager.h"
-#include "UniformBuffer.h"
 #include "video/Renderer.h"
 #include "util/IncludeUtil.h"
-#include "util/VarUtil.h"
 #include <glm/gtc/type_ptr.hpp>
 #include "engine-config.h"
 
@@ -28,6 +25,72 @@ namespace video {
 
 // GLSL version used by shader source preprocessing (#version and compatibility rewrites).
 // Keep this backend-neutral so VK-only builds don't depend on GL-only GLSLVersion enums.
+
+#ifdef USE_OPENGLES
+/**
+ * @brief Strip a named layout qualifier (e.g. "binding" or "set") from shader source.
+ * Handles ", binding = N", "binding = N, " and standalone "binding = N" inside layout().
+ */
+static core::String stripLayoutQualifier(const core::String &src, const char *qualifier) {
+	core::String out = src;
+	// ", qualifier = N"
+	{
+		core::String pattern = core::String::format(", %s", qualifier);
+		size_t pos = 0;
+		while ((pos = out.find(pattern, pos)) != core::String::npos) {
+			size_t end = pos + pattern.size();
+			// skip whitespace
+			while (end < out.size() && (out[end] == ' ' || out[end] == '=')) {
+				++end;
+			}
+			while (end < out.size() && (out[end] == ' ')) {
+				++end;
+			}
+			while (end < out.size() && out[end] >= '0' && out[end] <= '9') {
+				++end;
+			}
+			out.erase(pos, end - pos);
+		}
+	}
+	// "qualifier = N, "
+	{
+		core::String pattern = core::String::format("%s", qualifier);
+		size_t pos = 0;
+		while ((pos = out.find(pattern, pos)) != core::String::npos) {
+			// make sure this is at a word boundary (preceded by '(' or space)
+			if (pos > 0 && out[pos - 1] != '(' && out[pos - 1] != ' ') {
+				pos += pattern.size();
+				continue;
+			}
+			size_t end = pos + pattern.size();
+			while (end < out.size() && out[end] == ' ') {
+				++end;
+			}
+			if (end >= out.size() || out[end] != '=') {
+				pos += pattern.size();
+				continue;
+			}
+			++end; // skip '='
+			while (end < out.size() && out[end] == ' ') {
+				++end;
+			}
+			while (end < out.size() && out[end] >= '0' && out[end] <= '9') {
+				++end;
+			}
+			// skip trailing ", "
+			if (end < out.size() && out[end] == ',') {
+				++end;
+				while (end < out.size() && out[end] == ' ') {
+					++end;
+				}
+			}
+			out.erase(pos, end - pos);
+		}
+	}
+	return out;
+}
+#endif
+
 int Shader::glslVersion = 430;
 
 Shader::Shader() {
@@ -40,68 +103,7 @@ Shader::~Shader() {
 	Shader::shutdown();
 }
 
-bool Shader::hasAttribute(const core::String& name) const {
-	return _attributes.hasKey(name);
-}
-
-bool Shader::hasUniform(const core::String& name) const {
-	return _uniforms.hasKey(name);
-}
-
-bool Shader::isUniformBlock(const core::String& name) const {
-	auto i = _uniforms.find(name);
-	if (i == _uniforms.end()) {
-		return false;
-	}
-	return i->second.block;
-}
-
-void Shader::checkAttribute(const core::String& attribute) {
-	if (!hasAttribute(attribute)) {
-		Log::warn("Attribute %s missing for shader %s", attribute.c_str(), _name.c_str());
-	} else {
-		Log::debug("Found attribute %s for shader %s", attribute.c_str(), _name.c_str());
-	}
-}
-
-void Shader::checkUniform(const core::String& uniform) {
-	if (!hasUniform(uniform)) {
-		Log::warn("Uniform %s missing for shader %s", uniform.c_str(), _name.c_str());
-	} else {
-		Log::debug("Found uniform %s for shader %s", uniform.c_str(), _name.c_str());
-	}
-}
-
-void Shader::checkAttributes(std::initializer_list<core::String> attributes) {
-	for (const core::String& attribute : attributes) {
-		checkAttribute(attribute);
-	}
-}
-
-void Shader::checkUniforms(std::initializer_list<core::String> uniforms) {
-	for (const core::String& uniform : uniforms) {
-		checkUniform(uniform);
-	}
-}
-
-void Shader::setUniformArraySize(const core::String& name, int size) {
-	_uniformArraySizes.put(name, size);
-}
-
-int Shader::getUniformArraySize(const core::String& name) const {
-	auto i = _uniformArraySizes.find(name);
-	if (i == _uniformArraySizes.end()) {
-		Log::trace("can't find uniform %s in shader %s - unknown array size", name.c_str(), _name.c_str());
-		return -1;
-	}
-	return i->second;
-}
-
 void Shader::shutdown() {
-	if (_initialized) {
-		core::Singleton<ShaderManager>::getInstance().unregisterShader(this);
-	}
-
 	for (auto& shader : _shader) {
 		video::deleteShader(shader);
 	}
@@ -142,6 +144,28 @@ bool Shader::load(const core::String& name, const core::String& buffer, ShaderTy
 	if (!video::compileShader(id, shaderType, source, _name)) {
 		_shader[(int)shaderType] = InvalidId;
 		Log::error("Failed to compile shader for %s\n", name.c_str());
+		return false;
+	}
+	return true;
+}
+
+bool Shader::loadSPIRV(const core::String& name, const uint8_t* spirv, size_t spirvSize, ShaderType shaderType) {
+	if (spirv == nullptr || spirvSize == 0) {
+		return false;
+	}
+	_name = name;
+
+	Id id = getShader(shaderType);
+	if (id == InvalidId) {
+		id = video::genShader(shaderType);
+		if (id == InvalidId) {
+			Log::error("Failed to generate shader handle for %s\n", name.c_str());
+			return false;
+		}
+		_shader[(int)shaderType] = id;
+	}
+	if (!video::loadShaderSPIRV(id, shaderType, spirv, spirvSize, _name)) {
+		_shader[(int)shaderType] = InvalidId;
 		return false;
 	}
 	return true;
@@ -190,11 +214,8 @@ bool Shader::init() {
 	createProgramFromShaders();
 	const bool success = _program != InvalidId;
 	_initialized = success;
-	if (_initialized) {
-		fetchAttributes();
-		fetchUniforms();
-		Log::debug("Register shader: %s", _name.c_str());
-		core::Singleton<ShaderManager>::getInstance().registerShader(this);
+	if (success) {
+		initBindings();
 	}
 	return success;
 }
@@ -225,13 +246,6 @@ bool Shader::deactivate() const {
 
 	_active = false;
 	_time = 0;
-	if (_recordUsedUniforms) {
-		for (const auto& e : _uniforms) {
-			if (_usedUniforms.find(e->value.location) == _usedUniforms.end()) {
-				Log::error("Didn't set the uniform %s (shader: %s)", e->key.c_str(), _name.c_str());
-			}
-		}
-	}
 
 	return _active;
 }
@@ -239,22 +253,6 @@ bool Shader::deactivate() const {
 void Shader::addDefine(const core::String& name, const core::String& value) {
 	core_assert_msg(!_initialized, "Shader is already initialized");
 	_defines.put(name, value);
-}
-
-int Shader::getAttributeLocation(const core::String& name) const {
-	const int location = checkAttributeLocation(name);
-	if (location == -1) {
-		Log::debug("can't find attribute %s in shader %s", name.c_str(), _name.c_str());
-	}
-	return location;
-}
-
-int Shader::checkAttributeLocation(const core::String& name) const {
-	auto i = _attributes.find(name);
-	if (i == _attributes.end()) {
-		return -1;
-	}
-	return i->second;
 }
 
 bool Shader::checkUniformCache(int location, const void* value, int length) const {
@@ -274,38 +272,6 @@ bool Shader::checkUniformCache(int location, const void* value, int length) cons
 	_uniformStateMap.put(location, hash);
 	return true;
 #endif
-}
-
-int Shader::getUniformLocation(const core::String& name) const {
-	const Uniform* uniform = getUniform(name);
-	if (uniform == nullptr) {
-		return -1;
-	}
-	return uniform->location;
-}
-
-const Uniform* Shader::getUniform(const core::String& name) const {
-	auto i = _uniforms.find(name);
-	if (i == _uniforms.end()) {
-		Log::debug("can't find uniform %s in shader %s", name.c_str(), _name.c_str());
-		for (const auto& uniformEntry : _uniforms) {
-			Log::trace("uniform %s", uniformEntry->key.c_str());
-		}
-		return nullptr;
-	}
-	return &i->second;
-}
-
-int Shader::fetchUniforms() {
-	_uniforms.clear();
-	Log::debug("Fetch uniforms");
-	return video::fetchUniforms(_program, _uniforms, _name);
-}
-
-int Shader::fetchAttributes() {
-	_attributes.clear();
-	Log::debug("Fetch attributes");
-	return video::fetchAttributes(_program, _attributes, _name);
 }
 
 core::String Shader::validPreprocessorName(const core::String& name) {
@@ -334,6 +300,12 @@ core::String Shader::getSource(ShaderType shaderType, const core::String& buffer
 		//src.append("#extension GL_ARB_compute_variable_group_size : enable\n");
 	}
 
+#ifndef USE_OPENGLES
+	if (glslVersion < 420) {
+		src.append("#extension GL_ARB_shading_language_420pack : enable\n");
+	}
+#endif
+
 #ifdef USE_OPENGLES
 	if (shaderType == ShaderType::Vertex || shaderType == ShaderType::Fragment) {
 		src.append("precision highp float;\n");
@@ -345,21 +317,6 @@ core::String Shader::getSource(ShaderType shaderType, const core::String& buffer
 		src.append("precision highp sampler2DArrayShadow;\n");
 	}
 #endif
-
-	util::visitVarSorted([&] (const core::VarPtr& var) {
-		src.append("#define ");
-		const core::String& validName = validPreprocessorName(var->name());
-		src.append(validName);
-		src.append(" ");
-		core::String val;
-		if (var->type() == core::VarType::Boolean) {
-			val = var->boolVal() ? "1" : "0";
-		} else {
-			val = var->strVal();
-		}
-		src.append(val);
-		src.append("\n");
-	}, core::CV_SHADER);
 
 	for (auto i = _defines.begin(); i != _defines.end(); ++i) {
 		src.append("#ifndef ");
@@ -387,13 +344,6 @@ core::String Shader::getSource(ShaderType shaderType, const core::String& buffer
 			break;
 		}
 	}
-
-	util::visitVarSorted([&] (const core::VarPtr& var) {
-		if ((var->getFlags() & core::CV_SHADER) != 0) {
-			const core::String& validName = validPreprocessorName(var->name());
-			src = core::string::replaceAll(src, var->name(), validName);
-		}
-	}, core::CV_SHADER);
 
 	if (finalize) {
 		// TODO: RENDERER: https://github.com/mattdesl/lwjgl-basics/wiki/GLSL-Versions
@@ -437,6 +387,13 @@ core::String Shader::getSource(ShaderType shaderType, const core::String& buffer
 		src = core::string::replaceAll(src, "$texture2D", replaceTexture2D);
 		src = core::string::replaceAll(src, "$texture3D", replaceTexture3D);
 		src = core::string::replaceAll(src, "$shadow2D", replaceShadow2D);
+
+#ifdef USE_OPENGLES
+		if (glslVersion < 310) {
+			src = stripLayoutQualifier(src, "binding");
+			src = stripLayoutQualifier(src, "set");
+		}
+#endif
 	}
 	return src;
 }
@@ -484,36 +441,10 @@ ScopedShader::~ScopedShader() {
 	useProgram(_oldShader);
 }
 
-bool Shader::setUniformBuffer(const core::String& name, const UniformBuffer& buffer) {
-	const Uniform* uniform = getUniform(name);
-	if (uniform == nullptr) {
-		Log::error("%s is no uniform", name.c_str());
-		return false;
-	}
-	if (!uniform->block) {
-		Log::error("%s is no uniform buffer", name.c_str());
-		return false;
-	}
-
-	if (uniform->size != (int)buffer.size()) {
-		Log::error("Uniform buffer %s: size %i differs from uploaded structure size %i", name.c_str(), uniform->size, (int)buffer.size());
-		return false;
-	}
-
-	video::setUniformBufferBinding(_program, uniform->blockIndex, uniform->blockBinding);
-	addUsedUniform(uniform->location);
-	return buffer.bind(uniform->blockIndex);
-}
-
 void Shader::setUniformi(int location, int value) const {
 	if (checkUniformCache(location, &value, sizeof(value))) {
 		video::setUniformi(location, value);
 	}
-	addUsedUniform(location);
-}
-
-int32_t Shader::getUniformBufferOffset(const char *name) {
-	return video::getUniformBufferOffset(_program, name);
 }
 
 }

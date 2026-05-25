@@ -164,6 +164,10 @@ public:
 	}
 	virtual ~SculptBrush() = default;
 
+	bool isSimplePreview() const override {
+		return _sculptMode == SculptMode::ExtendPlane && _planeFitted;
+	}
+
 	void onSceneChange() override;
 	void reset() override;
 	void onActivated() override;

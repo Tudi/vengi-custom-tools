@@ -13,6 +13,7 @@
 #include "core/DirtyState.h"
 #include "core/IComponent.h"
 #include "core/String.h"
+#include "core/collection/Buffer.h"
 #include "math/Axis.h"
 #include "voxedit-util/modifier/ModifierType.h"
 #include "voxedit-util/modifier/SceneModifiedFlags.h"
@@ -175,6 +176,21 @@ public:
 	}
 
 	/**
+	 * @brief Override the dirty region reporting for mesh extraction.
+	 *
+	 * By default, executeBrush() uses the wrapper's dirty region (a single bounding box
+	 * of all modified positions). Brushes that modify positions far apart (e.g. TransformBrush
+	 * erasing at source and writing at destination) can override this to provide tighter
+	 * regions, avoiding extraction of empty space between them.
+	 *
+	 * @param[out] regions Buffer to fill with dirty regions
+	 * @return true if the brush provides its own regions (use them instead of wrapper's dirty region)
+	 */
+	virtual bool dirtyRegions(core::Buffer<voxel::Region> &regions) const {
+		return false;
+	}
+
+	/**
 	 * @brief Get the error reason if the brush is not usable - this can be shown as
 	 * tooltip for the cursor in the viewport
 	 */
@@ -298,6 +314,10 @@ public:
 	 * that have not been committed to the undo stack yet.
 	 */
 	virtual bool hasPendingChanges() const {
+		return false;
+	}
+
+	virtual bool isSimplePreview() const {
 		return false;
 	}
 

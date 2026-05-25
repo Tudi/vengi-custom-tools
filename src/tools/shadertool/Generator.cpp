@@ -13,6 +13,24 @@
 
 namespace shadertool {
 
+static core::String spirvToString(const core::DynamicArray<uint32_t>& binary) {
+	if (binary.empty()) {
+		return "";
+	}
+	core::String s;
+	s.reserve(binary.size() * 12);
+	for (size_t i = 0; i < binary.size(); ++i) {
+		if (i > 0) {
+			s += ",";
+			if (i % 8 == 0) {
+				s += "\n\t";
+			}
+		}
+		s += core::String::format("0x%08xu", binary[i]);
+	}
+	return s;
+}
+
 static const char *convertToTexUnit(int unit) {
 	switch (unit) {
 	default:
@@ -47,7 +65,8 @@ static core::String maxStringLength(const core::String& input) {
 bool generateSrc(const core::String& templateHeader, const core::String& templateSource, const core::String& templateConstantsHeader,
 		const core::String& templateUniformBuffer, const ShaderStruct& shaderStruct,
 		const io::FilesystemPtr& filesystem, const core::String& namespaceSrc, const core::String& sourceDirectory, const core::String& shaderDirectory, const core::String& postfix,
-		const core::String& vertexBuffer, const core::String& geometryBuffer, const core::String& fragmentBuffer, const core::String& computeBuffer) {
+		const core::String& vertexBuffer, const core::String& geometryBuffer, const core::String& fragmentBuffer, const core::String& computeBuffer,
+		const SPIRVData& spirvData) {
 	core::String srcHeader(templateHeader);
 	core::String srcSource(templateSource);
 	core::String srcConstantsHeader(templateConstantsHeader);
@@ -58,26 +77,9 @@ bool generateSrc(const core::String& templateHeader, const core::String& templat
 	core::String uniformArrayInfo;
 	const int uniformSize = int(shaderStruct.uniforms.size());
 	if (uniformSize > 0) {
-		uniforms += "checkUniforms({";
-		int i = 0;
-		for (const Variable& uniform : shaderStruct.uniforms) {
-			uniforms += "\"";
-			uniforms += uniform.name;
-			uniforms += "\"";
-			if (i < uniformSize - 1) {
-				uniforms += ", ";
-			}
-			++i;
-		}
-		uniforms += "});";
-
-		for (const Variable& uniform : shaderStruct.uniforms) {
-			uniformArrayInfo += "\tsetUniformArraySize(\"";
-			uniformArrayInfo += uniform.name;
-			uniformArrayInfo += "\", ";
-			uniformArrayInfo += core::string::toString(uniform.arraySize);
-			uniformArrayInfo += ");\n";
-		}
+		uniforms += "// ";
+		uniforms += core::string::toString(uniformSize);
+		uniforms += " uniforms";
 	} else {
 		uniforms += "// no uniforms";
 	}
@@ -85,18 +87,9 @@ bool generateSrc(const core::String& templateHeader, const core::String& templat
 	core::String attributes;
 	const int attributeSize = int(shaderStruct.attributes.size());
 	if (attributeSize > 0) {
-		attributes += "checkAttributes({";
-		int i = 0;
-		for (const Variable& v : shaderStruct.attributes) {
-			attributes += "\"";
-			attributes += v.name;
-			attributes += "\"";
-			if (i < attributeSize - 1) {
-				attributes += ", ";
-			}
-			++i;
-		}
-		attributes += "});\n";
+		attributes += "// ";
+		attributes += core::string::toString(attributeSize);
+		attributes += " attributes";
 	} else {
 		attributes += "// no attributes";
 	}
@@ -151,16 +144,49 @@ bool generateSrc(const core::String& templateHeader, const core::String& templat
 		}
 		const bool isInteger = v.isSingleInteger();
 		const core::String& uniformName = util::convertName(v.name, true);
-		core::String mproto;
-		mproto += "set";
-		mproto += uniformName;
-		mproto += "(";
 		const Types& cType = util::resolveTypes(v.type);
 		auto layoutIter = shaderStruct.layouts.find(v.name);
 		Layout layout;
 		if (layoutIter != shaderStruct.layouts.end()) {
 			layout = layoutIter->second;
 		}
+
+		// samplers/images with layout(binding=X) need no setter - the binding is set at compile time
+		if ((v.isSampler() || v.isImage()) && layout.binding != -1 && layout.location == -1) {
+			if (v.isSampler()) {
+				prototypes += "\n\tvideo::TextureUnit getBound";
+				prototypes += uniformName;
+				prototypes += "TexUnit() const;\n";
+				methods += "\nvideo::TextureUnit ";
+				methods += filename;
+				methods += "::getBound";
+				methods += uniformName;
+				methods += "TexUnit() const {\n";
+				methods += "\treturn video::TextureUnit::";
+				methods += convertToTexUnit(layout.binding);
+				methods += ";\n}\n";
+			}
+			if (layout.imageFormat != video::ImageFormat::Max) {
+				prototypes += "\n\tvideo::ImageFormat getImageFormat";
+				prototypes += uniformName;
+				prototypes += "() const;\n";
+				methods += "\nvideo::ImageFormat ";
+				methods += filename;
+				methods += "::getImageFormat";
+				methods += uniformName;
+				methods += "() const {\n";
+				methods += "\treturn video::ImageFormat::";
+				methods += util::getImageFormatTypeString(layout.imageFormat);
+				methods += ";\n}\n";
+			}
+			++n;
+			continue;
+		}
+
+		core::String mproto;
+		mproto += "set";
+		mproto += uniformName;
+		mproto += "(";
 
 		if ((v.arraySize > 0 && isInteger) || cType.passBy == PassBy::Reference) {
 			mproto += "const ";
@@ -190,11 +216,6 @@ bool generateSrc(const core::String& templateHeader, const core::String& templat
 		methods += "::";
 		methods += mproto;
 
-		if (v.isSampler() && layout.binding != -1) {
-			mproto += " = video::TextureUnit::";
-			mproto += convertToTexUnit(layout.binding);
-		}
-
 		if (v.arraySize == -1) {
 			mproto += ", int amount";
 			methods += ", int amount";
@@ -217,12 +238,8 @@ bool generateSrc(const core::String& templateHeader, const core::String& templat
 			methods += core::string::toString(layout.location);
 			methods += ";\n";
 		} else {
-			methods += "getUniformLocation(\"";
-			methods += v.name;
-			methods += "\");\n";
-			methods += "\tif (location == -1) {\n";
-			methods += "\t\treturn false;\n";
-			methods += "\t}\n";
+			Log::error("Uniform '%s' has no layout(location=X) or layout(binding=X) qualifier", v.name.c_str());
+			return false;
 		}
 		methods += "\tsetUniform";
 		methods += util::uniformSetterPostfix(v.type, v.arraySize == -1 ? 2 : v.arraySize);
@@ -310,11 +327,9 @@ bool generateSrc(const core::String& templateHeader, const core::String& templat
 			methods += ", ";
 			methods += core::string::toString(v.arraySize);
 			methods += ">& var) const {\n";
-			methods += "\tconst int location = getUniformLocation(\"";
-			methods += v.name;
-			methods += "\");\n\tif (location == -1) {\n";
-			methods += "\t\treturn false;\n";
-			methods += "\t}\n";
+			methods += "\tconst int location = ";
+			methods += core::string::toString(layout.location);
+			methods += ";\n";
 			methods += "\tsetUniform";
 			methods += util::uniformSetterPostfix(v.type, v.arraySize);
 			methods += "(location, &var[0], var.size());\n";
@@ -329,6 +344,15 @@ bool generateSrc(const core::String& templateHeader, const core::String& templat
 	int i = 0;
 	for (const Variable& v : shaderStruct.attributes) {
 		const core::String& attributeName = util::convertName(v.name, true);
+		auto attrLayoutIter = shaderStruct.layouts.find(v.name);
+		Layout attrLayout;
+		if (attrLayoutIter != shaderStruct.layouts.end()) {
+			attrLayout = attrLayoutIter->second;
+		}
+		if (attrLayout.location == -1) {
+			Log::error("Attribute '%s' has no layout(location=X) qualifier", v.name.c_str());
+			return false;
+		}
 
 		prototypes += "\n\t/**\n";
 		prototypes += "\t * @brief This version takes the c++ data type as a reference\n";
@@ -365,7 +389,6 @@ bool generateSrc(const core::String& templateHeader, const core::String& templat
 		prototypes += "\t\tattribute";
 		prototypes += attributeName;
 		prototypes += ".type = video::mapType<TYPE>();\n";
-		// TODO: add validation that the given c++ data type fits the specified glsl type.
 		prototypes += "\t\treturn attribute";
 		prototypes += attributeName;
 		prototypes += ";\n";
@@ -374,12 +397,12 @@ bool generateSrc(const core::String& templateHeader, const core::String& templat
 		prototypes += "\n\t/**\n\t * @brief Return the binding location of the shader attribute @c ";
 		prototypes += attributeName;
 		prototypes += "\n\t */\n";
-		prototypes += "\tinline int getLocation";
+		prototypes += "\tstatic inline int getLocation";
 		prototypes += attributeName;
-		prototypes += "() const {\n";
-		prototypes += "\t\treturn getAttributeLocation(\"";
-		prototypes += v.name;
-		prototypes += "\");\n";
+		prototypes += "() {\n";
+		prototypes += "\t\treturn ";
+		prototypes += core::string::toString(attrLayout.location);
+		prototypes += ";\n";
 		prototypes += "\t}\n";
 
 		prototypes += "\n\t/**\n\t * @brief Return the components if the attribute @c ";
@@ -485,27 +508,6 @@ bool generateSrc(const core::String& templateHeader, const core::String& templat
 			ub += core::string::toString(align);
 			ub += "\n";
 
-			uniforms += "\n\tif (";
-			uniforms += core::string::toString((uint32_t)(offset * 4));
-			uniforms += " != getUniformBufferOffset(\"";
-			uniforms += v.name;
-			if (v.arraySize > 0) {
-				uniforms += "[0]";
-			}
-			uniforms += "\")) {\n";
-			uniforms += "\t\tLog::error(\"Invalid offset found for uniform ";
-			uniforms += v.name;
-			if (v.arraySize > 0) {
-				uniforms += "[0]";
-			}
-			uniforms += " %i - expected ";
-			uniforms += core::string::toString((uint32_t)(offset * 4));
-			uniforms += "\", getUniformBufferOffset(\"";
-			uniforms += v.name;
-			uniforms += "\"));\n";
-			//uniforms += "\t\treturn false;\n";
-			uniforms += "\t}\n";
-
 			if (offsetsIndex > 0) {
 				offsets += ", ";
 			}
@@ -583,9 +585,13 @@ bool generateSrc(const core::String& templateHeader, const core::String& templat
 		prototypes += "\tinline bool set";
 		prototypes += uniformBufferStructName;
 		prototypes += "(const video::UniformBuffer& buf) {\n";
-		prototypes += "\t\treturn setUniformBuffer(\"";
-		prototypes += ubuf.name;
-		prototypes += "\", buf);\n";
+		if (ubuf.layout.binding == -1) {
+			Log::error("Uniform block '%s' has no layout(binding=X) qualifier", ubuf.name.c_str());
+			return false;
+		}
+		prototypes += "\t\treturn buf.bind(";
+		prototypes += core::string::toString(ubuf.layout.binding);
+		prototypes += ");\n";
 		prototypes += "\t}\n";
 
 		core::String generatedUb = core::string::replaceAll(templateUniformBuffer, "$name$", uniformBufferClassName);
@@ -882,6 +888,46 @@ bool generateSrc(const core::String& templateHeader, const core::String& templat
 	srcSource = core::string::replaceAll(srcSource, "$uniformarrayinfo$", uniformArrayInfo);
 	srcSource = core::string::replaceAll(srcSource, "$uniforms$", uniforms);
 
+	// Generate shader resource bindings table for Vulkan descriptor set layout
+	core::String shaderBindings;
+	{
+		core::String entries;
+		int bindingCount = 0;
+		// UBOs: present in vertex (and possibly fragment) stage
+		for (const auto &ubuf : shaderStruct.uniformBlocks) {
+			if (ubuf.layout.binding >= 0) {
+				entries += "\t\t{";
+				entries += core::string::toString(ubuf.layout.binding);
+				entries += ", video::ShaderResourceBinding::UniformBuffer, 1 | 2},\n"; // vertex + fragment
+				++bindingCount;
+			}
+		}
+		// Samplers/images: present in fragment stage
+		for (const auto &v : shaderStruct.uniforms) {
+			if (!v.isSampler() && !v.isImage()) {
+				continue;
+			}
+			auto layoutIter = shaderStruct.layouts.find(v.name);
+			if (layoutIter != shaderStruct.layouts.end() && layoutIter->second.binding >= 0) {
+				entries += "\t\t{";
+				entries += core::string::toString(layoutIter->second.binding);
+				entries += ", video::ShaderResourceBinding::CombinedImageSampler, 2},\n"; // fragment
+				++bindingCount;
+			}
+		}
+		if (bindingCount > 0) {
+			shaderBindings += "\t{\n";
+			shaderBindings += "\t\tstatic const video::ShaderResourceBinding _bindings[] = {\n";
+			shaderBindings += entries;
+			shaderBindings += "\t\t};\n";
+			shaderBindings += "\t\tvideo::registerShaderBindings(_program, _bindings, ";
+			shaderBindings += core::string::toString(bindingCount);
+			shaderBindings += ");\n";
+			shaderBindings += "\t}\n";
+		}
+	}
+	srcSource = core::string::replaceAll(srcSource, "$shaderbindings$", shaderBindings);
+
 	srcSource = core::string::replaceAll(srcSource, "$attributes$", attributes);
 	srcSource = core::string::replaceAll(srcSource, "$methods$", methods);
 	srcSource = core::string::replaceAll(srcSource, "$prototypes$", prototypes);
@@ -891,6 +937,99 @@ bool generateSrc(const core::String& templateHeader, const core::String& templat
 	srcSource = core::string::replaceAll(srcSource, "$computeshaderbuffer$", maxStringLength(computeBuffer));
 	srcSource = core::string::replaceAll(srcSource, "$fragmentshaderbuffer$", maxStringLength(fragmentBuffer));
 	srcSource = core::string::replaceAll(srcSource, "$geometryshaderbuffer$", maxStringLength(geometryBuffer));
+
+	// SPIR-V binary data
+	const core::String vertSpirv = spirvToString(spirvData.vertex);
+	const core::String fragSpirv = spirvToString(spirvData.fragment);
+	const core::String geomSpirv = spirvToString(spirvData.geometry);
+	const core::String compSpirv = spirvToString(spirvData.compute);
+	const bool hasSpirv = !vertSpirv.empty() || !compSpirv.empty();
+
+	core::String spirvBlock;
+	if (hasSpirv) {
+		spirvBlock += "#ifdef USE_SPIRV\n";
+		if (!vertSpirv.empty()) {
+			spirvBlock += "static const uint32_t VertexShaderSPIRV[] = {\n\t";
+			spirvBlock += vertSpirv;
+			spirvBlock += "\n};\n";
+		}
+		if (!fragSpirv.empty()) {
+			spirvBlock += "static const uint32_t FragmentShaderSPIRV[] = {\n\t";
+			spirvBlock += fragSpirv;
+			spirvBlock += "\n};\n";
+		}
+		if (!geomSpirv.empty()) {
+			spirvBlock += "static const uint32_t GeometryShaderSPIRV[] = {\n\t";
+			spirvBlock += geomSpirv;
+			spirvBlock += "\n};\n";
+		}
+		if (!compSpirv.empty()) {
+			spirvBlock += "static const uint32_t ComputeShaderSPIRV[] = {\n\t";
+			spirvBlock += compSpirv;
+			spirvBlock += "\n};\n";
+		}
+		spirvBlock += "#endif\n";
+	}
+	srcSource = core::string::replaceAll(srcSource, "$spirvdata$", spirvBlock);
+
+	// Generate SPIR-V setup code
+	core::String spirvSetup;
+	if (hasSpirv) {
+		spirvSetup += "#ifdef USE_SPIRV\n";
+		spirvSetup += "\tdo {\n";
+		if (!compSpirv.empty()) {
+			spirvSetup += "\t\tif (!loadSPIRV(\"";
+			spirvSetup += shaderDirectory + shaderStruct.filename;
+			spirvSetup += "\", (const uint8_t*)priv";
+			spirvSetup += filename;
+			spirvSetup += "::ComputeShaderSPIRV, sizeof(priv";
+			spirvSetup += filename;
+			spirvSetup += "::ComputeShaderSPIRV), video::ShaderType::Compute)) {\n";
+			spirvSetup += "\t\t\tbreak;\n";
+			spirvSetup += "\t\t}\n";
+		} else {
+			spirvSetup += "\t\tif (!loadSPIRV(\"";
+			spirvSetup += shaderDirectory + shaderStruct.filename;
+			spirvSetup += "\", (const uint8_t*)priv";
+			spirvSetup += filename;
+			spirvSetup += "::VertexShaderSPIRV, sizeof(priv";
+			spirvSetup += filename;
+			spirvSetup += "::VertexShaderSPIRV), video::ShaderType::Vertex)) {\n";
+			spirvSetup += "\t\t\tbreak;\n";
+			spirvSetup += "\t\t}\n";
+			spirvSetup += "\t\tif (!loadSPIRV(\"";
+			spirvSetup += shaderDirectory + shaderStruct.filename;
+			spirvSetup += "\", (const uint8_t*)priv";
+			spirvSetup += filename;
+			spirvSetup += "::FragmentShaderSPIRV, sizeof(priv";
+			spirvSetup += filename;
+			spirvSetup += "::FragmentShaderSPIRV), video::ShaderType::Fragment)) {\n";
+			spirvSetup += "\t\t\tbreak;\n";
+			spirvSetup += "\t\t}\n";
+			if (!geomSpirv.empty()) {
+				spirvSetup += "\t\tloadSPIRV(\"";
+				spirvSetup += shaderDirectory + shaderStruct.filename;
+				spirvSetup += "\", (const uint8_t*)priv";
+				spirvSetup += filename;
+				spirvSetup += "::GeometryShaderSPIRV, sizeof(priv";
+				spirvSetup += filename;
+				spirvSetup += "::GeometryShaderSPIRV), video::ShaderType::Geometry);\n";
+			}
+		}
+		spirvSetup += "\t\t_name = \"";
+		spirvSetup += shaderDirectory + shaderStruct.filename;
+		spirvSetup += "\";\n";
+		spirvSetup += "\t\tif (init()) {\n";
+		spirvSetup += "\t\t\treturn true;\n";
+		spirvSetup += "\t\t}\n";
+		spirvSetup += "\t} while (false);\n";
+		spirvSetup += "\t// SPIR-V failed, reset and fall back to GLSL\n";
+		spirvSetup += "\tfor (auto& s : _shader) {\n";
+		spirvSetup += "\t\tvideo::deleteShader(s);\n";
+		spirvSetup += "\t}\n";
+		spirvSetup += "#endif\n";
+	}
+	srcSource = core::string::replaceAll(srcSource, "$spirvsetup$", spirvSetup);
 
 	Log::debug("Generate shader bindings for %s", shaderStruct.name.c_str());
 	const core::String targetHeaderFile = sourceDirectory + filename + ".h" + postfix;

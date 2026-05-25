@@ -71,6 +71,13 @@ protected:
 	core::VarPtr _cullBuffers;
 	core::VarPtr _cullNodes;
 	core::VarPtr _selectionTint;
+	core::VarPtr _gamma;
+	core::VarPtr _checkerboard;
+	core::VarPtr _debugShadow;
+	core::VarPtr _debugCascade;
+	core::VarPtr _tonemapping;
+	core::VarPtr _renderOutline;
+	core::VarPtr _renderNormals;
 
 	core::TimeProviderPtr _timeProvider;
 
@@ -110,6 +117,7 @@ public:
 
 	void render(const voxel::MeshStatePtr &meshState, RenderContext &renderContext, const video::Camera &camera,
 				bool shadow, bool bloom);
+	void ensureSize(int idx);
 	void clear(const voxel::MeshStatePtr &meshState);
 	/**
 	 * @brief Checks whether the given volume @c idx is visible

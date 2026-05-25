@@ -252,7 +252,7 @@ app::AppState IMGUIApp::onConstruct() {
 				"'-' prefix excludes tests matched by the term, '^' prefix anchors term matching to the start of the "
 				"string, '$' suffix anchors term matching to the end of the string. This is no full regex engine, only "
 				"supports the behavior of these modifiers.");
-		registerArg("--imgui_list_tests").setDescription("List all available tests and exit");
+		registerArg("--imgui_list_tests").setDescription("List all available tests and exit").addFlag(ARGUMENT_FLAG_BOOL);
 	}
 #else
 	const core::VarDef uIShowMetrics2(cfg::UIShowMetrics, false, N_("Show metrics"), N_("Show metric and debug window"), core::CV_NOPERSIST);
@@ -565,6 +565,10 @@ const glm::vec4 &IMGUIApp::color(style::StyleColor color) {
 			return color::Orange();
 		}
 		return color::Yellow();
+	case style::ColorBrushGizmoPolygon: {
+		static const glm::vec4 c(1.0f, 1.0f, 1.0f, 0.1f);
+		return c;
+	}
 	}
 	return color::White();
 }

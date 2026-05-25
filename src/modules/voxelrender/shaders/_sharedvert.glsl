@@ -3,7 +3,7 @@
 #define MATERIALCOLORS 256
 // NormalPaletteMaxNormals + NORMAL_PALETTE_OFFSET
 #define NORMALS 256
-layout(std140) uniform u_vert {
+layout(std140, binding = 0) uniform u_vert {
 	vec4 u_materialcolor[MATERIALCOLORS];
 	vec4 u_normals[NORMALS];
 	vec4 u_glowcolor[MATERIALCOLORS];
@@ -11,8 +11,8 @@ layout(std140) uniform u_vert {
 	mat4 u_model;
 	int u_gray;
 	int u_locked;
-	int u_padding2;
-	int u_padding3;
+	int u_vert_renderoutline;
+	int u_shownormals;
 };
 
 $out vec3 v_pos;
@@ -21,9 +21,7 @@ $out vec4 v_color;
 $out vec4 v_glow;
 flat $out uint v_flags;
 
-#if cl_shadowmap == 1
 $out vec3 v_lightspacepos;
 $out float v_viewz;
-#endif
 
 const float aovalues[] = float[](0.15, 0.6, 0.8, 1.0);
