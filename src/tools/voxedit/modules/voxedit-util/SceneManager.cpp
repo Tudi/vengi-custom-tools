@@ -4493,6 +4493,11 @@ void SceneManager::construct() {
 			}
 		}).setHelp(_("Delete a particular node by id - or the current active one")).setArgumentCompleter(nodeCompleter(_sceneGraph));
 
+	command::Command::registerCommand("nodedeletelocked")
+		.setHandler([&] (const command::CommandArgs& args) {
+			nodeRemoveLocked();
+		}).setHelp(_("Delete all locked model nodes"));
+
 	command::Command::registerCommand("nodelock")
 		.addArg({"nodeid", command::ArgType::String, true, "", "Node ID or UUID to lock"})
 		.setHandler([&] (const command::CommandArgs& args) {
@@ -5995,6 +6000,31 @@ bool SceneManager::nodeRemoveChildrenByType(scenegraph::SceneGraphNode &node, sc
 		}
 	}
 	return true;
+}
+
+int SceneManager::nodeRemoveLocked() {
+	core::Buffer<int> nodeIds;
+	nodeIds.reserve(_sceneGraph.size());
+	for (auto iter = _sceneGraph.beginModel(); iter != _sceneGraph.end(); ++iter) {
+		const scenegraph::SceneGraphNode &node = *iter;
+		if (node.locked()) {
+			nodeIds.push_back(node.id());
+		}
+	}
+	if (nodeIds.empty()) {
+		return 0;
+	}
+	memento::ScopedMementoGroup mementoGroup(_mementoHandler, "noderemovelocked");
+	int removed = 0;
+	for (int nodeId : nodeIds) {
+		if (!_sceneGraph.hasNode(nodeId)) {
+			continue;
+		}
+		if (nodeRemove(nodeId, false)) {
+			++removed;
+		}
+	}
+	return removed;
 }
 
 bool SceneManager::nodeRename(scenegraph::SceneGraphNode &node, const core::String &name) {

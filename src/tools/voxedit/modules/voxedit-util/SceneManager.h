@@ -609,6 +609,7 @@ public:
 	bool nodeRemoveIKConstraint(int nodeId);
 	bool nodeRename(int nodeId, const core::String &name);
 	bool nodeRemove(int nodeId, bool recursive);
+	int nodeRemoveLocked();
 	bool nodeSetVisible(int nodeId, bool visible);
 	bool nodeSetLocked(int nodeId, bool locked);
 	bool nodeActivate(int nodeId);

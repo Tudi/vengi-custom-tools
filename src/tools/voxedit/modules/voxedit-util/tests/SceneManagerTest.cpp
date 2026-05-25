@@ -800,6 +800,52 @@ TEST_F(SceneManagerTest, testDuplicateAndRemoveChild) {
 	ASSERT_EQ(4u, _sceneMgr->sceneGraph().nodeSize());
 }
 
+TEST_F(SceneManagerTest, testNodeRemoveLockedNone) {
+	const int nodeId = _sceneMgr->sceneGraph().activeNode();
+	ASSERT_NE(nodeId, InvalidNodeId);
+	const size_t modelsBefore = _sceneMgr->sceneGraph().size();
+	EXPECT_EQ(0, _sceneMgr->nodeRemoveLocked());
+	EXPECT_EQ(modelsBefore, _sceneMgr->sceneGraph().size());
+}
+
+TEST_F(SceneManagerTest, testNodeRemoveLockedSubset) {
+	const int aId = _sceneMgr->sceneGraph().activeNode();
+	ASSERT_NE(aId, InvalidNodeId);
+	const int bId = _sceneMgr->addModelChild("b", 1, 1, 1);
+	ASSERT_NE(bId, InvalidNodeId);
+	const int cId = _sceneMgr->addModelChild("c", 1, 1, 1);
+	ASSERT_NE(cId, InvalidNodeId);
+	ASSERT_EQ(3u, _sceneMgr->sceneGraph().size());
+
+	ASSERT_TRUE(_sceneMgr->nodeSetLocked(aId, true));
+	ASSERT_TRUE(_sceneMgr->nodeSetLocked(cId, true));
+
+	EXPECT_EQ(2, _sceneMgr->nodeRemoveLocked());
+	EXPECT_EQ(1u, _sceneMgr->sceneGraph().size());
+	EXPECT_TRUE(_sceneMgr->sceneGraph().hasNode(bId));
+	EXPECT_FALSE(_sceneMgr->sceneGraph().hasNode(aId));
+	EXPECT_FALSE(_sceneMgr->sceneGraph().hasNode(cId));
+}
+
+TEST_F(SceneManagerTest, testNodeRemoveLockedUndo) {
+	const int aId = _sceneMgr->sceneGraph().activeNode();
+	const int bId = _sceneMgr->addModelChild("b", 1, 1, 1);
+	const int cId = _sceneMgr->addModelChild("c", 1, 1, 1);
+	ASSERT_EQ(3u, _sceneMgr->sceneGraph().size());
+
+	ASSERT_TRUE(_sceneMgr->nodeSetLocked(aId, true));
+	ASSERT_TRUE(_sceneMgr->nodeSetLocked(cId, true));
+
+	EXPECT_EQ(2, _sceneMgr->nodeRemoveLocked());
+	EXPECT_EQ(1u, _sceneMgr->sceneGraph().size());
+	EXPECT_TRUE(_sceneMgr->sceneGraph().hasNode(bId));
+
+	// a single undo should restore both locked nodes (grouped memento). Node IDs are
+	// re-assigned on restore, so verify by model count rather than by original id.
+	ASSERT_TRUE(_sceneMgr->undo());
+	EXPECT_EQ(3u, _sceneMgr->sceneGraph().size());
+}
+
 // https://github.com/vengi-voxel/vengi/issues/425
 TEST_F(SceneManagerTest, testUnReferenceAndUndo) {
 	const int nodeId = _sceneMgr->sceneGraph().activeNode();
