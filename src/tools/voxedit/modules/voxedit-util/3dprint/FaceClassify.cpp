@@ -305,10 +305,22 @@ struct Level {
 	std::vector<uint8_t> state; // flat: kStateEmpty/Exterior/Interior per cell
 
 	void initGrid(const glm::ivec3 &lo, const glm::ivec3 &hi) {
-		gridLower = lo;
-		dimX = (hi.x - lo.x) / cellSize + 1;
-		dimY = (hi.y - lo.y) / cellSize + 1;
-		dimZ = (hi.z - lo.z) / cellSize + 1;
+		// Snap the grid origin DOWN to a multiple of cellSize. toIdx()/inBounds()
+		// compute the cell index as (cell - gridLower) / cellSize, which is only
+		// correct when gridLower is itself a multiple of cellSize -- the cell
+		// origins fed in come from toCellOrigin() and are absolute multiples of
+		// cellSize. A fine level inherits the coarse grid bounds, and the coarse
+		// cell size from the single-node auto-fallback can be odd (e.g. 81), so a
+		// fine cellSize like 40 does NOT divide the incoming origin. Without this
+		// snap the lattice is offset by (lo % cellSize) and every solid (wall)
+		// cell lands in the wrong slot, so the flood walks straight through the
+		// wall. The modulo form handles negative origins (model spans -x/-y/-z).
+		gridLower.x = lo.x - (((lo.x % cellSize) + cellSize) % cellSize);
+		gridLower.y = lo.y - (((lo.y % cellSize) + cellSize) % cellSize);
+		gridLower.z = lo.z - (((lo.z % cellSize) + cellSize) % cellSize);
+		dimX = (hi.x - gridLower.x) / cellSize + 1;
+		dimY = (hi.y - gridLower.y) / cellSize + 1;
+		dimZ = (hi.z - gridLower.z) / cellSize + 1;
 		state.assign((size_t)dimX * (size_t)dimY * (size_t)dimZ, kStateEmpty);
 	}
 
@@ -1574,11 +1586,19 @@ struct CoarseShellResult {
 // refinement chain, handle intCount==0 with its own message). nodes and coarse
 // are output parameters because Level holds a std::vector that we want to fill
 // in place rather than copy out of the helper.
+// coarseCellSizeOverride: 0 = auto (mode of node widths; fast path that maps one
+// solid cell per node -- valid when nodes are already cellSize-aligned, e.g.
+// after 3dprint regrid). When > 0, use the override AND switch to per-voxel
+// bucketing via buildSolidHash so a node that spans multiple coarse cells gets
+// each sub-cell tagged correctly. Required for single-node fillholes where
+// node width != target coarse cellSize (mode-of-widths would pick the whole
+// node width and yield a 1-cell grid with no possible interior).
 static CoarseShellResult buildCoarseShell(
 		SceneManager *sceneMgr,
 		const char *callerTag,
 		core::DynamicArray<NodeInfo> &nodes,
-		Level &coarse) {
+		Level &coarse,
+		int coarseCellSizeOverride = 0) {
 	CoarseShellResult res;
 	res.ok = false;
 	res.intCount = 0;
@@ -1608,8 +1628,8 @@ static CoarseShellResult buildCoarseShell(
 	}
 	const int totalNodes = (int)nodes.size();
 
-	int coarseCellSize = 0;
-	{
+	int coarseCellSize = coarseCellSizeOverride;
+	if (coarseCellSize <= 0) {
 		std::unordered_map<int, int> widthCount;
 		for (const NodeInfo &ni : nodes) {
 			widthCount[ni.rv->region().getWidthInVoxels()]++;
@@ -1628,28 +1648,51 @@ static CoarseShellResult buildCoarseShell(
 	}
 
 	coarse.cellSize = coarseCellSize;
-	coarse.solid.reserve((size_t)totalNodes);
 	glm::ivec3 gridLower(INT_MAX, INT_MAX, INT_MAX);
 	glm::ivec3 gridUpper(INT_MIN, INT_MIN, INT_MIN);
 
-	for (int i = 0; i < totalNodes; ++i) {
-		NodeInfo &ni = nodes[i];
-		const voxel::Region &r = ni.rv->region();
-		ni.cellOrigin = toCellOrigin(transformPoint(ni.worldMat, r.getLowerCorner()), coarseCellSize);
-		gridLower = glm::min(gridLower, ni.cellOrigin);
-		gridUpper = glm::max(gridUpper, ni.cellOrigin);
-		bool hasSolid = false;
-		for (int z = r.getLowerZ(); z <= r.getUpperZ() && !hasSolid; ++z) {
-			for (int y = r.getLowerY(); y <= r.getUpperY() && !hasSolid; ++y) {
-				for (int x = r.getLowerX(); x <= r.getUpperX() && !hasSolid; ++x) {
-					if (!voxel::isAir(ni.rv->voxel(x, y, z).getMaterial())) {
-						hasSolid = true;
+	if (coarseCellSizeOverride > 0) {
+		// Per-voxel bucketing: a single node can span many coarse cells. Without
+		// this, the fast path below would tag just one cell per node and the
+		// coarse grid for a non-regridded model collapses to a single solid cell
+		// -- no enclosed interior possible.
+		buildSolidHash(coarse, nodes);
+		if (coarse.solid.empty()) {
+			Log::error("3dprint %s: no solid voxels in any node at cs=%d", callerTag, coarseCellSize);
+			return res;
+		}
+		for (const auto &kv : coarse.solid) {
+			gridLower = glm::min(gridLower, kv.first);
+			gridUpper = glm::max(gridUpper, kv.first);
+		}
+		// Keep ni.cellOrigin sensible for downstream code that reads it (anchors
+		// it to the node's lower corner; ambiguous when the node spans multiple
+		// cells, but no caller treats it as authoritative classification).
+		for (int i = 0; i < totalNodes; ++i) {
+			NodeInfo &ni = nodes[i];
+			ni.cellOrigin = toCellOrigin(transformPoint(ni.worldMat, ni.rv->region().getLowerCorner()), coarseCellSize);
+		}
+	} else {
+		coarse.solid.reserve((size_t)totalNodes);
+		for (int i = 0; i < totalNodes; ++i) {
+			NodeInfo &ni = nodes[i];
+			const voxel::Region &r = ni.rv->region();
+			ni.cellOrigin = toCellOrigin(transformPoint(ni.worldMat, r.getLowerCorner()), coarseCellSize);
+			gridLower = glm::min(gridLower, ni.cellOrigin);
+			gridUpper = glm::max(gridUpper, ni.cellOrigin);
+			bool hasSolid = false;
+			for (int z = r.getLowerZ(); z <= r.getUpperZ() && !hasSolid; ++z) {
+				for (int y = r.getLowerY(); y <= r.getUpperY() && !hasSolid; ++y) {
+					for (int x = r.getLowerX(); x <= r.getUpperX() && !hasSolid; ++x) {
+						if (!voxel::isAir(ni.rv->voxel(x, y, z).getMaterial())) {
+							hasSolid = true;
+						}
 					}
 				}
 			}
-		}
-		if (hasSolid) {
-			coarse.solid.emplace(ni.cellOrigin, i);
+			if (hasSolid) {
+				coarse.solid.emplace(ni.cellOrigin, i);
+			}
 		}
 	}
 
@@ -1672,6 +1715,29 @@ static CoarseShellResult buildCoarseShell(
 	res.gridLower = gridLower;
 	res.gridUpper = gridUpper;
 	res.ok = true;
+
+	// Auto-fallback for non-regridded models (single-node case is the common one):
+	// the auto-picked coarseCellSize (mode of node widths) collapses to a 1-cell
+	// grid with no possible interior. Halve the cellSize and retry with per-voxel
+	// bucketing; bottom out at cs=8 to keep dense-pass memory bounded. Only fires
+	// when the caller didn't supply an override AND the coarse pass found no
+	// enclosed interior. Applies to every command that calls buildCoarseShell:
+	// fillholes, erode, thicken, faceclassify, holemap.
+	if (coarseCellSizeOverride == 0 && res.intCount == 0) {
+		static constexpr int kMinCoarseRetryCellSize = 8;
+		int retryCellSize = coarseCellSize / 2;
+		while (retryCellSize >= kMinCoarseRetryCellSize) {
+			Log::info("3dprint %s: no enclosed interior at cs=%d -- retrying with cs=%d (auto-fallback)",
+					  callerTag, coarseCellSize, retryCellSize);
+			nodes.clear();
+			coarse = Level{};
+			CoarseShellResult retry = buildCoarseShell(sceneMgr, callerTag, nodes, coarse, retryCellSize);
+			if (!retry.ok || retry.intCount > 0) {
+				return retry;
+			}
+			retryCellSize /= 2;
+		}
+	}
 	return res;
 }
 
@@ -2810,11 +2876,10 @@ void runHoleFill(SceneManager *sceneMgr, int minCellSize) {
 		minCellSize = 2;
 	}
 	if (shell.intCount == 0) {
-		Log::warn("3dprint fillholes: no enclosed interior at coarse scale (cs=%d). The model has no sealed cavity -- "
-				  "exterior flood reached every air cell. Either the model is genuinely solid/open, or it has a "
-				  "coarse-scale gap (>= %d voxels wide) that lets ext flow through. To proceed: seal large gaps "
-				  "manually, or run '3dprint regrid <smaller_cs>' to make the coarse grid finer. Aborting.",
-				  coarseCellSize, coarseCellSize);
+		Log::warn("3dprint fillholes: no enclosed interior at coarse scale (cs=%d, retried down to cs=8). The model "
+				  "has no sealed cavity -- exterior flood reached every air cell. Either the model is genuinely "
+				  "solid/open, or it has a coarse-scale gap (>= 8 voxels wide) that lets ext flow through. Aborting.",
+				  coarseCellSize);
 		return;
 	}
 	if (k3DPrintVerbose) {
@@ -3700,50 +3765,23 @@ void runThicken(SceneManager *sceneMgr, int minCellSize) {
 
 void runDebugFrontier(SceneManager *sceneMgr, int cellSize) {
 	const uint64_t fnStart = core::TimeProvider::systemMillis();
-	scenegraph::SceneGraph &graph = sceneMgr->sceneGraph();
 
+	// Build the coarse exterior/interior shell through the SAME path that
+	// fillholes/holemap/faceclassify/erode/thicken use, so what debugfrontier
+	// paints is exactly what those commands classify -- including the auto-fallback
+	// halving that a tight-cropped single node needs (no interior at the modal
+	// width). buildCoarseShell fills `nodes`, picks the coarse cell size, builds
+	// the grid and classifies it (solid/exterior/interior).
 	core::DynamicArray<NodeInfo> nodes;
-	nodes.reserve((size_t)graph.size());
-	for (auto iter = graph.beginModel(); iter != graph.end(); ++iter) {
-		scenegraph::SceneGraphNode &node = *iter;
-		voxel::RawVolume *rv = node.volume();
-		if (rv == nullptr) continue;
-		NodeInfo info;
-		info.nodeId      = node.id();
-		info.rv          = rv;
-		info.worldMat    = graph.worldMatrix(node, 0);
-		info.invWorldMat = glm::inverse(info.worldMat);
-		info.cellOrigin  = glm::ivec3(0);
-		nodes.push_back(info);
+	Level coarse;
+	const CoarseShellResult shell = buildCoarseShell(sceneMgr, "debugfrontier", nodes, coarse);
+	if (!shell.ok) {
+		return;
 	}
-	if (nodes.empty()) { Log::info("3dprint debugfrontier: no model nodes"); return; }
 	const int totalNodes = (int)nodes.size();
-
-	// Default cellSize = modal regridded width (typically 128 after `3dprint regrid`).
-	if (cellSize <= 0) {
-		std::unordered_map<int, int> widthCount;
-		for (const NodeInfo &ni : nodes) widthCount[ni.rv->region().getWidthInVoxels()]++;
-		int bestCount = 0;
-		for (const auto &kv : widthCount)
-			if (kv.second > bestCount) { bestCount = kv.second; cellSize = kv.first; }
-	}
-	if (cellSize <= 0) {
-		Log::error("3dprint debugfrontier: invalid cellSize");
-		return;
-	}
-	// Determine the natural coarse cell size from regridded model nodes (modal width).
-	int coarseCellSize = 0;
-	{
-		std::unordered_map<int, int> widthCount;
-		for (const NodeInfo &ni : nodes) widthCount[ni.rv->region().getWidthInVoxels()]++;
-		int bestCount = 0;
-		for (const auto &kv : widthCount)
-			if (kv.second > bestCount) { bestCount = kv.second; coarseCellSize = kv.first; }
-	}
-	if (coarseCellSize <= 0) {
-		Log::error("3dprint debugfrontier: could not determine coarse cell size -- run 3dprint regrid first");
-		return;
-	}
+	const int coarseCellSize = shell.coarseCellSize;
+	const glm::ivec3 gridLower = shell.gridLower;
+	const glm::ivec3 gridUpper = shell.gridUpper;
 	// User's requested cellSize is the deepest level we'll refine to. Clamp:
 	//  cellSize <= 0          : default to coarse
 	//  cellSize >= coarse     : just run coarse, don't refine
@@ -3754,36 +3792,9 @@ void runDebugFrontier(SceneManager *sceneMgr, int cellSize) {
 	Log::info("3dprint debugfrontier: coarse=%d target=%d nodes=%d",
 			  coarseCellSize, targetCellSize, totalNodes);
 
-	// World grid bbox from snapped node lower-corners. Expand by 1 coarse cell on
-	// each side so exterior BFS has air around the model to seed from.
-	glm::ivec3 gridLower(INT_MAX, INT_MAX, INT_MAX), gridUpper(INT_MIN, INT_MIN, INT_MIN);
-	Level coarse;
-	coarse.cellSize = coarseCellSize;
-	coarse.solid.reserve((size_t)totalNodes);
-	for (int i = 0; i < totalNodes; ++i) {
-		NodeInfo &ni = nodes[i];
-		const voxel::Region &r = ni.rv->region();
-		ni.cellOrigin = toCellOrigin(transformPoint(ni.worldMat, r.getLowerCorner()), coarseCellSize);
-		gridLower = glm::min(gridLower, ni.cellOrigin);
-		gridUpper = glm::max(gridUpper, ni.cellOrigin);
-		bool hasSolid = false;
-		for (int z = r.getLowerZ(); z <= r.getUpperZ() && !hasSolid; ++z)
-			for (int y = r.getLowerY(); y <= r.getUpperY() && !hasSolid; ++y)
-				for (int x = r.getLowerX(); x <= r.getUpperX() && !hasSolid; ++x)
-					if (!voxel::isAir(ni.rv->voxel(x, y, z).getMaterial())) hasSolid = true;
-		if (hasSolid) coarse.solid.emplace(ni.cellOrigin, i);
-	}
-	gridLower -= glm::ivec3(coarseCellSize);
-	gridUpper += glm::ivec3(coarseCellSize);
-
-	// Coarse pass: state grid + ext/uint64_t classification. Same as runHoleFill.
-	coarse.initGrid(gridLower, gridUpper);
-	for (const auto &kv : coarse.solid)
-		if (coarse.inBounds(kv.first)) coarse.state[(size_t)coarse.toIdx(kv.first)] = kStateSolid;
-	{ Level emptyPrev; buildExterior(coarse, emptyPrev); }
-	const uint64_t coarseInt = buildInteriorAllSeeds(coarse);
-	Log::info("3dprint debugfrontier: coarse %dx%dx%d ext+int classified (int=%lu, elapsed=%.1fs)",
-			  coarse.dimX, coarse.dimY, coarse.dimZ, (unsigned long)coarseInt, elapsedSince(fnStart));
+	// `coarse` is already classified (solid/exterior/interior) by buildCoarseShell.
+	Log::info("3dprint debugfrontier: coarse %dx%dx%d ext+int classified (interior=%lu cell(s), elapsed=%.1fs)",
+			  coarse.dimX, coarse.dimY, coarse.dimZ, (unsigned long)shell.intCount, elapsedSince(fnStart));
 
 	// Progressive refinement chain (mirrors runHoleFill exactly so the visualised
 	// frontier matches what holefill would actually expand from). State at each
