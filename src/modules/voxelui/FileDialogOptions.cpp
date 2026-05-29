@@ -36,6 +36,8 @@
 #include "voxelformat/private/qubicle/QBFormat.h"
 #include "voxelformat/private/qubicle/QBTFormat.h"
 #include "voxelformat/private/mesh/lego/LDrawFormat.h"
+#include "voxelformat/private/mesh/lego/LXFFormat.h"
+#include "voxelformat/private/mesh/lego/StudioIOFormat.h"
 #include "voxelformat/private/vengi/VENGIFormat.h"
 #include "voxelutil/ImageUtils.h"
 
@@ -169,6 +171,9 @@ static void saveOptionsMesh(const io::FormatDescription *desc) {
 	ImGui::CheckboxVar(cfg::VoxformatAmbientocclusion);
 	ImGui::CheckboxVar(cfg::VoxformatTransform);
 	ImGui::CheckboxVar(cfg::VoxformatOptimize);
+	ImGui::BeginDisabled(!core::getVar(cfg::VoxformatOptimize)->boolVal());
+	ImGui::InputVarFloat(cfg::VoxformatMeshSimplifyRatio);
+	ImGui::EndDisabled();
 	ImGui::CheckboxVar(cfg::VoxformatPointCloud);
 	ImGui::BeginDisabled(!supportsQuads);
 	ImGui::CheckboxVar(cfg::VoxformatQuads);
@@ -420,7 +425,7 @@ bool loadOptions(const io::FormatDescription *desc, const io::FilesystemEntry &e
 		ImGui::CheckboxVar(cfg::VoxformatVOXAnimAsNodes);
 	}
 
-	if (*desc == voxelformat::LDrawFormat::format()) {
+	if (*desc == voxelformat::LDrawFormat::format() || *desc == voxelformat::StudioIOFormat::format() || *desc == voxelformat::LXFFormat::format()) {
 		ImGui::InputVarString(cfg::VoxformatLDrawDir);
 	}
 

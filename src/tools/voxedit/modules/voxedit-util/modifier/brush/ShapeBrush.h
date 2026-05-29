@@ -52,8 +52,8 @@ protected:
 	math::Axis getShapeDimensionForAxis(voxel::FaceNames face, const glm::ivec3 &dimensions, int &width, int &height,
 										int &depth) const;
 
-	ShapeType _shapeType = ShapeType::AABB; ///< Current shape being generated
-	int _thickness = 1; ///< Wall thickness for hollow shapes (e.g., Circle)
+	ShapeType _shapeType = ShapeType::Box; ///< Current shape being generated
+	int _thickness = 1; ///< Wall thickness for hollow shapes (e.g., Circle, Torus)
 
 	/**
 	 * @brief Generate the selected shape within the given region
@@ -78,7 +78,7 @@ public:
 	void reset() override;
 
 	bool isSimplePreview() const override {
-		return _shapeType == ShapeType::AABB;
+		return _shapeType == ShapeType::Box;
 	}
 
 	/**

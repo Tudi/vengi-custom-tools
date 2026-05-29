@@ -9,6 +9,7 @@
 #include "io/FilesystemArchive.h"
 #include "app/tests/AbstractTest.h"
 #include "math/Axis.h"
+#include "scenegraph/SceneGraphNode.h"
 #include "voxel/MaterialColor.h"
 #include "voxel/RawVolume.h"
 #include "voxel/RawVolumeWrapper.h"
@@ -40,12 +41,12 @@ protected:
 	void save(const core::String &filename) const {
 #if 0
 		scenegraph::SceneGraph sceneGraph;
-		scenegraph::SceneGraphNode node1;
+		scenegraph::SceneGraphNode node1(scenegraph::SceneGraphNodeType::Model);
 		node1.setUnownedVolume(_volume);
 		sceneGraph.emplace(core::move(node1));
-		const io::FilePtr &file = io::filesystem()->open(filename, io::FileMode::SysWrite);
+		const io::ArchivePtr &archive = io::openFilesystemArchive(_testApp->filesystem());
 		voxelformat::SaveContext saveCtx;
-		ASSERT_TRUE(voxelformat::saveFormat(file, nullptr, sceneGraph, saveCtx));
+		ASSERT_TRUE(voxelformat::saveFormat(sceneGraph, filename, nullptr, archive, saveCtx));
 #endif
 	}
 
@@ -93,18 +94,19 @@ protected:
 		voxelformat::LoadContext loadCtx;
 		voxelformat::QBFormat format;
 		ASSERT_TRUE(format.load(filename, archive, sceneGraph, loadCtx));
-		scenegraph::SceneGraph::MergeResult merged = sceneGraph.merge();
-		core::ScopedPtr<voxel::RawVolume> v(merged.volume());
+		const scenegraph::SceneGraphNode *node = sceneGraph.firstModelNode();
+		ASSERT_NE(nullptr, node) << "No model node found in " << filename;
+		const voxel::RawVolume *v = node->volume();
 		ASSERT_NE(nullptr, v) << "Can't load " << filename;
-		volumeComparator(*v, merged.palette, *_volume, merged.palette);
+		volumeComparator(*v, node->palette(), *_volume, node->palette());
 	}
 
-	void testCreateCirclePlane(math::Axis axis) {
+	void testCreateEllipsePlane(math::Axis axis) {
 		voxel::RawVolumeWrapper wrapper(_volume);
 		glm::ivec3 centerBottom = _center;
 		const int axisIdx = math::getIndexForAxis(axis);
 		centerBottom[axisIdx] = _region.getLowerCorner()[axisIdx];
-		shape::createCirclePlane(wrapper, centerBottom, axis, _width, _depth, 10, _voxel);
+		shape::createEllipsePlane(wrapper, centerBottom, axis, _width, _depth, 10, _voxel);
 		EXPECT_EQ(wrapper.dirtyRegion().getLowerCorner()[axisIdx], centerBottom[axisIdx]);
 	}
 
@@ -233,43 +235,35 @@ TEST_F(ShapeGeneratorTest, testCreateCircleOutline) {
 	EXPECT_TRUE(voxel::isAir(_volume->voxel(center.x, center.y, center.z).getMaterial()));
 }
 
-TEST_F(ShapeGeneratorTest, testCreateHollowCylinder) {
+TEST_F(ShapeGeneratorTest, testCreateEllipseOutline) {
 	voxel::RawVolumeWrapper wrapper(_volume);
-	glm::ivec3 centerBottom = _center;
-	centerBottom.y = _region.getLowerY();
-	const int radius = 10;
+	glm::ivec3 center = _center;
+	center.y = _region.getLowerY();
+	const int width = 20;
+	const int depth = 14;
+	const double radiusX = width / 2.0;
+	const double radiusZ = depth / 2.0;
 	const int thickness = 2;
-	shape::createHollowCylinder(wrapper, centerBottom, math::Axis::Y, radius, _height, thickness, _voxel);
-	const int hollowCount = voxelutil::countVoxels(*_volume);
+	shape::createEllipseOutline(wrapper, center, math::Axis::Y, width, depth, radiusX, radiusZ, thickness, _voxel);
+	const int count = voxelutil::countVoxels(*_volume);
+	EXPECT_GT(count, 0);
 
-	// compare with filled cylinder - hollow should have fewer voxels
-	voxel::RawVolume filledVolume(_region);
-	voxel::RawVolumeWrapper filledWrapper(&filledVolume);
-	shape::createCylinder(filledWrapper, centerBottom, math::Axis::Y, radius, _height, _voxel);
-	const int filledCount = voxelutil::countVoxels(filledVolume);
-
-	EXPECT_GT(hollowCount, 0);
-	EXPECT_LT(hollowCount, filledCount);
-
-	// verify the center column is empty
-	for (int y = centerBottom.y; y < centerBottom.y + _height; ++y) {
-		EXPECT_TRUE(voxel::isAir(_volume->voxel(centerBottom.x, y, centerBottom.z).getMaterial()))
-			<< "Center should be empty at y=" << y;
-	}
+	// verify the center is empty (hollow)
+	EXPECT_TRUE(voxel::isAir(_volume->voxel(center.x, center.y, center.z).getMaterial()));
 }
 
-TEST_F(ShapeGeneratorTest, testCreateCirclePlaneX) {
-	testCreateCirclePlane(math::Axis::X);
+TEST_F(ShapeGeneratorTest, testCreateEllipsePlaneX) {
+	testCreateEllipsePlane(math::Axis::X);
 	save("circleplaneX.qb");
 }
 
-TEST_F(ShapeGeneratorTest, testCreateCirclePlaneY) {
-	testCreateCirclePlane(math::Axis::Y);
+TEST_F(ShapeGeneratorTest, testCreateEllipsePlaneY) {
+	testCreateEllipsePlane(math::Axis::Y);
 	save("circleplaneY.qb");
 }
 
-TEST_F(ShapeGeneratorTest, testCreateCirclePlaneZ) {
-	testCreateCirclePlane(math::Axis::Z);
+TEST_F(ShapeGeneratorTest, testCreateEllipsePlaneZ) {
+	testCreateEllipsePlane(math::Axis::Z);
 	save("circleplaneZ.qb");
 }
 

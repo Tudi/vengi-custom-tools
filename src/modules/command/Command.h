@@ -153,9 +153,6 @@ private:
 	static size_t _sortedCommandListSize;
 	static Command* _sortedCommandList[MAX_COMMANDS];
 
-	static double _delaySeconds;
-	static core::DynamicArray<core::String> _delayedTokens;
-
 	core::String _name;
 	core::String _help;
 	FunctionType _func;
@@ -230,8 +227,6 @@ public:
 	static int update(double deltaFrameSeconds);
 
 	static int execute(const core::String& command);
-
-	static int execute(CORE_FORMAT_STRING const char* msg, ...) CORE_PRINTF_VARARG_FUNC(1);
 
 	static bool execute(const core::String& command, const core::DynamicArray<core::String>& rawArgs);
 

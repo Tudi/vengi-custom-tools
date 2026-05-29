@@ -121,9 +121,11 @@ Some of these settings are only for voxel format, others are only for the mesh f
 | `voxformat_imagesliceoffset`                         | The offset of the slices when importing images as volumes or heightmaps            | 0            |
 | `voxformat_imagevolumemaxdepth`                      | The maximum depth of the volume when importing an image as volume                  | 1            |
 | `voxformat_imagevolumebothsides`                     | Import the image as volume for both sides                                          | true/false   |
+| `voxformat_ldrawdir`          | Path to the LDraw parts library directory for resolving part references                  |              |
 | `voxformat_mergequads`        | Merge similar quads to optimize the mesh                                                 | true/false   |
 | `voxformat_merge`             | Merge all models into one object                                                         | true/false   |
 | `voxformat_mesh_simplify`     | Simplify the mesh before voxelizing it                                                   | true/false   |
+| `voxformat_mesh_simplify_ratio` | Target fraction of triangle indices to keep when applying mesh optimization (0 = disable simplification) | 0.0-1.0      |
 | `voxformat_optimize`          | Apply mesh optimizations when saving mesh based formats                                  | true/false   |
 | `voxformat_osmmeterspervoxel` | The number of real-world meters each voxel represents in OSM imports                     | 1            |
 | `voxformat_osmurl`            | The openstreetmap overpass url                                                           |              |

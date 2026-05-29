@@ -12,6 +12,7 @@
 #include "app/App.h"
 #include "app/I18N.h"
 #include "app/i18n/Language.h"
+#include "font/FontResolver.h"
 #include "color/Quantize.h"
 #include "core/ConfigVar.h"
 #include "core/collection/DynamicArray.h"
@@ -310,7 +311,7 @@ void IMGUIApp::loadFonts() {
 	io.Fonts->AddFontFromMemoryCompressedTTF(ArimoRegular_compressed_data, ArimoRegular_compressed_size);
 	io.Fonts->AddFontFromMemoryCompressedTTF(FontLucide_compressed_data, FontLucide_compressed_size, 0.0f,
 											&fontIconCfg);
-	_monospace = io.Fonts->AddFontDefaultVector();
+
 	core::DynamicArray<io::FilesystemEntry> entities;
 	io::filesystem()->list("font", entities, "*.ttf");
 	Log::debug("Found %i additional font files", (int)entities.size());
@@ -323,6 +324,23 @@ void IMGUIApp::loadFonts() {
 			Log::error("Failed to load font from %s", name.c_str());
 		}
 	}
+
+	if (entities.empty()) {
+		const core::DynamicArray<core::String> &systemFonts = ui::font::findSystemFonts();
+		for (const core::String &fontPath : systemFonts) {
+			if (!core::string::icontains(fontPath, "NotoSansCJK")) {
+				continue;
+			}
+			Log::debug("Load system font from %s", fontPath.c_str());
+			ImFontConfig fontCfg;
+			fontCfg.MergeMode = true;
+			if (io.Fonts->AddFontFromFileTTF(fontPath.c_str(), 0.0f, &fontCfg) != nullptr) {
+				break; // one system font is enough
+			}
+		}
+	}
+
+	_monospace = io.Fonts->AddFontDefaultVector();
 }
 
 static void *_imguiAlloc(size_t size, void *) {
@@ -438,6 +456,7 @@ app::AppState IMGUIApp::onInit() {
 #ifdef IMGUI_ENABLE_TEST_ENGINE
 	if (registerUITests()) {
 		ImGuiTestEngine_Start(_imguiTestEngine, ImGui::GetCurrentContext());
+		_imguiTestEngineStarted = true;
 	}
 #endif
 	// if we decide to hide the window, we don't want docking to show externalized windows
@@ -1071,8 +1090,13 @@ void IMGUIApp::colorReductionOptions() {
 
 app::AppState IMGUIApp::onCleanup() {
 #ifdef IMGUI_ENABLE_TEST_ENGINE
-	ImGuiTestEngine_Stop(_imguiTestEngine);
-	_fileDialog.unregisterUITests(_imguiTestEngine);
+	if (_imguiTestEngine != nullptr) {
+		if (_imguiTestEngineStarted) {
+			ImGuiTestEngine_Stop(_imguiTestEngine);
+			_imguiTestEngineStarted = false;
+		}
+		_fileDialog.unregisterUITests(_imguiTestEngine);
+	}
 #endif
 	if (_imguiBackendInitialized) {
 #ifndef USE_VK_RENDERER
@@ -1093,8 +1117,10 @@ app::AppState IMGUIApp::onCleanup() {
 		ImGui::DestroyContext();
 	}
 #ifdef IMGUI_ENABLE_TEST_ENGINE
-	ImGuiTestEngine_DestroyContext(_imguiTestEngine);
-	_imguiTestEngine = nullptr;
+	if (_imguiTestEngine != nullptr) {
+		ImGuiTestEngine_DestroyContext(_imguiTestEngine);
+		_imguiTestEngine = nullptr;
+	}
 #endif
 	_console.shutdown();
 	return Super::onCleanup();

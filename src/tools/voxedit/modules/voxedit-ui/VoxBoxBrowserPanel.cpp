@@ -3,6 +3,7 @@
  */
 
 #include "VoxBoxBrowserPanel.h"
+#include "ScopedID.h"
 #include "app/I18N.h"
 #include "command/CommandHandler.h"
 #include "core/Var.h"
@@ -69,25 +70,51 @@ void VoxBoxBrowserPanel::loginPanel() {
 		return;
 	}
 
-	core::String username = _varUsername->strVal();
-	core::String password = _varPassword->strVal();
-	ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.4f);
-	if (ImGui::InputTextWithHint("##voxbox_user", _("Username"), &username)) {
-		_varUsername->setVal(username);
-	}
-	ImGui::SameLine();
-	ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.5f);
-	if (ImGui::InputTextWithHint("##voxbox_pass", _("Password"), &password, ImGuiInputTextFlags_Password)) {
-		_varPassword->setVal(password);
-	}
-	ImGui::SameLine();
-	if (ImGui::IconButton(ICON_LC_LOG_IN, _("Login"))) {
-		if (_api.login(username, password)) {
-			_loginError = "";
-			_varPassword->setVal("");
-			_varApiKey->setVal(_api.refreshToken());
-		} else {
-			_loginError = _("Login failed");
+	if (_useApiKey) {
+		core::String apiKey = _varApiKey->strVal();
+		ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.7f);
+		if (ImGui::InputTextWithHint("##voxbox_apikey", _("API key (refresh token)"), &apiKey, ImGuiInputTextFlags_Password)) {
+			_varApiKey->setVal(apiKey);
+		}
+		ImGui::SameLine();
+		if (ImGui::IconButton(ICON_LC_LOG_IN, _("Connect"))) {
+			if (apiKey.empty()) {
+				_loginError = _("API key is empty");
+			} else {
+				_api.setRefreshToken(apiKey);
+				_varApiKey->setVal(apiKey);
+				_loginError = "";
+			}
+		}
+		ImGui::SameLine();
+		if (ImGui::SmallButton(_("Use password"))) {
+			_useApiKey = false;
+		}
+	} else {
+		core::String username = _varUsername->strVal();
+		core::String password = _varPassword->strVal();
+		ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.4f);
+		if (ImGui::InputTextWithHint("##voxbox_user", _("Username"), &username)) {
+			_varUsername->setVal(username);
+		}
+		ImGui::SameLine();
+		ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.5f);
+		if (ImGui::InputTextWithHint("##voxbox_pass", _("Password"), &password, ImGuiInputTextFlags_Password)) {
+			_varPassword->setVal(password);
+		}
+		ImGui::SameLine();
+		if (ImGui::IconButton(ICON_LC_LOG_IN, _("Login"))) {
+			if (_api.login(username, password)) {
+				_loginError = "";
+				_varPassword->setVal("");
+				_varApiKey->setVal(_api.refreshToken());
+			} else {
+				_loginError = _("Login failed");
+			}
+		}
+		ImGui::SameLine();
+		if (ImGui::SmallButton(_("Use API key"))) {
+			_useApiKey = true;
 		}
 	}
 	if (!_loginError.empty()) {
@@ -326,10 +353,12 @@ void VoxBoxBrowserPanel::uploadPanel() {
 		return;
 	}
 
+	ui::ScopedID id("upload");
+
 	ImGui::InputText(_("Name"), &_uploadInfo.name);
 	ImGui::InputTextMultiline(_("Description"), &_uploadInfo.description, ImVec2(0, ImGui::GetTextLineHeight() * 3));
 
-	if (ImGui::BeginCombo(_("Category##upload"), VoxBoxCategoryStr(_uploadInfo.category))) {
+	if (ImGui::BeginCombo(_("Category"), VoxBoxCategoryStr(_uploadInfo.category))) {
 		for (int i = 0; i < (int)VoxBoxCategory::Max; ++i) {
 			if (ImGui::Selectable(VoxBoxCategoryStr((VoxBoxCategory)i), _uploadInfo.category == (VoxBoxCategory)i)) {
 				_uploadInfo.category = (VoxBoxCategory)i;
@@ -338,7 +367,7 @@ void VoxBoxBrowserPanel::uploadPanel() {
 		ImGui::EndCombo();
 	}
 
-	if (ImGui::BeginCombo(_("License##upload"), VoxBoxLicenseStr(_uploadInfo.license))) {
+	if (ImGui::BeginCombo(_("License"), VoxBoxLicenseStr(_uploadInfo.license))) {
 		for (int i = 0; i < (int)VoxBoxLicense::Max; ++i) {
 			if (ImGui::Selectable(VoxBoxLicenseStr((VoxBoxLicense)i), _uploadInfo.license == (VoxBoxLicense)i)) {
 				_uploadInfo.license = (VoxBoxLicense)i;
@@ -347,9 +376,9 @@ void VoxBoxBrowserPanel::uploadPanel() {
 		ImGui::EndCombo();
 	}
 
-	ImGui::Checkbox(_("Animated##upload"), &_uploadInfo.animated);
+	ImGui::Checkbox(_("Animated"), &_uploadInfo.animated);
 	ImGui::SameLine();
-	ImGui::Checkbox(_("Public##upload"), &_uploadInfo.isPublic);
+	ImGui::Checkbox(_("Public"), &_uploadInfo.isPublic);
 
 	if (!_uploadInfo.id.empty()) {
 		ImGui::Text(_("Updating existing model: %s"), _uploadInfo.id.c_str());

@@ -45,7 +45,7 @@ TEST_F(NormalBrushTest, testExecuteSingleManual) {
 #endif
 	NormalBrush brush;
 	ASSERT_TRUE(brush.init());
-	brush.setSingleMode();
+	brush.setStrokeMode();
 	brush.setPaintMode(NormalBrush::PaintMode::Manual);
 
 	scenegraph::SceneGraph sceneGraph;

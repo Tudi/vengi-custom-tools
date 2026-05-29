@@ -24,35 +24,35 @@ void AABBBrush::construct() {
 	command::Command::registerCommand("set" + cmdName + "center")
 		.setHandler([this](const command::CommandArgs &args) {
 			setCenterMode();
-		}).setHelp(_("Set center plane building"));
+		}).setHelp(_("Grow the box from the first click as the center"));
 
 	command::Command::registerCommand("set" + cmdName + "aabb")
 		.setHandler([this](const command::CommandArgs &args) {
-			setAABBMode();
-		}).setHelp(_("Set default aabb voxel building mode"));
+			setBoxMode();
+		}).setHelp(_("Click and drag to define a box of voxels"));
 
 	command::Command::registerCommand("set" + cmdName + "single")
 		.setHandler([this](const command::CommandArgs &args) {
-			setSingleMode();
-		}).setHelp(_("Set single voxel building mode - continue setting voxels until you release the action button"));
+			setStrokeMode();
+		}).setHelp(_("Place voxels along the cursor while the action button is held"));
 
 	command::Command::registerCommand("set" + cmdName + "singlemove")
 		.setHandler([this](const command::CommandArgs &args) {
-			setSingleModeMove();
-		}).setHelp(_("Set single voxel building mode - continue setting voxels until you release the action button - but don't overwrite the last voxel"));
+			setStrokeNoOverlap();
+		}).setHelp(_("Like stroke mode, but do not replace the same voxel twice"));
 }
 
 void AABBBrush::onSceneChange() {
 	Super::onSceneChange();
 	_secondPosValid = false;
-	_aabbMode = false;
+	_boxMode = false;
 	_aabbFace = voxel::FaceNames::Max;
 }
 
 void AABBBrush::reset() {
 	Super::reset();
 	_secondPosValid = false;
-	_aabbMode = false;
+	_boxMode = false;
 	// Preserve _mode (AABB/Single/Center) - it is a user preference set via UI commands
 	// (e.g., SelectBrush::setSelectMode(Paint) calls setSingleMode()). Resetting it here
 	// causes a mismatch: the derived brush still shows its mode in the UI, but the
@@ -140,7 +140,7 @@ bool AABBBrush::execute(scenegraph::SceneGraph &sceneGraph, ModifierVolumeWrappe
 	region = extendRegionInOrthoMode(region, wrapper.region(), ctx);
 	glm::ivec3 minsMirror = region.getLowerCorner();
 	glm::ivec3 maxsMirror = region.getUpperCorner();
-	if (!getMirrorAABB(minsMirror, maxsMirror)) {
+	if (!getMirrorBox(minsMirror, maxsMirror)) {
 		generate(sceneGraph, wrapper, ctx, region);
 	} else {
 		Log::debug("Execute mirror action");
@@ -171,20 +171,20 @@ glm::ivec3 AABBBrush::currentCursorPosition(const BrushContext &ctx) const {
 	return pos;
 }
 
-bool AABBBrush::wantAABB() const {
-	return !anySingleMode();
+bool AABBBrush::wantBox() const {
+	return !anyStrokeMode();
 }
 
 bool AABBBrush::beginBrush(const BrushContext &ctx) {
-	if (_aabbMode) {
+	if (_boxMode) {
 		return false;
 	}
 
-	// the order here matters - don't change _aabbMode earlier here
+	// the order here matters - don't change _boxMode earlier here
 	_aabbFirstPos = applyGridResolution(ctx.cursorPosition, ctx.gridResolution);
 	_lastCursorPos = ctx.cursorPosition;
 	_secondPosValid = false;
-	_aabbMode = wantAABB();
+	_boxMode = wantBox();
 	_aabbFace = ctx.cursorFace;
 	return true;
 }
@@ -196,14 +196,14 @@ void AABBBrush::update(const BrushContext &ctx, double nowSeconds) {
 		_lastCursorPos = ctx.cursorPosition;
 		// we have to update the preview each time we move the cursor if the brush
 		// is either spanning an aabb or has a radius set in single mode
-		if (_aabbMode || radius() > 0) {
+		if (_boxMode || radius() > 0) {
 			markDirty();
 		}
 	}
 }
 
 bool AABBBrush::active() const {
-	return _aabbMode || anySingleMode();
+	return _boxMode || anyStrokeMode();
 }
 
 bool AABBBrush::aborted(const BrushContext &ctx) const {
@@ -211,7 +211,7 @@ bool AABBBrush::aborted(const BrushContext &ctx) const {
 }
 
 void AABBBrush::step(const BrushContext &ctx) {
-	if (!_aabbMode || radius() > 0 || ctx.lockedAxis != math::Axis::None) {
+	if (!_boxMode || radius() > 0 || ctx.lockedAxis != math::Axis::None) {
 		return;
 	}
 	glm::ivec3 pos = currentCursorPosition(ctx);
@@ -224,7 +224,7 @@ void AABBBrush::step(const BrushContext &ctx) {
 
 void AABBBrush::endBrush(BrushContext &ctx) {
 	_secondPosValid = false;
-	_aabbMode = false;
+	_boxMode = false;
 	_aabbFace = voxel::FaceNames::Max;
 }
 
@@ -234,7 +234,7 @@ bool AABBBrush::isMode(uint32_t mode) const {
 
 void AABBBrush::setMode(uint32_t mode) {
 	_mode = mode;
-	if (singleModeMove()) {
+	if (strokeNoOverlap()) {
 		_sceneModifiedFlags = SceneModifiedFlags::NoResetTrace;
 	} else {
 		_sceneModifiedFlags = SceneModifiedFlags::All;
@@ -248,12 +248,12 @@ void AABBBrush::setRadius(int radius) {
 
 voxel::Region AABBBrush::calcRegion(const BrushContext &ctx) const {
 	const glm::ivec3 &pos = currentCursorPosition(ctx);
-	if (!anySingleMode() && centerMode()) {
+	if (!anyStrokeMode() && centerMode()) {
 		const glm::ivec3 &first = applyGridResolution(_aabbFirstPos, ctx.gridResolution);
 		const glm::ivec3 &delta = glm::abs(pos - first);
 		return voxel::Region(first - delta, first + delta);
 	}
-	const glm::ivec3 &first = anySingleMode() ? pos : applyGridResolution(_aabbFirstPos, ctx.gridResolution);
+	const glm::ivec3 &first = anyStrokeMode() ? pos : applyGridResolution(_aabbFirstPos, ctx.gridResolution);
 	const int rad = radius();
 	if (rad > 0) {
 		// TODO: BRUSH: _radius should only go into one direction (see BrushContext::_cursorFace) (only paint the surface)

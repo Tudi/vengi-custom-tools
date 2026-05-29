@@ -27,6 +27,7 @@
 #include "scenegraph/SceneGraphAnimation.h"
 #include "scenegraph/SceneGraphKeyFrame.h"
 #include "scenegraph/SceneGraphNode.h"
+#include "scenegraph/SceneGraphNodeProperties.h"
 #include "scenegraph/SceneGraphTransform.h"
 #include "scenegraph/SceneGraphUtil.h"
 #include "voxel/MaterialColor.h"
@@ -1372,10 +1373,13 @@ static int luaVoxel_shape_cylinder(lua_State* s) {
 static int luaVoxel_shape_torus(lua_State* s) {
 	LuaRawVolumeWrapper *volume = luaVoxel_tovolumewrapper(s, 1);
 	const glm::ivec3& center = clua_tovec<glm::ivec3>(s, 2);
-	const int minorRadius = (int)luaL_checkinteger(s, 3);
-	const int majorRadius = (int)luaL_checkinteger(s, 4);
-	const voxel::Voxel voxel = luaVoxel_getVoxel(s, 5);
-	shape::createTorus(*volume, center, minorRadius, majorRadius, voxel);
+	const math::Axis axis = luaVoxel_getAxis(s, 3);
+	const int width = (int)luaL_checkinteger(s, 4);
+	const int height = (int)luaL_checkinteger(s, 5);
+	const int depth = (int)luaL_checkinteger(s, 6);
+	const int minorRadius = (int)luaL_optinteger(s, 7, 0);
+	const voxel::Voxel voxel = luaVoxel_getVoxel(s, 8);
+	shape::createTorus(*volume, center, axis, glm::ivec3(width, height, depth), minorRadius, voxel);
 	return 0;
 }
 
@@ -1432,11 +1436,21 @@ static int luaVoxel_shape_circle(lua_State* s) {
 	LuaRawVolumeWrapper *volume = luaVoxel_tovolumewrapper(s, 1);
 	const glm::vec3& centerBottom = clua_tovec<glm::vec3>(s, 2);
 	const math::Axis axis = luaVoxel_getAxis(s, 3);
-	const int radius = (int)luaL_checkinteger(s, 4);
+	const int width = (int)luaL_checkinteger(s, 4);
 	const int height = (int)luaL_checkinteger(s, 5);
-	const int thickness = (int)luaL_optinteger(s, 6, 1);
-	const voxel::Voxel voxel = luaVoxel_getVoxel(s, 7);
-	shape::createHollowCylinder(*volume, centerBottom, axis, radius, height, thickness, voxel);
+	const int depth = (int)luaL_checkinteger(s, 6);
+	const int thickness = (int)luaL_optinteger(s, 7, 1);
+	const voxel::Voxel voxel = luaVoxel_getVoxel(s, 8);
+	const double radiusX = width / 2.0;
+	const double radiusZ = depth / 2.0;
+	const int axisIdx = math::getIndexForAxis(axis);
+	glm::ivec3 circleCenter = centerBottom;
+	glm::ivec3 offset{0};
+	offset[axisIdx] = 1;
+	for (int i = 0; i < height; ++i) {
+		shape::createEllipseOutline(*volume, circleCenter, axis, width, depth, radiusX, radiusZ, thickness, voxel);
+		circleCenter += offset;
+	}
 	return 0;
 }
 
@@ -2421,16 +2435,38 @@ static int luaVoxel_genland(lua_State *s) {
 	settings.river = clua_optboolean(s, 14, true);
 	settings.ambience = clua_optboolean(s, 15, true);
 
+	scenegraph::SceneGraph* sceneGraph = luaVoxel_scenegraph(s);
+	lua_getglobal(s, luaVoxel_globalnodeid());
+	int currentNodeId = lua_tointeger(s, -1);
+	lua_pop(s, 1);
+	const scenegraph::SceneGraphNode &currentNode = sceneGraph->node(currentNodeId);
+
+	const palette::Palette &palette = currentNode.palette();
+	if (lua_gettop(s) >= 16) {
+		if (lua_isnumber(s, 16)) {
+			settings.ground = palette.color((int)luaL_checkinteger(s, 16));
+		}
+		if (lua_isnumber(s, 17)) {
+			settings.grass = palette.color((int)luaL_checkinteger(s, 17));
+		}
+		if (lua_isnumber(s, 18)) {
+			settings.grass2 = palette.color((int)luaL_checkinteger(s, 18));
+		}
+		if (lua_isnumber(s, 19)) {
+			settings.water = palette.color((int)luaL_checkinteger(s, 19));
+		}
+	}
+
 	voxel::RawVolume *v = voxelgenerator::genland(settings);
 	if (v == nullptr) {
 		return clua_error(s, "Failed to generate land");
 	}
-	scenegraph::SceneGraph *sceneGraph = luaVoxel_scenegraph(s);
 	scenegraph::SceneGraphNode node(scenegraph::SceneGraphNodeType::Model);
 	node.setVolume(v);
 	node.setName("Generated Land");
-	node.setProperty("Generator", "Genland by Tom Dobrowolski");
-	int newNodeId = sceneGraph->emplace(core::move(node));
+	node.setProperty(scenegraph::PropGenerator, "Genland by Tom Dobrowolski");
+	node.setPalette(palette);
+	int newNodeId = sceneGraph->emplace(core::move(node), currentNodeId);
 	if (newNodeId == InvalidNodeId) {
 		return clua_error(s, "Failed to add generated land node to scene graph");
 	}
@@ -4437,8 +4473,11 @@ static int luaVoxel_shape_torus_jsonhelp(lua_State* s) {
 		"parameters": [
 			{"name": "volume", "type": "volume", "description": "The volume to draw in."},
 			{"name": "center", "type": "ivec3", "description": "The center position."},
-			{"name": "minorRadius", "type": "integer", "description": "The minor (tube) radius."},
-			{"name": "majorRadius", "type": "integer", "description": "The major (ring) radius."},
+			{"name": "axis", "type": "string", "description": "The axis perpendicular to the torus ring plane: 'x', 'y', or 'z' (default 'y')."},
+			{"name": "width", "type": "integer", "description": "The width of the bounding box."},
+			{"name": "height", "type": "integer", "description": "The height of the bounding box."},
+			{"name": "depth", "type": "integer", "description": "The depth of the bounding box."},
+			{"name": "minorRadius", "type": "integer", "description": "The minor (tube) radius (optional, 0 = auto)."},
 			{"name": "color", "type": "integer", "description": "The color index (optional, default 1)."}
 		],
 		"returns": []})";
@@ -4594,8 +4633,9 @@ static int luaVoxel_shape_circle_jsonhelp(lua_State* s) {
 			{"name": "volume", "type": "volume", "description": "The volume to draw in."},
 			{"name": "centerBottom", "type": "vec3", "description": "The center bottom position."},
 			{"name": "axis", "type": "string", "description": "The axis: 'x', 'y', or 'z' (default 'y')."},
-			{"name": "radius", "type": "integer", "description": "The outer radius of the cylinder."},
+			{"name": "width", "type": "integer", "description": "The width of the ellipse cross-section."},
 			{"name": "height", "type": "integer", "description": "The height of the cylinder."},
+			{"name": "depth", "type": "integer", "description": "The depth of the ellipse cross-section."},
 			{"name": "thickness", "type": "integer", "description": "The wall thickness in voxels (optional, default 1)."},
 			{"name": "color", "type": "integer", "description": "The color index (optional, default 1)."}
 		],
@@ -6414,7 +6454,11 @@ static int luaVoxel_genland_jsonhelp(lua_State* s) {
 			{"name": "offsetZ", "type": "integer", "description": "Z offset (optional, default 0)."},
 			{"name": "shadow", "type": "boolean", "description": "Add shadows (optional, default true)."},
 			{"name": "river", "type": "boolean", "description": "Add rivers (optional, default true)."},
-			{"name": "ambience", "type": "boolean", "description": "Add ambient effects (optional, default true)."}
+			{"name": "ambience", "type": "boolean", "description": "Add ambient effects (optional, default true)."},
+			{"name": "groundColor", "type": "integer", "description": "Ground color palette index (optional)."},
+			{"name": "grassColor", "type": "integer", "description": "Grass color palette index (optional)."},
+			{"name": "grass2Color", "type": "integer", "description": "Secondary grass color palette index (optional)."},
+			{"name": "waterColor", "type": "integer", "description": "Water color palette index (optional)."}
 		],
 		"returns": [
 			{"type": "node", "description": "The generated terrain node."}

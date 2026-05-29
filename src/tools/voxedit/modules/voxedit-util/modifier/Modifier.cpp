@@ -9,7 +9,6 @@
 #include "command/CommandCompleter.h"
 #include "core/Log.h"
 #include "core/Trace.h"
-#include "io/Filesystem.h"
 #include "math/Axis.h"
 #include "palette/Palette.h"
 #include "scenegraph/SceneGraph.h"
@@ -181,11 +180,15 @@ void Modifier::shutdown() {
 	_modifierRenderer->shutdown();
 }
 
+void Modifier::setHighlightRegion(const voxel::Region &region, uint64_t renderRegionMillis) {
+	_modifierRenderer->setHighlightRegion(region, renderRegionMillis);
+}
+
 void Modifier::update(double nowSeconds, const video::Camera *camera) {
 	_nowSeconds = nowSeconds;
 	_brushContext.fixedOrthoSideView = camera == nullptr ? false : camera->isOrthoAligned();
 	if (AABBBrush *aabbBrush = currentAABBBrush()) {
-		if (aabbBrush->anySingleMode()) {
+		if (aabbBrush->anyStrokeMode()) {
 			if (_actionExecuteButton.pressed() && nowSeconds >= _nextSingleExecution) {
 				_actionExecuteButton.execute(true);
 				_nextSingleExecution = nowSeconds + 0.1;
@@ -378,7 +381,7 @@ void Modifier::preExecuteBrush(const voxel::RawVolume *volume) {
 	}
 	_brushContext.targetVolumeRegion = volume->region();
 	_brushContext.prevCursorPosition = _brushContext.cursorPosition;
-	if (brush->brushClamping()) {
+	if (brush->clampToVolume()) {
 		const voxel::Region brushRegion = brush->calcRegion(_brushContext);
 		_brushContext.cursorPosition =
 			updateCursor(_brushContext.targetVolumeRegion, brushRegion, _brushContext.prevCursorPosition);
@@ -397,7 +400,7 @@ bool Modifier::executeBrush(scenegraph::SceneGraph &sceneGraph, scenegraph::Scen
 	ModifierVolumeWrapper wrapper(node, modifierType, _selectBrush.box3D().selectionRegion());
 	voxel::Voxel prevVoxel = _brushContext.cursorVoxel;
 	glm::ivec3 prevCursorPos = _brushContext.cursorPosition;
-	if (brush->brushClamping()) {
+	if (brush->clampToVolume()) {
 		const voxel::Region brushRegion = brush->calcRegion(_brushContext);
 		_brushContext.cursorPosition = updateCursor(_brushContext.targetVolumeRegion, brushRegion, prevCursorPos);
 	}
@@ -622,7 +625,7 @@ void Modifier::flushPendingBrushChanges() {
 		return;
 	}
 	Brush *brush = currentBrush();
-	if (!brush || !brush->dirty() || !brush->hasPendingChanges()) {
+	if (!brush || !brush->dirty() || !brush->needsPerFrameFlush()) {
 		return;
 	}
 	scenegraph::SceneGraph &sceneGraph = _sceneMgr->sceneGraph();
@@ -693,7 +696,7 @@ void Modifier::render(voxelrender::RenderContext &renderContext, const video::Ca
 			// rendering, then regenerate immediately at the new position.
 			resetPreview();
 			brush->markClean();
-			if (!brush->hasPendingChanges()) {
+			if (!brush->needsPerFrameFlush()) {
 				_previewManager.scheduleUpdate(_nowSeconds);
 			}
 		}

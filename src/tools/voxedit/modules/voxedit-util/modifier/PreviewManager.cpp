@@ -186,7 +186,7 @@ void PreviewManager::updateBrushVolumePreview(Modifier &modifier, palette::Palet
 	// Safety net: brushes with pending changes are handled in render() by
 	// executing on the real volume. If we reach here anyway, bail out to
 	// avoid corrupting brush history state against a temporary dummy volume.
-	if (brush->hasPendingChanges()) {
+	if (brush->needsPerFrameFlush()) {
 		return;
 	}
 
@@ -200,7 +200,7 @@ void PreviewManager::updateBrushVolumePreview(Modifier &modifier, palette::Palet
 	if (!simplePreview && canAllocatePreviewRegion(region, maxPreviewExtent)) {
 		glm::ivec3 minsMirror = region.getLowerCorner();
 		glm::ivec3 maxsMirror = region.getUpperCorner();
-		if (brush->getMirrorAABB(minsMirror, maxsMirror)) {
+		if (brush->getMirrorBox(minsMirror, maxsMirror)) {
 			createOrClearPreviewVolume(existingVolume, _previewMirrorVolume, voxel::Region(minsMirror, maxsMirror));
 			scenegraph::SceneGraphNode mirrorDummyNode(scenegraph::SceneGraphNodeType::Model);
 			mirrorDummyNode.setUnownedVolume(_previewMirrorVolume);
@@ -233,7 +233,7 @@ void PreviewManager::updateBrushVolumePreview(Modifier &modifier, palette::Palet
 		}
 		glm::ivec3 minsMirror = region.getLowerCorner();
 		glm::ivec3 maxsMirror = region.getUpperCorner();
-		if (brush->getMirrorAABB(minsMirror, maxsMirror)) {
+		if (brush->getMirrorBox(minsMirror, maxsMirror)) {
 			_brushPreview.simpleMirrorPreviewRegion = voxel::Region(minsMirror, maxsMirror);
 		}
 	}

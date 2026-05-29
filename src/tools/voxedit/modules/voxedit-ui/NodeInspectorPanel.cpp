@@ -493,6 +493,11 @@ void NodeInspectorPanel::sceneView(command::CommandExecutionListener &listener, 
 			pivotChanged = change = true;
 		}
 		ImGui::TooltipTextUnformatted(reset);
+		if (ImGui::Button(ICON_LC_CIRCLE_DOT "##centerpv")) {
+			pivot[0] = pivot[1] = pivot[2] = 0.5f;
+			pivotChanged = change = true;
+		}
+		ImGui::TooltipTextUnformatted(_("Center pivot"));
 		ImGui::TableNextColumn();
 		if (ImGui::Button(ICON_LC_LOCK "##multiplepv")) {
 			_sceneMgr->nodeGroupUpdatePivot(pivot);
@@ -673,7 +678,6 @@ void NodeInspectorPanel::ikConstraintSettings(scenegraph::SceneGraphNode &node) 
 		}
 		if (ImGui::IconButton(ICON_LC_PLUS, _("Add swing limit"))) {
 			scenegraph::IKConstraint::RadiusConstraint rc;
-			rc.center = glm::vec2(0.0f);
 			rc.radius = glm::half_pi<float>();
 			constraint.swingLimits.push_back(rc);
 			changed = true;

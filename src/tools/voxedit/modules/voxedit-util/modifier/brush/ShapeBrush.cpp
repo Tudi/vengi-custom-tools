@@ -16,8 +16,7 @@ namespace voxedit {
 void ShapeBrush::construct() {
 	Super::construct();
 	for (int type = ShapeType::Min; type < ShapeType::Max; ++type) {
-		const core::String &typeStr = core::String::lower(ShapeTypeStr[type]);
-		const core::String &cmd = "shape" + typeStr; // shapeaabb, ...
+		const core::String &cmd = core::String::format("shape%s", ShapeTypeCmdStr[type]);
 		const core::String &help = core::String::format(_("Change the shape type to %s"), _(ShapeTypeStr[type]));
 		command::Command::registerCommand(cmd.c_str())
 			.setHandler([&, type](const command::CommandArgs &args) {
@@ -77,13 +76,13 @@ void ShapeBrush::generate(scenegraph::SceneGraph &sceneGraph, ModifierVolumeWrap
 		face = voxel::FaceNames::PositiveX;
 	}
 	const math::Axis axis = getShapeDimensionForAxis(face, dimensions, width, height, depth);
-	const double size = (glm::max)(width, depth);
 	const bool negative = voxel::isNegativeFace(face);
 
 	const int axisIdx = math::getIndexForAxis(axis);
-	const glm::ivec3 &center = region.getCenter();
+	const glm::ivec3 &lc = region.getLowerCorner();
+	const glm::ivec3 center = lc + region.getDimensionsInVoxels() / 2;
 	glm::ivec3 centerBottom = center;
-	centerBottom[axisIdx] = region.getLowerCorner()[axisIdx];
+	centerBottom[axisIdx] = lc[axisIdx];
 
 	const voxel::Voxel &voxel = ctx.cursorVoxel;
 	if (!voxel::isAir(voxel.getMaterial())) {
@@ -94,18 +93,23 @@ void ShapeBrush::generate(scenegraph::SceneGraph &sceneGraph, ModifierVolumeWrap
 		}
 	}
 	switch (_shapeType) {
-	case ShapeType::AABB:
+	case ShapeType::Box:
 		voxelgenerator::shape::createCubeNoCenter(wrapper, region.getLowerCorner(), dimensions, voxel);
 		break;
 	case ShapeType::Torus: {
-		const double minorRadius = size / 5.0;
-		const double majorRadius = size / 2.0 - minorRadius;
-		voxelgenerator::shape::createTorus(wrapper, center, minorRadius, majorRadius, voxel);
+		voxelgenerator::shape::createTorus(wrapper, center, axis, dimensions, _thickness, voxel);
 		break;
 	}
 	case ShapeType::Cylinder: {
-		const int radius = (int)glm::round(size / 2.0);
-		voxelgenerator::shape::createCylinder(wrapper, centerBottom, axis, radius, height, voxel);
+		const double radiusX = width / 2.0;
+		const double radiusZ = depth / 2.0;
+		glm::ivec3 circleCenter = centerBottom;
+		glm::ivec3 offset{0};
+		offset[axisIdx] = 1;
+		for (int i = 0; i < height; ++i) {
+			voxelgenerator::shape::createEllipsePlane(wrapper, circleCenter, axis, width, depth, radiusX, radiusZ, voxel);
+			circleCenter += offset;
+		}
 		break;
 	}
 	case ShapeType::Cone:
@@ -118,8 +122,15 @@ void ShapeBrush::generate(scenegraph::SceneGraph &sceneGraph, ModifierVolumeWrap
 		voxelgenerator::shape::createEllipse(wrapper, centerBottom, axis, width, height, depth, voxel);
 		break;
 	case ShapeType::Circle: {
-		const int radius = (int)glm::round(size / 2.0);
-		voxelgenerator::shape::createHollowCylinder(wrapper, centerBottom, axis, radius, height, _thickness, voxel);
+		const double radiusX = width / 2.0;
+		const double radiusZ = depth / 2.0;
+		glm::ivec3 circleCenter = centerBottom;
+		glm::ivec3 offset{0};
+		offset[axisIdx] = 1;
+		for (int i = 0; i < height; ++i) {
+			voxelgenerator::shape::createEllipseOutline(wrapper, circleCenter, axis, width, depth, radiusX, radiusZ, _thickness, voxel);
+			circleCenter += offset;
+		}
 		break;
 	}
 	case ShapeType::Max:
@@ -138,7 +149,7 @@ void ShapeBrush::setThickness(int thickness) {
 
 void ShapeBrush::reset() {
 	Super::reset();
-	_shapeType = ShapeType::AABB;
+	_shapeType = ShapeType::Box;
 	_thickness = 1;
 }
 

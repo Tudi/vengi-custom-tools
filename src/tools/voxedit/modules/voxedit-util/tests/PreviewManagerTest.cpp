@@ -31,6 +31,7 @@ protected:
 		int updateCalls = 0;
 		int renderCalls = 0;
 		int waitCalls = 0;
+		int clearCalls = 0;
 		ModifierRendererContext lastContext;
 
 		void update(const ModifierRendererContext &ctx) override {
@@ -42,6 +43,9 @@ protected:
 		}
 		void waitForPendingExtractions() override {
 			++waitCalls;
+		}
+		void clearBrushVolumes() override {
+			++clearCalls;
 		}
 	};
 
@@ -64,7 +68,7 @@ protected:
 		modifier.setCursorPosition(mins, voxel::FaceNames::PositiveX);
 		EXPECT_TRUE(modifier.beginBrush());
 		if (brushType == BrushType::Shape) {
-			if (modifier.shapeBrush().singleMode()) {
+			if (modifier.shapeBrush().strokeMode()) {
 				EXPECT_FALSE(modifier.shapeBrush().active())
 					<< "ShapeBrush is active in single mode for modifierType " << (int)modifierType;
 				return;

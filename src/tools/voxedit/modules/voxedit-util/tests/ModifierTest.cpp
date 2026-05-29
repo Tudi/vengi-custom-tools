@@ -33,6 +33,9 @@ protected:
 		int updateCalls = 0;
 		int renderCalls = 0;
 		int waitCalls = 0;
+		int highlightCalls = 0;
+		voxel::Region lastHighlightRegion = voxel::Region::InvalidRegion;
+		uint64_t lastHighlightMillis = 0;
 		ModifierRendererContext lastContext;
 
 		void update(const ModifierRendererContext &ctx) override {
@@ -44,6 +47,36 @@ protected:
 		}
 		void waitForPendingExtractions() override {
 			++waitCalls;
+		}
+		void setHighlightRegion(const voxel::Region &region, uint64_t renderRegionMillis = 0) override {
+			++highlightCalls;
+			lastHighlightRegion = region;
+			lastHighlightMillis = renderRegionMillis;
+		}
+	};
+
+	class QueuedModifierRenderer : public IModifierRenderer {
+	public:
+		int drainedHighlightCommands = 0;
+		voxel::Region lastHighlightRegion = voxel::Region::InvalidRegion;
+		uint64_t lastHighlightMillis = 0;
+
+		void update(const ModifierRendererContext &ctx) override {
+			(void)ctx;
+			const core::DynamicArray<CommandEvent> cmds = popCommandBuffer();
+			for (const CommandEvent &cmd : cmds) {
+				switch (cmd.type) {
+				case CommandType::HighlightRegion:
+					lastHighlightRegion = voxel::Region(
+						glm::ivec3(cmd.highlightRegion.regionMins[0], cmd.highlightRegion.regionMins[1],
+								   cmd.highlightRegion.regionMins[2]),
+						glm::ivec3(cmd.highlightRegion.regionMaxs[0], cmd.highlightRegion.regionMaxs[1],
+								   cmd.highlightRegion.regionMaxs[2]));
+					lastHighlightMillis = cmd.highlightRegion.renderRegionMillis;
+					++drainedHighlightCommands;
+					break;
+				}
+			}
 		}
 	};
 
@@ -66,7 +99,7 @@ protected:
 		modifier.setCursorPosition(mins, voxel::FaceNames::PositiveX); // mins for aabb
 		EXPECT_TRUE(modifier.beginBrush());
 		if (brushType == BrushType::Shape) {
-			if (modifier.shapeBrush().singleMode()) {
+			if (modifier.shapeBrush().strokeMode()) {
 				EXPECT_FALSE(modifier.shapeBrush().active())
 					<< "ShapeBrush is active in single mode for modifierType " << (int)modifierType;
 				return;
@@ -297,7 +330,7 @@ TEST_F(ModifierTest, testClamp) {
 	modifier.setCursorPosition(volume.region().getLowerCenter(), voxel::FaceNames::PositiveX); // mins for aabb
 
 	{
-		brush.setBrushClamping(false);
+		brush.setClampToVolume(false);
 		voxel::Region dirtyRegion;
 		EXPECT_TRUE(modifier.execute(sceneGraph, node,
 									 [&dirtyRegion](const voxel::Region &region, ModifierType type,
@@ -306,7 +339,7 @@ TEST_F(ModifierTest, testClamp) {
 	}
 	volume.clear();
 	{
-		brush.setBrushClamping(true);
+		brush.setClampToVolume(true);
 		voxel::Region dirtyRegion;
 		EXPECT_TRUE(modifier.execute(sceneGraph, node,
 									 [&dirtyRegion](const voxel::Region &region, ModifierType type,
@@ -342,8 +375,43 @@ TEST_F(ModifierTest, testRenderCallsRenderer) {
 	EXPECT_EQ(renderer->renderCalls, 1) << "Renderer render should be called once per render";
 	// Check that cursor position was passed to the renderer
 	EXPECT_EQ(renderer->lastContext.cursorPosition, glm::ivec3(5));
+	EXPECT_EQ(renderer->lastContext.activeRegion, voxel::Region(glm::ivec3(0), glm::ivec3(31)));
 	modifier.shutdown();
 	mgr.shutdown();
+}
+
+TEST_F(ModifierTest, testSetHighlightRegionDelegatesToRenderer) {
+	auto renderer = core::make_shared<TrackingModifierRenderer>();
+	SceneManager mgr(core::make_shared<core::TimeProvider>(), _testApp->filesystem(),
+					 core::make_shared<ISceneRenderer>(), core::make_shared<IModifierRenderer>());
+	mgr.construct();
+	ASSERT_TRUE(mgr.init());
+	mgr.newScene(true, "test", voxel::Region(0, 31));
+
+	Modifier modifier(&mgr, renderer);
+	modifier.construct();
+	ASSERT_TRUE(modifier.init());
+
+	const voxel::Region highlightRegion(glm::ivec3(2), glm::ivec3(4));
+	modifier.setHighlightRegion(highlightRegion, 250);
+	EXPECT_EQ(renderer->highlightCalls, 1);
+	EXPECT_EQ(renderer->lastHighlightRegion, highlightRegion);
+	EXPECT_EQ(renderer->lastHighlightMillis, 250u);
+
+	modifier.shutdown();
+	mgr.shutdown();
+}
+
+TEST_F(ModifierTest, testQueuedHighlightRegionCommand) {
+	QueuedModifierRenderer renderer;
+	const voxel::Region highlightRegion(glm::ivec3(1), glm::ivec3(3));
+
+	renderer.setHighlightRegion(highlightRegion, 123);
+	renderer.update(ModifierRendererContext{});
+
+	EXPECT_EQ(renderer.drainedHighlightCommands, 1);
+	EXPECT_EQ(renderer.lastHighlightRegion, highlightRegion);
+	EXPECT_EQ(renderer.lastHighlightMillis, 123u);
 }
 
 TEST_F(ModifierTest, testRenderSkippedWhenLocked) {

@@ -61,6 +61,18 @@ MeshFormat::ChunkMeshExt *MeshFormat::getParent(const scenegraph::SceneGraph &sc
 	return nullptr;
 }
 
+glm::vec3 MeshFormat::getScale() {
+	const float scale = core::getVar(cfg::VoxformatScale)->floatVal();
+	float scaleX = core::getVar(cfg::VoxformatScaleX)->floatVal();
+	float scaleY = core::getVar(cfg::VoxformatScaleY)->floatVal();
+	float scaleZ = core::getVar(cfg::VoxformatScaleZ)->floatVal();
+	scaleX = glm::epsilonNotEqual(scaleX, 1.0f, glm::epsilon<float>()) ? scaleX : scale;
+	scaleY = glm::epsilonNotEqual(scaleY, 1.0f, glm::epsilon<float>()) ? scaleY : scale;
+	scaleZ = glm::epsilonNotEqual(scaleZ, 1.0f, glm::epsilon<float>()) ? scaleZ : scale;
+	Log::debug("scale: %f:%f:%f", scaleX, scaleY, scaleZ);
+	return {scaleX, scaleY, scaleZ};
+}
+
 glm::vec3 MeshFormat::getInputScale(const glm::vec3 &meshMins, const glm::vec3 &meshMaxs) {
 	const int voxelSize = core::getVar(cfg::VoxformatVoxelSize)->intVal();
 	if (voxelSize > 0) {
@@ -72,15 +84,7 @@ glm::vec3 MeshFormat::getInputScale(const glm::vec3 &meshMins, const glm::vec3 &
 			return glm::vec3(uniformScale);
 		}
 	}
-	const float scale = core::getVar(cfg::VoxformatScale)->floatVal();
-	float scaleX = core::getVar(cfg::VoxformatScaleX)->floatVal();
-	float scaleY = core::getVar(cfg::VoxformatScaleY)->floatVal();
-	float scaleZ = core::getVar(cfg::VoxformatScaleZ)->floatVal();
-	scaleX = glm::epsilonNotEqual(scaleX, 1.0f, glm::epsilon<float>()) ? scaleX : scale;
-	scaleY = glm::epsilonNotEqual(scaleY, 1.0f, glm::epsilon<float>()) ? scaleY : scale;
-	scaleZ = glm::epsilonNotEqual(scaleZ, 1.0f, glm::epsilon<float>()) ? scaleZ : scale;
-	Log::debug("scale: %f:%f:%f", scaleX, scaleY, scaleZ);
-	return {scaleX, scaleY, scaleZ};
+	return getScale();
 }
 
 bool MeshFormat::subdivideTri(const voxelformat::MeshTri &meshTri, MeshTriCollection &tinyTris, int &depth) {
@@ -390,7 +394,11 @@ int MeshFormat::voxelizeNodeChunked(const core::String &name, scenegraph::SceneG
 				trisMins, meshTri,
 				[this, &colorMaterials, &meshMaterialArray](const voxelformat::MeshTri &tri, const glm::vec2 &uv, int x, int y, int z) {
 					const color::RGBA rgba = flattenRGB(colorAt(tri, meshMaterialArray, uv));
-					colorMaterials.put(rgba, tri.materialIdx > 0 && tri.materialIdx < (int)meshMaterialArray.size() ? &meshMaterialArray[tri.materialIdx]->material : nullptr);
+					const palette::Material *newMat = tri.materialIdx >= 0 && tri.materialIdx < (int)meshMaterialArray.size() ? &meshMaterialArray[tri.materialIdx]->material : nullptr;
+					auto iter = colorMaterials.find(rgba);
+					if (iter == colorMaterials.end() || (newMat && (!iter->value || newMat->mask > iter->value->mask))) {
+						colorMaterials.put(rgba, newMat);
+					}
 				});
 		}
 		createPalette(colorMaterials, palette);
@@ -597,7 +605,7 @@ int MeshFormat::voxelizeNode(const core::UUID &uuid, const core::String &name, s
 	node.setNormalPalette(normalPalette);
 
 	const bool fillHollow = core::getVar(cfg::VoxformatFillHollow)->boolVal();
-	const int maxVoxels = vdim.x * vdim.y * vdim.z;
+	const int64_t maxVoxels = (int64_t)vdim.x * vdim.y * vdim.z;
 	if (axisAligned) {
 		// estimate capacity from triangle bounding volumes (each axis-aligned tri covers a 2D area)
 		int64_t estimatedVoxels = 0;
@@ -607,8 +615,8 @@ int MeshFormat::voxelizeNode(const core::UUID &uuid, const core::String &name, s
 			const glm::ivec3 size = glm::max(maxs - mins, glm::ivec3(1));
 			estimatedVoxels += (int64_t)size.x * size.y * size.z;
 		}
-		const int posMapCapacity = (int)core_min((int64_t)maxVoxels, estimatedVoxels);
-		Log::debug("max voxels: %i, estimated: %i (%i:%i:%i)", maxVoxels, posMapCapacity, vdim.x, vdim.y, vdim.z);
+		const int64_t posMapCapacity = (int64_t)core_min((int64_t)maxVoxels, estimatedVoxels);
+		Log::debug("max voxels: %i, estimated: %i (%i:%i:%i)", (int)maxVoxels, (int)posMapCapacity, vdim.x, vdim.y, vdim.z);
 		PosMap posMap;
 		posMap.reserve(posMapCapacity);
 		transformTrisAxisAligned(region, tris, posMap, meshMaterialArray, normalPalette);
@@ -628,7 +636,13 @@ int MeshFormat::voxelizeNode(const core::UUID &uuid, const core::String &name, s
 					trisMins, meshTri,
 					[this, &colorMaterials, &meshMaterialArray](const voxelformat::MeshTri &tri, const glm::vec2 &uv, int x, int y, int z) {
 						const color::RGBA rgba = flattenRGB(colorAt(tri, meshMaterialArray, uv));
-						colorMaterials.put(rgba, tri.materialIdx > 0 && tri.materialIdx < (int)meshMaterialArray.size() ? &meshMaterialArray[tri.materialIdx]->material : nullptr);
+						const palette::Material *newMat = tri.materialIdx >= 0 && tri.materialIdx < (int)meshMaterialArray.size() ? &meshMaterialArray[tri.materialIdx]->material : nullptr;
+						auto iter = colorMaterials.find(rgba);
+						if (iter == colorMaterials.end()) {
+							colorMaterials.put(rgba, newMat);
+						} else if (newMat && (!iter->value || newMat->mask > iter->value->mask)) {
+							colorMaterials.put(rgba, newMat);
+						}
 					});
 #else
 				const glm::vec2 &uv = meshTri.centerUV();
@@ -782,7 +796,13 @@ void MeshFormat::voxelizeTris(scenegraph::SceneGraphNode &node, const PosMap &po
 				continue;
 			}
 			MeshMaterialIndex materialIdx = pos.getMaterialIndex();
-			colorMaterials.put(rgba, materialIdx > 0 && materialIdx < (int)meshMaterialArray.size() ? &meshMaterialArray[materialIdx]->material : nullptr);
+			const palette::Material *newMat = materialIdx >= 0 && materialIdx < (int)meshMaterialArray.size() ? &meshMaterialArray[materialIdx]->material : nullptr;
+			auto iter = colorMaterials.find(rgba);
+			if (iter == colorMaterials.end()) {
+				colorMaterials.put(rgba, newMat);
+			} else if (newMat && (!iter->value || newMat->mask > iter->value->mask)) {
+				colorMaterials.put(rgba, newMat);
+			}
 		}
 		createPalette(colorMaterials, palette);
 	} else {

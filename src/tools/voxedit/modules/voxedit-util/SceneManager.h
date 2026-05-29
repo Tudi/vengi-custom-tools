@@ -6,6 +6,7 @@
 
 #include "ISceneRenderer.h"
 #include "LUAApiListener.h"
+#include "SceneJob.h"
 #include "command/ActionButton.h"
 #include "core/DeltaFrameSeconds.h"
 #include "core/TimeProvider.h"
@@ -26,6 +27,7 @@
 #include "voxedit-util/network/SessionPlayer.h"
 #include "sound/SoundManager.h"
 #include "voxel/ClipboardData.h"
+#include "voxel/Region.h"
 #include "voxel/Voxel.h"
 #include "voxelgenerator/LSystem.h"
 #include "voxelgenerator/LUAApi.h"
@@ -61,7 +63,15 @@ enum class NodeMergeFlags {
 CORE_ENUM_BIT_OPERATIONS(NodeMergeFlags)
 
 /**
- * @note The data is shared across all viewports
+ * @brief Owns and coordinates the editable voxel scene.
+ *
+ * SceneManager is the central mutation boundary for voxedit: it owns the scene
+ * graph, memento state, modifier state, networking hooks and background scene
+ * jobs. Long running volume operations are snapshotted here, computed on a
+ * worker thread and applied back on the main thread to keep live scene graph
+ * state single-threaded.
+ *
+ * @note The data is shared across all viewports.
  */
 class SceneManager : public core::DeltaFrameSeconds {
 	friend class LUAApiListener;
@@ -73,9 +83,15 @@ protected:
 	memento::MementoHandler _mementoHandler;
 	voxel::ClipboardData _copy;
 	core::Future<scenegraph::SceneGraph> _loadingFuture;
+	core::Future<SceneJobResult> _sceneJobFuture;
+	core::DynamicArray<SceneJobRequest> _sceneJobQueue;
+	SceneJobType _sceneJobType = SceneJobType::None;
+	core::String _sceneJobText;
+	float _sceneJobProgress = -1.0f;
+	bool _sceneJobCancelRequested = false;
 	core::TimeProviderPtr _timeProvider;
 	SceneRendererPtr _sceneRenderer;
-	Modifier _modifierFacade;
+	Modifier _modifier;
 	voxelgenerator::LUAApi _luaApi;
 	LUAApiListener _luaApiListener;
 	io::FilesystemPtr _filesystem;
@@ -117,10 +133,6 @@ protected:
 
 	int _lastRaytraceX = -1;
 	int _lastRaytraceY = -1;
-
-	static const uint32_t DirtyRendererLockedAxis = 1 << 0;
-	static const uint32_t DirtyRendererGridRenderer = 1 << 1;
-	uint32_t _dirtyRenderer = 0u;
 
 	// model animation speed
 	double _frameAnimationSpeed = 0.0;
@@ -181,6 +193,21 @@ protected:
 
 	bool setSceneGraphNodeVolume(scenegraph::SceneGraphNode &node, voxel::RawVolume *volume);
 	int activeNode() const;
+	bool startSceneJob(SceneJobRequest &&request);
+	bool startSceneJob(SceneJobType type, int nodeId);
+	bool startActiveSceneJob(SceneJobType type, const core::String &text, core::Future<SceneJobResult> &&future);
+	bool startVolumeOperationSceneJob(const SceneJobRequest &request);
+	bool startCropSceneJob(int nodeId, const core::String &text);
+	bool startScaleUpSceneJob(int nodeId, const core::String &text);
+	bool startScaleDownSceneJob(int nodeId, const core::String &text);
+	bool startResizeSceneJob(const SceneJobRequest &request);
+	bool startSplitObjectsSceneJob(int nodeId, const core::String &text);
+	bool startColorToModelSceneJob(const SceneJobRequest &request);
+	bool startSplatMergeSceneJob(int nodeId, const core::String &text);
+	void startNextQueuedSceneJob();
+	void updateSceneJob();
+	bool applySceneJobResult(SceneJobResult &&result);
+	bool queueSceneJobForGroup(SceneJobType type);
 
 	void animateFrames(double nowSeconds);
 	/**
@@ -411,8 +438,35 @@ public:
 	bool globalCopyVisible();
 	bool globalPasteNode(const glm::ivec3 &pos);
 
+	/**
+	 * @brief Splats (merges) a source node into all other intersecting nodes in the scene.
+	 *
+	 * Projects the source node's voxels into world space and overwrites voxels in any
+	 * intersecting background or model nodes.
+	 *
+	 * @param sourceNodeId The ID of the node to merge into the scene.
+	 * @return @c true if the merge was successful, @c false otherwise.
+	 */
 	bool splatMerge(int sourceNodeId);
+
+	/**
+	 * @brief Merges the currently active node into the background structure.
+	 *
+	 * Slices the active node into chunks matching the background layer structure
+	 * (or modifies underlying background nodes if they already exist).
+	 *
+	 * @return @c true if the operation succeeded, @c false otherwise.
+	 */
 	bool mergeActiveToBackground();
+
+	/**
+	 * @brief Merges all visible model nodes into a single temporary combined node.
+	 *
+	 * This does not modify the existing visible nodes, but creates a new, temporary node
+	 * containing the baked world-space volume of all visible nodes.
+	 *
+	 * @return The node ID of the newly created temporary node, or @c InvalidNodeId if no merge was performed.
+	 */
 	int mergeVisibleToTemp();
 	int mergeLockedToTemp(bool onlySelected = false);
 
@@ -451,6 +505,28 @@ public:
 	bool load(const io::FileDescription &file, const uint8_t *data, size_t size);
 	bool isLoading() const;
 	bool loadSceneGraph(scenegraph::SceneGraph &&sceneGraph, bool disconnect = true);
+
+	/**
+	 * @brief Returns @c true if the scene is locked and no modifications should be made.
+	 */
+	bool isLocked() const;
+
+	/**
+	 * @brief Returns @c true if a background scene job is currently running.
+	 */
+	bool isCommandRunning() const;
+	bool isSceneJobRunning() const;
+	const core::String &sceneJobText() const;
+	float sceneJobProgress() const;
+	bool cancelSceneJob();
+	bool cancelPendingSceneJob(int index);
+	void clearPendingSceneJobs();
+	int pendingSceneJobs() const;
+	const core::String &pendingSceneJobText(int index) const;
+
+	bool nodeResizeAsync(int nodeId, const voxel::Region &region);
+	bool nodeResizeAsync(int nodeId, const glm::ivec3 &size);
+	bool nodeColorToNewNodeAsync(int nodeId, const core::Buffer<uint8_t> &paletteIndices);
 
 	bool undo(int n = 1);
 	bool redo(int n = 1);
@@ -746,23 +822,23 @@ inline void SceneManager::clearDirty() {
 }
 
 inline const voxel::Voxel &SceneManager::hitCursorVoxel() const {
-	return _modifierFacade.hitCursorVoxel();
+	return _modifier.hitCursorVoxel();
 }
 
 inline const glm::ivec3 &SceneManager::cursorPosition() const {
-	return _modifierFacade.cursorPosition();
+	return _modifier.cursorPosition();
 }
 
 inline const glm::ivec3 &SceneManager::referencePosition() const {
-	return _modifierFacade.referencePosition();
+	return _modifier.referencePosition();
 }
 
 inline const Modifier &SceneManager::modifier() const {
-	return _modifierFacade;
+	return _modifier;
 }
 
 inline Modifier &SceneManager::modifier() {
-	return _modifierFacade;
+	return _modifier;
 }
 
 inline voxelgenerator::LUAApi &SceneManager::luaApi() {

@@ -47,6 +47,7 @@ bool ToolsPanel::init() {
 	_showGizmoScene = core::getVar(cfg::VoxEditShowaxis);
 	_showGizmoModel = core::getVar(cfg::VoxEditModelGizmo);
 	_showGizmoBrush = core::getVar(cfg::VoxEditBrushGizmo);
+	_brushHud = core::getVar(cfg::VoxEditBrushHud);
 	_localSpace = core::getVar(cfg::VoxEditLocalSpace);
 	_cursorDetails = core::getVar(cfg::VoxEditCursorDetails);
 	_gridSize = core::getVar(cfg::VoxEditGridsize);
@@ -95,23 +96,30 @@ void ToolsPanel::updateSceneMode(command::CommandExecutionListener &listener) {
 
 void ToolsPanel::updateEditMode(command::CommandExecutionListener &listener) {
 	if (ImGui::CollapsingHeader(_("Action"), ImGuiTreeNodeFlags_DefaultOpen)) {
+		if (_sceneMgr->isSceneJobRunning()) {
+			ImGui::TextUnformatted(_sceneMgr->sceneJobText().c_str());
+			ImGui::SameLine();
+			if (ImGui::Button(_("Cancel"))) {
+				_sceneMgr->cancelSceneJob();
+			}
+		}
 		ui::ScopedStyle style;
 		style.pushFontSize(imguiApp()->bigFontSize());
 		ui::Toolbar toolbar("toolbar", &listener);
 		const int nodeId = _sceneMgr->sceneGraph().activeNode();
-		toolbar.button(ICON_LC_CROP, "crop");
-		toolbar.button(ICON_LC_SCALING, "resizetoselection", !_sceneMgr->hasSelection(nodeId));
-		toolbar.button(ICON_LC_SPLIT, "splitobjects");
-		toolbar.button(ICON_LC_EXPAND, "modelsize");
-		toolbar.button(ICON_LC_UNGROUP, "colortomodel");
-		toolbar.button(ICON_LC_SQUARE_CHEVRON_DOWN, "scaledown");
-		toolbar.button(ICON_LC_SQUARE_CHEVRON_UP, "scaleup");
-		toolbar.button(ICON_LC_PAINT_BUCKET, "fillhollow");
-		toolbar.button(ICON_LC_ERASER, "hollow");
-		toolbar.button(ICON_LC_X, "clear");
-		toolbar.button(ICON_LC_TRASH, "deleteselected");
-		toolbar.button(ICON_LC_PAINT_BUCKET, "fill");
-		toolbar.button(ICON_LC_MERGE, "splatmerge");
+		toolbar.button(ICON_LC_CROP, "crop", _sceneMgr->isSceneJobRunning());
+		toolbar.button(ICON_LC_SCALING, "resizetoselection", _sceneMgr->isSceneJobRunning() || !_sceneMgr->hasSelection(nodeId));
+		toolbar.button(ICON_LC_SPLIT, "splitobjects", _sceneMgr->isSceneJobRunning());
+		toolbar.button(ICON_LC_EXPAND, "modelsize", _sceneMgr->isSceneJobRunning());
+		toolbar.button(ICON_LC_UNGROUP, "colortomodel", _sceneMgr->isSceneJobRunning());
+		toolbar.button(ICON_LC_SQUARE_CHEVRON_DOWN, "scaledown", _sceneMgr->isSceneJobRunning());
+		toolbar.button(ICON_LC_SQUARE_CHEVRON_UP, "scaleup", _sceneMgr->isSceneJobRunning());
+		toolbar.button(ICON_LC_PAINT_BUCKET, "fillhollow", _sceneMgr->isSceneJobRunning());
+		toolbar.button(ICON_LC_ERASER, "hollow", _sceneMgr->isSceneJobRunning());
+		toolbar.button(ICON_LC_X, "clear", _sceneMgr->isSceneJobRunning());
+		toolbar.button(ICON_LC_TRASH, "deleteselected", _sceneMgr->isSceneJobRunning());
+		toolbar.button(ICON_LC_PAINT_BUCKET, "fill", _sceneMgr->isSceneJobRunning());
+		toolbar.button(ICON_LC_MERGE, "splatmerge", _sceneMgr->isSceneJobRunning());
 	}
 
 	const float buttonWidth = ImGui::GetFontSize() * 4;
@@ -247,6 +255,8 @@ void ToolsPanel::update(const char *id, bool sceneMode, command::CommandExecutio
 			ImGui::Unindent();
 			ImGui::IconCheckboxVar(ICON_LC_HAND, _showGizmoBrush);
 			ImGui::TooltipTextUnformatted(_("Show gizmo for brushes that support it"));
+			ImGui::IconCheckboxVar(ICON_LC_BRUSH, _brushHud);
+			ImGui::TooltipTextUnformatted(_("Show brush status and hints in the viewport"));
 		}
 	}
 	ImGui::End();

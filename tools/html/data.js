@@ -864,6 +864,17 @@ const jsonData = {
       "save": false
     },
     {
+      "name": "Luanti World Edit",
+      "extensions": [
+        "we"
+      ],
+      "magics": [],
+      "mimetype": "application/x-luanti-world-edit",
+      "animation": false,
+      "load": true,
+      "save": false
+    },
+    {
       "name": "Wavefront Object",
       "extensions": [
         "obj"
@@ -909,6 +920,31 @@ const jsonData = {
       ],
       "magics": [],
       "mimetype": "text/plain",
+      "mesh": true,
+      "animation": false,
+      "load": true,
+      "save": false
+    },
+    {
+      "name": "LEGO Digital Designer",
+      "extensions": [
+        "lxf",
+        "lxfml"
+      ],
+      "magics": [],
+      "mimetype": "application/xml",
+      "mesh": true,
+      "animation": false,
+      "load": true,
+      "save": false
+    },
+    {
+      "name": "BrickLink Studio",
+      "extensions": [
+        "io"
+      ],
+      "magics": [],
+      "mimetype": "application/x-bricklink-studio",
       "mesh": true,
       "animation": false,
       "load": true,

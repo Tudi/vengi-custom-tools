@@ -40,6 +40,7 @@ private:
 	bool _open = false;
 	bool _requestFocus = false;
 	bool _showUpload = false;
+	bool _useApiKey = false;
 
 	void fetchModels();
 	void loginPanel();
@@ -50,6 +51,9 @@ public:
 	VoxBoxBrowserPanel(ui::IMGUIApp *app, const SceneManagerPtr &sceneMgr, const video::TexturePoolPtr &texturePool);
 	void open();
 	void update(const char *id, command::CommandExecutionListener *listener = nullptr);
+#ifdef IMGUI_ENABLE_TEST_ENGINE
+	void registerUITests(ImGuiTestEngine *engine, const char *id) override;
+#endif
 };
 
 } // namespace voxedit

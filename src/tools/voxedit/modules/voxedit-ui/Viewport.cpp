@@ -30,6 +30,7 @@
 #include "video/Camera.h"
 #include "video/Renderer.h"
 #include "video/WindowedApp.h"
+#include "voxedit-ui/BrushHud.h"
 #include "voxedit-ui/CameraPanel.h"
 #include "voxedit-ui/MenuBar.h"
 #include "voxedit-util/Config.h"
@@ -54,6 +55,67 @@
 #include <glm/gtx/transform.hpp>
 
 namespace voxedit {
+
+static void renderSceneJobQueue(SceneManager &sceneMgr) {
+	if (!sceneMgr.isSceneJobRunning() && sceneMgr.pendingSceneJobs() == 0) {
+		return;
+	}
+
+	const ImGuiViewport *viewport = ImGui::GetMainViewport();
+	const ImVec2 padding(ImGui::GetStyle().WindowPadding.x, ImGui::GetStyle().WindowPadding.y);
+	const ImVec2 pos(viewport->Pos.x + viewport->Size.x - padding.x, viewport->Pos.y + viewport->Size.y - padding.y);
+	ImGui::SetNextWindowPos(pos, ImGuiCond_Always, ImVec2(1.0f, 1.0f));
+	ImGui::SetNextWindowBgAlpha(0.9f);
+	ImGui::SetNextWindowSizeConstraints(ImVec2(ImGui::GetFontSize() * 18.0f, 0.0f),
+										ImVec2(ImGui::GetFontSize() * 32.0f, FLT_MAX));
+	const ImGuiWindowFlags flags = ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoDecoration |
+								   ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoSavedSettings |
+								   ImGuiWindowFlags_NoFocusOnAppearing;
+	if (!ImGui::Begin("##scenejobqueue", nullptr, flags)) {
+		ImGui::End();
+		return;
+	}
+
+	ImGui::TextUnformatted(_("Scene jobs"));
+	ImGui::Separator();
+
+	if (sceneMgr.isSceneJobRunning()) {
+		ImGui::Text("%s %s", ICON_LC_LOADER, sceneMgr.sceneJobText().c_str());
+		ImGui::SameLine();
+		if (ImGui::SmallButton(_("Abort"))) {
+			sceneMgr.cancelSceneJob();
+		}
+	}
+
+	const int pending = sceneMgr.pendingSceneJobs();
+	if (pending > 0) {
+		if (sceneMgr.isSceneJobRunning()) {
+			ImGui::Separator();
+		}
+		ImGui::Text(_("Pending: %i"), pending);
+		for (int i = 0; i < pending; ++i) {
+			ImGui::PushID(i);
+			ImGui::Text("%i. %s", i + 1, sceneMgr.pendingSceneJobText(i).c_str());
+			ImGui::SameLine();
+			if (ImGui::SmallButton(ICON_LC_X)) {
+				sceneMgr.cancelPendingSceneJob(i);
+				ImGui::PopID();
+				break;
+			}
+			ImGui::PopID();
+		}
+		if (ImGui::SmallButton(_("Clear pending"))) {
+			sceneMgr.clearPendingSceneJobs();
+		}
+		ImGui::SameLine();
+		if (ImGui::SmallButton(_("Abort all"))) {
+			sceneMgr.clearPendingSceneJobs();
+			sceneMgr.cancelSceneJob();
+		}
+	}
+
+	ImGui::End();
+}
 
 static bool s_hideAxis[3]{false, false, false};
 
@@ -93,6 +155,7 @@ bool Viewport::init() {
 	_animationPlaying = core::getVar(cfg::VoxEditAnimationPlaying);
 	_clipping = core::getVar(cfg::GameModeClipping);
 	_brushGizmo = core::getVar(cfg::VoxEditBrushGizmo);
+	_brushHud = core::getVar(cfg::VoxEditBrushHud);
 	// Use the actual framebuffer pixel dimensions (not logical window size) to ensure
 	// crisp rendering on HiDPI displays
 	if (!_renderContext.init(_app->frameBufferDimension())) {
@@ -344,9 +407,19 @@ void Viewport::renderViewport() {
 		renderViewportImage(contentSize);
 		const bool modifiedRegion = renderGizmo(camera(), headerSize, contentSize);
 
-		if (_sceneMgr->isLoading()) {
+		if (!isSceneMode() && _brushHud->boolVal()) {
+			brushhud::render(_sceneMgr, ImGui::GetWindowPos(), contentSize, headerSize);
+		}
+
+		if (_sceneMgr->isLoading() || _sceneMgr->isCommandRunning()) {
 			const float radius = ImGui::GetFontSize() * 12.0f;
-			ImGui::LoadingIndicatorCircle(_("Loading"), radius, color::White(), color::Gray());
+			ImGui::LoadingIndicatorCircle(_("Working"), radius, color::White(), color::Gray());
+			if (_sceneMgr->isSceneJobRunning()) {
+				ImGui::TextUnformatted(_sceneMgr->sceneJobText().c_str());
+				if (ImGui::Button(_("Cancel"))) {
+					_sceneMgr->cancelSceneJob();
+				}
+			}
 		} else if (ImGui::IsItemHovered() && !modifiedRegion) {
 			renderCursor();
 			updateViewportInput(headerSize);
@@ -355,6 +428,7 @@ void Viewport::renderViewport() {
 
 		dragAndDrop(headerSize);
 	}
+	renderSceneJobQueue(*_sceneMgr.get());
 }
 
 bool Viewport::isGameMode() const {
@@ -509,7 +583,6 @@ void Viewport::menuBarRecentColors() {
 	const float height = ImGui::GetFrameHeight();
 	const float spacing = ImGui::GetStyle().ItemSpacing.x;
 	const float elementWidth = height + spacing;
-	const float totalWidth = (float)_recentColors.size() * elementWidth;
 	const float availWidth = ImGui::GetContentRegionAvail().x;
 	if (availWidth < elementWidth) {
 		return;
@@ -1089,7 +1162,7 @@ bool Viewport::runBrushGizmo(const video::Camera &camera, float headerSize) {
 			}
 			drawList->AddConcavePolyFilled(imPoints, n, ImGui::GetColorU32(ImVec4(style::color(style::ColorBrushGizmoPolygon))));
 			const glm::vec4 outlineColor = glm::vec4(glm::vec3(style::color(style::ColorBrushGizmoPolygon)), 0.8f);
-			drawList->AddPolyline(imPoints, n, ImGui::GetColorU32(ImVec4(outlineColor)), ImDrawFlags_Closed, 1.5f);
+			drawList->AddPolyline(imPoints, n, ImGui::GetColorU32(ImVec4(outlineColor)), 1.5f, ImDrawFlags_Closed);
 		}
 	}
 
@@ -1172,7 +1245,7 @@ bool Viewport::renderGizmo(video::Camera &camera, float headerSize, const ImVec2
 	}
 	core_trace_scoped(RenderGizmo);
 
-	const bool orthographic = camera.mode() == video::CameraMode::Orthogonal;
+	const bool orthographic = camera.isOrthographic();
 
 	ImGuizmo::PushID(_id);
 	ImGuizmo::SetDrawlist();

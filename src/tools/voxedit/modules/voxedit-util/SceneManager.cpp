@@ -5,6 +5,7 @@
 #include "SceneManager.h"
 
 #include "app/Async.h"
+#include "command/CommandHandler.h"
 #include "core/ConfigVar.h"
 #include "app/I18N.h"
 #include "color/ColorUtil.h"
@@ -48,6 +49,7 @@
 #include "scenegraph/SceneUtil.h"
 #include "video/Camera.h"
 #include "voxedit-util/modifier/SceneModifiedFlags.h"
+#include "voxedit-util/modifier/ModifierVolumeWrapper.h"
 #include "voxedit-util/network/protocol/SceneStateMessage.h"
 #include "voxedit-util/network/ServerNetwork.h"
 #include "voxel/ClipboardData.h"
@@ -98,7 +100,7 @@ namespace voxedit {
 SceneManager::SceneManager(const core::TimeProviderPtr &timeProvider, const io::FilesystemPtr &filesystem,
 						   const SceneRendererPtr &sceneRenderer, const ModifierRendererPtr &modifierRenderer)
 	: _timeProvider(timeProvider), _sceneRenderer(sceneRenderer),
-	  _modifierFacade(this, modifierRenderer), _luaApi(filesystem),
+	  _modifier(this, modifierRenderer), _luaApi(filesystem),
 	  _luaApiListener(this, _mementoHandler, _sceneGraph), _filesystem(filesystem),
 	  _server(&_luaApi, this), _client(this), _recorder(this), _player(this) {
 	server().setState(&_sceneGraph);
@@ -109,6 +111,9 @@ SceneManager::~SceneManager() {
 }
 
 bool SceneManager::loadPalette(const core::String& paletteName, bool searchBestColors, bool save) {
+	if (isLocked()) {
+		return false;
+	}
 	palette::Palette palette;
 
 	const bool isNodePalette = core::string::startsWith(paletteName, NODE_PALETTE_PREFIX);
@@ -143,6 +148,9 @@ bool SceneManager::loadPalette(const core::String& paletteName, bool searchBestC
 }
 
 bool SceneManager::importPalette(const core::String& file, bool setActive, bool searchBestColors) {
+	if (isLocked()) {
+		return false;
+	}
 	palette::Palette palette;
 	if (!voxelformat::importPalette(file, palette)) {
 		Log::warn("Failed to import a palette from file '%s'", file.c_str());
@@ -163,20 +171,26 @@ bool SceneManager::importPalette(const core::String& file, bool setActive, bool 
 }
 
 void SceneManager::nodeGroupCalulateNormals(voxel::Connectivity connectivity, bool recalcAll, bool fillAndHollow) {
+	if (isLocked()) {
+		return;
+	}
 	nodeForeachGroup([&] (int groupNodeId) {
 		nodeCalculateNormals(groupNodeId, connectivity, recalcAll, fillAndHollow);
 	});
 }
 
 bool SceneManager::nodeCalculateNormals(int nodeId, voxel::Connectivity connectivity, bool recalcAll, bool fillAndHollow) {
+	if (isLocked()) {
+		return false;
+	}
 	if (scenegraph::SceneGraphNode *node = sceneGraphModelNode(nodeId)) {
 		if (!node->hasNormalPalette()) {
 			Log::warn("Node %i has no normal palette", nodeId);
 			return false;
 		}
-		voxel::RawVolumeWrapper wrapper = _modifierFacade.createRawVolumeWrapper(node->volume());
+		voxel::RawVolumeWrapper wrapper = _modifier.createRawVolumeWrapper(node->volume());
 		if (fillAndHollow) {
-			voxelutil::fillHollow(wrapper, _modifierFacade.cursorVoxel());
+			voxelutil::fillHollow(wrapper, _modifier.cursorVoxel());
 		}
 		const palette::NormalPalette &normalPalette = node->normalPalette();
 		voxelutil::visitSurfaceVolumeParallel(*node->volume(), [&] (int x, int y, int z, const voxel::Voxel &voxel) {
@@ -271,8 +285,8 @@ void SceneManager::nodeGroupFillHollow() {
 		if (v == nullptr) {
 			return;
 		}
-		voxel::RawVolumeWrapper wrapper = _modifierFacade.createRawVolumeWrapper(v);
-		voxelutil::fillHollow(wrapper, _modifierFacade.cursorVoxel());
+		voxel::RawVolumeWrapper wrapper = _modifier.createRawVolumeWrapper(v);
+		voxelutil::fillHollow(wrapper, _modifier.cursorVoxel());
 		modified(groupNodeId, wrapper.dirtyRegion());
 	});
 }
@@ -287,8 +301,8 @@ void SceneManager::nodeGroupFill() {
 		if (v == nullptr) {
 			return;
 		}
-		voxel::RawVolumeWrapper wrapper = _modifierFacade.createRawVolumeWrapper(v);
-		voxelutil::fill(wrapper, _modifierFacade.cursorVoxel(), _modifierFacade.isMode(ModifierType::Override));
+		voxel::RawVolumeWrapper wrapper = _modifier.createRawVolumeWrapper(v);
+		voxelutil::fill(wrapper, _modifier.cursorVoxel(), _modifier.isMode(ModifierType::Override));
 		modified(groupNodeId, wrapper.dirtyRegion());
 	});
 }
@@ -303,7 +317,7 @@ void SceneManager::nodeGroupClear() {
 		if (v == nullptr) {
 			return;
 		}
-		voxel::RawVolumeWrapper wrapper = _modifierFacade.createRawVolumeWrapper(v);
+		voxel::RawVolumeWrapper wrapper = _modifier.createRawVolumeWrapper(v);
 		voxelutil::clear(wrapper);
 		modified(groupNodeId, wrapper.dirtyRegion());
 	});
@@ -323,7 +337,7 @@ void SceneManager::nodeGroupDeleteSelected() {
 		if (!selRegion.isValid()) {
 			return;
 		}
-		voxel::RawVolumeWrapper wrapper = _modifierFacade.createRawVolumeWrapper(v);
+		voxel::RawVolumeWrapper wrapper = _modifier.createRawVolumeWrapper(v);
 		voxelutil::visitVolume(*v, selRegion, [&](int x, int y, int z, const voxel::Voxel &voxel) {
 			wrapper.setVoxel(x, y, z, voxel::Voxel());
 		}, voxelutil::VisitSolidOutline());
@@ -345,7 +359,7 @@ void SceneManager::nodeGroupColorSelected(uint8_t colorIndex) {
 		if (!selRegion.isValid()) {
 			return;
 		}
-		voxel::RawVolumeWrapper wrapper = _modifierFacade.createRawVolumeWrapper(v);
+		voxel::RawVolumeWrapper wrapper = _modifier.createRawVolumeWrapper(v);
 		voxelutil::recolorSelected(wrapper, *v, selRegion, colorIndex);
 		modified(groupNodeId, wrapper.dirtyRegion());
 	});
@@ -567,13 +581,16 @@ void SceneManager::nodeGroupHollow() {
 		if (v == nullptr) {
 			return;
 		}
-		voxel::RawVolumeWrapper wrapper = _modifierFacade.createRawVolumeWrapper(v);
+		voxel::RawVolumeWrapper wrapper = _modifier.createRawVolumeWrapper(v);
 		voxelutil::hollow(wrapper);
 		modified(groupNodeId, wrapper.dirtyRegion());
 	});
 }
 
 void SceneManager::fillPlane(const image::ImagePtr &image) {
+	if (isLocked()) {
+		return;
+	}
 	const int nodeId = activeNode();
 	if (nodeId == InvalidNodeId) {
 		Log::error("No active node for fill plane operation");
@@ -584,20 +601,23 @@ void SceneManager::fillPlane(const image::ImagePtr &image) {
 		Log::error("No volume for active node %i", nodeId);
 		return;
 	}
-	voxel::RawVolumeWrapper wrapper = _modifierFacade.createRawVolumeWrapper(v);
-	const glm::ivec3 &pos = _modifierFacade.cursorPosition();
-	const voxel::FaceNames face = _modifierFacade.cursorFace();
+	voxel::RawVolumeWrapper wrapper = _modifier.createRawVolumeWrapper(v);
+	const glm::ivec3 &pos = _modifier.cursorPosition();
+	const voxel::FaceNames face = _modifier.cursorFace();
 	const voxel::Voxel hitVoxel/* = hitCursorVoxel()*/; // TODO: should be an option
 	voxelutil::fillPlane(wrapper, image, hitVoxel, pos, face);
 	modified(nodeId, wrapper.dirtyRegion());
 }
 
 void SceneManager::nodeUpdateVoxelType(int nodeId, uint8_t palIdx, voxel::VoxelType newType) {
+	if (isLocked()) {
+		return;
+	}
 	voxel::RawVolume *v = volume(nodeId);
 	if (v == nullptr) {
 		return;
 	}
-	voxel::RawVolumeWrapper wrapper = _modifierFacade.createRawVolumeWrapper(v);
+	voxel::RawVolumeWrapper wrapper = _modifier.createRawVolumeWrapper(v);
 	auto func = [&wrapper, palIdx, newType](int x, int y, int z, const voxel::Voxel &) {
 		wrapper.setVoxel(x, y, z, voxel::createVoxel(newType, palIdx));
 	};
@@ -625,6 +645,9 @@ bool SceneManager::saveModels(const core::String& dir) {
 }
 
 bool SceneManager::save(const io::FileDescription &file, bool autosave) {
+	if (isLocked()) {
+		return false;
+	}
 	if (_sceneGraph.empty()) {
 		Log::debug("No volumes for saving found");
 		return false;
@@ -653,6 +676,9 @@ bool SceneManager::save(const io::FileDescription &file, bool autosave) {
 }
 
 bool SceneManager::import(const core::String& file) {
+	if (isLocked()) {
+		return false;
+	}
 	if (file.empty()) {
 		Log::error("Can't import model: No file given");
 		return false;
@@ -679,6 +705,9 @@ bool SceneManager::import(const core::String& file) {
 }
 
 bool SceneManager::importDirectory(const core::String& directory, const io::FormatDescription *format, int depth) {
+	if (isLocked()) {
+		return false;
+	}
 	if (directory.empty()) {
 		return false;
 	}
@@ -736,6 +765,9 @@ bool SceneManager::load(const io::FileDescription& file) {
 }
 
 bool SceneManager::load(const io::FileDescription& file, const uint8_t *data, size_t size) {
+	if (isLocked()) {
+		return false;
+	}
 	scenegraph::SceneGraph newSceneGraph;
 	io::MemoryArchivePtr archive = io::openMemoryArchive();
 	archive->add(file.name, data, size);
@@ -813,7 +845,8 @@ void SceneManager::modified(int nodeId, const voxel::Region& modifiedRegion, Sce
 	const bool updateRegion = (flags & SceneModifiedFlags::UpdateRendererRegion) == SceneModifiedFlags::UpdateRendererRegion;
 	if (updateRegion && modifiedRegion.isValid()) {
 		Log::debug("Modify region for nodeid %i", nodeId);
-		_sceneRenderer->updateNodeRegion(nodeId, modifiedRegion, renderRegionMillis);
+		_sceneRenderer->updateNodeRegion(nodeId, modifiedRegion);
+		_modifier.setHighlightRegion(modifiedRegion, renderRegionMillis);
 	}
 	const bool invalidateNodeCache = (flags & SceneModifiedFlags::InvalidateNodeCache) == SceneModifiedFlags::InvalidateNodeCache;
 	if (invalidateNodeCache) {
@@ -840,7 +873,7 @@ int SceneManager::nodeColorToNewNode(int nodeId, const voxel::Voxel voxelColor) 
 	}
 	const voxel::Region &region = v->region();
 	voxel::RawVolume* newVolume = new voxel::RawVolume(region);
-	voxel::RawVolumeWrapper wrapper = _modifierFacade.createRawVolumeWrapper(v);
+	voxel::RawVolumeWrapper wrapper = _modifier.createRawVolumeWrapper(v);
 	auto func = [&] (int32_t x, int32_t y, int32_t z, const voxel::Voxel& voxel) {
 		newVolume->setVoxel(x, y, z, voxel);
 		wrapper.setVoxel(x, y, z, voxel::Voxel());
@@ -877,7 +910,7 @@ int SceneManager::nodeColorToNewNode(int nodeId, const core::Buffer<uint8_t> &pa
 	}
 	const voxel::Region &region = v->region();
 	voxel::RawVolume *newVolume = new voxel::RawVolume(region);
-	voxel::RawVolumeWrapper wrapper = _modifierFacade.createRawVolumeWrapper(v);
+	voxel::RawVolumeWrapper wrapper = _modifier.createRawVolumeWrapper(v);
 	auto func = [&](int32_t x, int32_t y, int32_t z, const voxel::Voxel &voxel) {
 		newVolume->setVoxel(x, y, z, voxel);
 		wrapper.setVoxel(x, y, z, voxel::Voxel());
@@ -970,8 +1003,363 @@ void SceneManager::nodeCrop(int nodeId) {
 	modified(nodeId, newVolume->region());
 }
 
+bool SceneManager::startCropSceneJob(int nodeId, const core::String &text) {
+	scenegraph::SceneGraphNode *node = sceneGraphModelNode(nodeId);
+	if (node == nullptr || node->volume() == nullptr) {
+		return false;
+	}
+
+	voxel::RawVolume *snapshot = new voxel::RawVolume(*node->volume());
+	core::Future<SceneJobResult> future = app::async([nodeId, snapshot]() {
+		SceneJobResult result;
+		result.type = SceneJobType::CropVolume;
+		result.nodeId = nodeId;
+
+		voxel::RawVolume *newVolume = voxelutil::cropVolume(snapshot);
+		delete snapshot;
+		if (newVolume == nullptr) {
+			result.error = "Failed to crop volume";
+			return result;
+		}
+		result.volume = newVolume;
+		result.modifiedRegion = newVolume->region();
+		result.success = true;
+		return result;
+	});
+	return startActiveSceneJob(SceneJobType::CropVolume, text, core::move(future));
+}
+
+bool SceneManager::nodeResizeAsync(int nodeId, const voxel::Region &region) {
+	SceneJobRequest request;
+	request.type = SceneJobType::ResizeVolume;
+	request.nodeId = nodeId;
+	request.region = region;
+	return startSceneJob(core::move(request));
+}
+
+bool SceneManager::nodeResizeAsync(int nodeId, const glm::ivec3 &size) {
+	voxel::RawVolume *v = volume(nodeId);
+	if (v == nullptr) {
+		return false;
+	}
+	voxel::Region region = v->region();
+	region.shiftUpperCorner(size);
+	return nodeResizeAsync(nodeId, region);
+}
+
+bool SceneManager::nodeColorToNewNodeAsync(int nodeId, const core::Buffer<uint8_t> &paletteIndices) {
+	SceneJobRequest request;
+	request.type = SceneJobType::ColorToModel;
+	request.nodeId = nodeId;
+	request.paletteIndices = paletteIndices;
+	return startSceneJob(core::move(request));
+}
+
+bool SceneManager::startScaleUpSceneJob(int nodeId, const core::String &text) {
+	scenegraph::SceneGraphNode *node = sceneGraphModelNode(nodeId);
+	if (node == nullptr || node->volume() == nullptr) {
+		return false;
+	}
+
+	voxel::RawVolume *snapshot = new voxel::RawVolume(*node->volume());
+	core::Future<SceneJobResult> future = app::async([nodeId, snapshot]() {
+		SceneJobResult result;
+		result.type = SceneJobType::ScaleUpVolume;
+		result.nodeId = nodeId;
+
+		voxel::RawVolume *newVolume = voxelutil::scaleUp(*snapshot);
+		delete snapshot;
+		if (newVolume == nullptr) {
+			result.error = "Failed to scale up volume";
+			return result;
+		}
+		result.volume = newVolume;
+		result.modifiedRegion = newVolume->region();
+		result.success = true;
+		return result;
+	});
+	return startActiveSceneJob(SceneJobType::ScaleUpVolume, text, core::move(future));
+}
+
+bool SceneManager::startScaleDownSceneJob(int nodeId, const core::String &text) {
+	scenegraph::SceneGraphNode *node = sceneGraphModelNode(nodeId);
+	if (node == nullptr || node->volume() == nullptr) {
+		return false;
+	}
+
+	const voxel::Region srcRegion = node->volume()->region();
+	const glm::ivec3 &targetDimensionsHalf = (srcRegion.getDimensionsInVoxels() / 2) - 1;
+	if (targetDimensionsHalf.x < 0 || targetDimensionsHalf.y < 0 || targetDimensionsHalf.z < 0) {
+		Log::debug("Can't scale anymore");
+		return false;
+	}
+	const palette::Palette palette = node->palette();
+	voxel::RawVolume *snapshot = new voxel::RawVolume(*node->volume());
+	core::Future<SceneJobResult> future = app::async([nodeId, snapshot, srcRegion, targetDimensionsHalf, palette]() {
+		SceneJobResult result;
+		result.type = SceneJobType::ScaleDownVolume;
+		result.nodeId = nodeId;
+
+		const voxel::Region destRegion(srcRegion.getLowerCorner(), srcRegion.getLowerCorner() + targetDimensionsHalf);
+		voxel::RawVolume *newVolume = new voxel::RawVolume(destRegion);
+		voxelutil::scaleDown(*snapshot, palette, *newVolume);
+		delete snapshot;
+		result.volume = newVolume;
+		result.modifiedRegion = srcRegion;
+		result.success = true;
+		return result;
+	});
+	return startActiveSceneJob(SceneJobType::ScaleDownVolume, text, core::move(future));
+}
+
+bool SceneManager::startResizeSceneJob(const SceneJobRequest &request) {
+	scenegraph::SceneGraphNode *node = sceneGraphModelNode(request.nodeId);
+	if (node == nullptr || node->volume() == nullptr || !request.region.isValid()) {
+		return false;
+	}
+
+	const voxel::Region oldRegion = node->volume()->region();
+	const voxel::Region newRegion = request.region;
+	voxel::RawVolume *snapshot = new voxel::RawVolume(*node->volume());
+	core::Future<SceneJobResult> future = app::async([nodeId = request.nodeId, snapshot, oldRegion, newRegion]() {
+		SceneJobResult result;
+		result.type = SceneJobType::ResizeVolume;
+		result.nodeId = nodeId;
+
+		voxel::RawVolume *newVolume = voxelutil::resize(snapshot, newRegion);
+		delete snapshot;
+		if (newVolume == nullptr) {
+			result.error = "Failed to resize volume";
+			return result;
+		}
+		result.volume = newVolume;
+		result.modifiedRegion = sceneJobModifiedRegionForResize(oldRegion, newRegion);
+		result.success = true;
+		return result;
+	});
+	return startActiveSceneJob(SceneJobType::ResizeVolume, request.text, core::move(future));
+}
+
+bool SceneManager::startVolumeOperationSceneJob(const SceneJobRequest &request) {
+	scenegraph::SceneGraphNode *node = sceneGraphModelNode(request.nodeId);
+	if (node == nullptr || node->volume() == nullptr) {
+		return false;
+	}
+	voxel::Region selectionRegion = voxel::Region::InvalidRegion;
+	if (request.type == SceneJobType::DeleteSelectedVolume) {
+		selectionRegion = selectionCalculateRegion(*node);
+		if (!selectionRegion.isValid()) {
+			return false;
+		}
+	}
+
+	voxel::RawVolume *snapshot = new voxel::RawVolume(*node->volume());
+	core::Future<SceneJobResult> future = app::async([request, snapshot, selectionRegion]() {
+		return makeVolumeOperationSceneJobResult(request.type, request.nodeId, snapshot, selectionRegion,
+												 request.voxel, request.overrideVoxels);
+	});
+	return startActiveSceneJob(request.type, request.text, core::move(future));
+}
+
+bool SceneManager::startSplitObjectsSceneJob(int nodeId, const core::String &text) {
+	scenegraph::SceneGraphNode *node = sceneGraphModelNode(nodeId);
+	if (node == nullptr || node->volume() == nullptr) {
+		return false;
+	}
+
+	const int parentNodeId = node->id();
+	const core::String name = node->name();
+	const palette::Palette palette = node->palette();
+	voxel::RawVolume *snapshot = new voxel::RawVolume(*node->volume());
+	core::Future<SceneJobResult> future = app::async([nodeId, parentNodeId, name, palette, snapshot]() {
+		SceneJobResult result;
+		result.type = SceneJobType::SplitObjects;
+		result.nodeId = nodeId;
+
+		core::Buffer<voxel::RawVolume *> volumes = voxelutil::splitObjects(snapshot);
+		delete snapshot;
+		if (volumes.empty()) {
+			result.error = "No objects to split";
+			return result;
+		}
+		for (voxel::RawVolume *volume : volumes) {
+			SceneJobNewNode newNode;
+			newNode.sourceNodeId = nodeId;
+			newNode.parentNodeId = parentNodeId;
+			newNode.name = name;
+			newNode.palette = palette;
+			newNode.volume = volume;
+			result.newNodes.push_back(core::move(newNode));
+		}
+		result.success = true;
+		return result;
+	});
+	return startActiveSceneJob(SceneJobType::SplitObjects, text, core::move(future));
+}
+
+bool SceneManager::startColorToModelSceneJob(const SceneJobRequest &request) {
+	scenegraph::SceneGraphNode *node = sceneGraphModelNode(request.nodeId);
+	if (node == nullptr || node->volume() == nullptr || request.paletteIndices.empty()) {
+		return false;
+	}
+
+	const int parentNodeId = node->parent();
+	const palette::Palette palette = node->palette();
+	core::String nameSuffix;
+	for (uint8_t idx : request.paletteIndices) {
+		if (!nameSuffix.empty()) {
+			nameSuffix.append(",");
+		}
+		nameSuffix.append(core::String::format("%i", (int)idx));
+	}
+	core::BitSet<palette::PaletteMaxColors> wanted;
+	for (uint8_t idx : request.paletteIndices) {
+		wanted.set(idx, true);
+	}
+
+	voxel::RawVolume *snapshot = new voxel::RawVolume(*node->volume());
+	core::Future<SceneJobResult> future = app::async([request, parentNodeId, palette, nameSuffix, wanted, snapshot]() {
+		SceneJobResult result;
+		result.type = SceneJobType::ColorToModel;
+		result.nodeId = request.nodeId;
+
+		const voxel::Region region = snapshot->region();
+		voxel::RawVolume *newVolume = new voxel::RawVolume(region);
+		voxel::RawVolumeWrapper wrapper(snapshot);
+		auto func = [&](int32_t x, int32_t y, int32_t z, const voxel::Voxel &voxel) {
+			newVolume->setVoxel(x, y, z, voxel);
+			wrapper.setVoxel(x, y, z, voxel::Voxel());
+		};
+		auto condition = [&wanted](const auto &sampler) {
+			const voxel::Voxel &voxel = sampler.voxel();
+			if (voxel::isAir(voxel.getMaterial())) {
+				return false;
+			}
+			return wanted[voxel.getColor()];
+		};
+		voxelutil::visitVolumeParallel(wrapper, func, condition);
+		if (!wrapper.dirtyRegion().isValid()) {
+			delete snapshot;
+			delete newVolume;
+			result.error = "No matching colors found";
+			return result;
+		}
+
+		result.volume = snapshot;
+		result.modifiedRegion = wrapper.dirtyRegion();
+		SceneJobNewNode newNode;
+		newNode.sourceNodeId = request.nodeId;
+		newNode.parentNodeId = parentNodeId;
+		newNode.name = core::String::format("colors: %s", nameSuffix.c_str());
+		newNode.palette = palette;
+		newNode.volume = newVolume;
+		result.newNodes.push_back(core::move(newNode));
+		result.success = true;
+		return result;
+	});
+	return startActiveSceneJob(SceneJobType::ColorToModel, request.text, core::move(future));
+}
+
+bool SceneManager::startSplatMergeSceneJob(int nodeId, const core::String &text) {
+	scenegraph::SceneGraphNode *sourceNode = sceneGraphModelNode(nodeId);
+	if (sourceNode == nullptr) {
+		Log::warn("splatmerge: no valid source node");
+		return false;
+	}
+	const voxel::RawVolume *sourceVolume = _sceneGraph.resolveVolume(*sourceNode);
+	if (sourceVolume == nullptr) {
+		Log::warn("splatmerge: source node has no volume");
+		return false;
+	}
+
+	const scenegraph::FrameTransform &srcTransform = _sceneGraph.transformForFrame(*sourceNode, _currentFrameIdx);
+	const glm::mat4 sourceWorldMatrix = srcTransform.worldMatrix();
+	const glm::vec3 sourcePivot = sourceNode->pivot();
+	const bool transformSource = !srcTransform.isIdentity();
+	const palette::Palette sourcePalette = sourceNode->palette();
+	voxel::RawVolume *sourceSnapshot = new voxel::RawVolume(*sourceVolume);
+
+	core::DynamicArray<SceneJobSplatTarget> targets;
+	for (auto iter = _sceneGraph.beginModel(); iter != _sceneGraph.end(); ++iter) {
+		scenegraph::SceneGraphNode &targetNode = *iter;
+		if (targetNode.id() == nodeId || !targetNode.isModelNode() || targetNode.volume() == nullptr) {
+			continue;
+		}
+		const voxel::Region targetWorldRegion = _sceneGraph.sceneRegion(targetNode, _currentFrameIdx);
+		if (!targetWorldRegion.isValid()) {
+			continue;
+		}
+		SceneJobSplatTarget target;
+		target.nodeId = targetNode.id();
+		target.volume = new voxel::RawVolume(*targetNode.volume());
+		target.palette = targetNode.palette();
+		target.worldRegion = targetWorldRegion;
+		targets.push_back(core::move(target));
+	}
+	if (targets.empty()) {
+		delete sourceSnapshot;
+		return false;
+	}
+
+	core::Future<SceneJobResult> future = app::async([nodeId, sourceSnapshot, sourcePalette, sourceWorldMatrix, sourcePivot,
+													 transformSource, targets = core::move(targets)]() mutable {
+		SceneJobResult result;
+		result.type = SceneJobType::SplatMerge;
+		result.nodeId = nodeId;
+
+		core::ScopedPtr<voxel::RawVolume> bakedSource;
+		const voxel::RawVolume *worldSource = sourceSnapshot;
+		if (transformSource) {
+			bakedSource = voxelutil::applyTransformToVolume(*sourceSnapshot, sourceWorldMatrix, sourcePivot);
+			worldSource = &(*bakedSource);
+		}
+		if (worldSource == nullptr) {
+			delete sourceSnapshot;
+			result.error = "Failed to transform source volume";
+			return result;
+		}
+		const voxel::Region &sourceWorldRegion = worldSource->region();
+		int mergedCount = 0;
+		for (SceneJobSplatTarget &target : targets) {
+			if (!voxel::intersects(sourceWorldRegion, target.worldRegion)) {
+				continue;
+			}
+			voxel::Region worldOverlap = sourceWorldRegion;
+			worldOverlap.cropTo(target.worldRegion);
+			const glm::ivec3 worldToLocal =
+				target.volume->region().getLowerCorner() - target.worldRegion.getLowerCorner();
+			const voxel::Region targetLocalOverlap(worldOverlap.getLowerCorner() + worldToLocal,
+												   worldOverlap.getUpperCorner() + worldToLocal);
+			const int count = voxelutil::mergeVolumes(target.volume, target.palette, worldSource, sourcePalette,
+													  targetLocalOverlap, worldOverlap);
+			if (count <= 0) {
+				continue;
+			}
+			SceneJobVolumeResult volumeResult;
+			volumeResult.nodeId = target.nodeId;
+			volumeResult.volume = target.volume;
+			volumeResult.modifiedRegion = targetLocalOverlap;
+			target.volume = nullptr;
+			result.volumes.push_back(core::move(volumeResult));
+			mergedCount += count;
+		}
+		delete sourceSnapshot;
+		if (mergedCount == 0) {
+			result.error = "No overlapping nodes found";
+			return result;
+		}
+		result.removeSourceNode = true;
+		result.success = true;
+		return result;
+	});
+	return startActiveSceneJob(SceneJobType::SplatMerge, text, core::move(future));
+}
+
 // TODO: not yet working for reference nodes
 void SceneManager::nodeBakeTransform(int nodeId) {
+	if (isLocked()) {
+		return;
+	}
 	scenegraph::SceneGraphNode *node = sceneGraphModelNode(nodeId);
 	if (node == nullptr) {
 		return;
@@ -999,6 +1387,9 @@ void SceneManager::nodeBakeTransform(int nodeId) {
 }
 
 void SceneManager::nodeResize(int nodeId, const glm::ivec3& size) {
+	if (isLocked()) {
+		return;
+	}
 	voxel::RawVolume* v = volume(nodeId);
 	if (v == nullptr) {
 		return;
@@ -1009,6 +1400,9 @@ void SceneManager::nodeResize(int nodeId, const glm::ivec3& size) {
 }
 
 void SceneManager::nodeResize(int nodeId, const voxel::Region &region) {
+	if (isLocked()) {
+		return;
+	}
 	if (!region.isValid()) {
 		return;
 	}
@@ -1054,6 +1448,9 @@ void SceneManager::nodeResize(int nodeId, const voxel::Region &region) {
 }
 
 void SceneManager::nodeRescaleContent(int nodeId, const glm::ivec3 &targetSize) {
+	if (isLocked()) {
+		return;
+	}
 	voxel::RawVolume *vol = volume(nodeId);
 	if (vol == nullptr) {
 		Log::error("Failed to lookup volume for node %i", nodeId);
@@ -1119,6 +1516,9 @@ palette::Palette &SceneManager::activePalette() const {
 }
 
 bool SceneManager::setActivePalette(const palette::Palette &palette, bool searchBestColors) {
+	if (isLocked()) {
+		return false;
+	}
 	const int nodeId = activeNode();
 	if (!_sceneGraph.hasNode(nodeId)) {
 		Log::warn("Failed to set the active palette - node with id %i not found", nodeId);
@@ -1384,24 +1784,30 @@ bool SceneManager::mementoStateExecute(const memento::MementoState &s, bool isRe
 }
 
 bool SceneManager::undo(int n) {
+	if (isLocked()) {
+		return false;
+	}
 	Log::debug("undo %i steps", n);
 	for (int i = 0; i < n; ++i) {
 		if (!doUndo()) {
 			return false;
 		}
 	}
-	_modifierFacade.onSceneChange();
+	_modifier.onSceneChange();
 	return true;
 }
 
 bool SceneManager::redo(int n) {
+	if (isLocked()) {
+		return false;
+	}
 	Log::debug("redo %i steps", n);
 	for (int i = 0; i < n; ++i) {
 		if (!doRedo()) {
 			return false;
 		}
 	}
-	_modifierFacade.onSceneChange();
+	_modifier.onSceneChange();
 	return true;
 }
 
@@ -1418,6 +1824,7 @@ bool SceneManager::doUndo() {
 	}
 	const int n = (int)group.states.size() - 1;
 
+	markDirty();
 	core::DynamicArray<const memento::MementoState*> parentFixupStates;
 	parentFixupStates.reserve(n);
 
@@ -1450,6 +1857,7 @@ bool SceneManager::doRedo() {
 		return false;
 	}
 
+	markDirty();
 	const memento::MementoStateGroup& group = _mementoHandler.redo();
 	for (const memento::MementoState& s : group.states) {
 		if (!mementoStateExecute(s, true)) {
@@ -1490,6 +1898,9 @@ voxel::ClipboardData SceneManager::nodeClipboardCopy(scenegraph::SceneGraphNode 
 }
 
 bool SceneManager::saveSelection(const io::FileDescription& file) {
+	if (isLocked()) {
+		return false;
+	}
 	const int nodeId = activeNode();
 	scenegraph::SceneGraphNode *node = sceneGraphModelNode(nodeId);
 	if (node == nullptr) {
@@ -1523,6 +1934,9 @@ bool SceneManager::saveSelection(const io::FileDescription& file) {
 }
 
 bool SceneManager::nodeCopy(int nodeId) {
+	if (isLocked()) {
+		return false;
+	}
 	scenegraph::SceneGraphNode *node = sceneGraphModelNode(nodeId);
 	if (node == nullptr) {
 		return false;
@@ -1536,6 +1950,9 @@ bool SceneManager::nodeCopy(int nodeId) {
 }
 
 bool SceneManager::nodePasteAsNewNode(int nodeId) {
+	if (isLocked()) {
+		return false;
+	}
 	if (!_copy) {
 		Log::debug("Nothing copied yet - failed to paste");
 		return false;
@@ -1593,11 +2010,17 @@ bool SceneManager::loadGlobalClipboard(voxel::ClipboardData &clipData) {
 }
 
 bool SceneManager::paste(const glm::ivec3& pos) {
+	if (isLocked()) {
+		return false;
+	}
 	const int nodeId = activeNode();
 	return nodePaste(nodeId, pos);
 }
 
 bool SceneManager::nodePaste(int nodeId, const glm::ivec3& pos) {
+	if (isLocked()) {
+		return false;
+	}
 	if (!_copy) {
 		Log::debug("Nothing copied yet - failed to paste");
 		return false;
@@ -1633,6 +2056,9 @@ bool SceneManager::nodePaste(int nodeId, const glm::ivec3& pos) {
 }
 
 bool SceneManager::nodeCut(int nodeId) {
+	if (isLocked()) {
+		return false;
+	}
 	voxel::Region selectionRegion = selectionCalculateRegion(nodeId);
 	if (!selectionRegion.isValid()) {
 		Log::debug("Cut failed: no selected voxels found");
@@ -1686,6 +2112,9 @@ bool SceneManager::nodeCut(int nodeId) {
 }
 
 bool SceneManager::globalCopy() {
+	if (isLocked()) {
+		return false;
+	}
 	// Always try to capture the current selection first.
 	// copy() only updates _copy when a selection exists; if there is no
 	// selection it leaves _copy unchanged, so a previously copied region
@@ -1695,6 +2124,9 @@ bool SceneManager::globalCopy() {
 }
 
 bool SceneManager::nodeGlobalCopy(int nodeId) {
+	if (isLocked()) {
+		return false;
+	}
 	nodeCopy(nodeId);
 	if (!_copy) {
 		Log::warn("globalcopy: nothing to copy - make a selection first");
@@ -1717,6 +2149,9 @@ bool SceneManager::nodeGlobalCopy(int nodeId) {
 }
 
 bool SceneManager::globalCopyVisible() {
+	if (isLocked()) {
+		return false;
+	}
 	const scenegraph::SceneGraph::MergeResult &merged = _sceneGraph.merge(true);
 	if (!merged.hasVolume()) {
 		Log::warn("globalcopyvisible: no visible model nodes to copy");
@@ -1739,11 +2174,17 @@ bool SceneManager::globalCopyVisible() {
 }
 
 bool SceneManager::globalPaste(const glm::ivec3 &pos) {
+	if (isLocked()) {
+		return false;
+	}
 	const int nodeId = activeNode();
 	return nodeGlobalPaste(nodeId, pos);
 }
 
 bool SceneManager::nodeGlobalPaste(int nodeId, const glm::ivec3 &pos) {
+	if (isLocked()) {
+		return false;
+	}
 	if (!loadGlobalClipboard(_copy)) {
 		return false;
 	}
@@ -1777,6 +2218,9 @@ bool SceneManager::nodeGlobalPaste(int nodeId, const glm::ivec3 &pos) {
 }
 
 bool SceneManager::globalPasteNode(const glm::ivec3 &pos) {
+	if (isLocked()) {
+		return false;
+	}
 	voxel::ClipboardData clipData;
 	if (!loadGlobalClipboard(clipData)) {
 		return false;
@@ -1800,6 +2244,9 @@ bool SceneManager::globalPasteNode(const glm::ivec3 &pos) {
 }
 
 bool SceneManager::splatMerge(int sourceNodeId) {
+	if (isLocked()) {
+		return false;
+	}
 	scenegraph::SceneGraphNode *sourceNode = sceneGraphModelNode(sourceNodeId);
 	if (sourceNode == nullptr) {
 		Log::warn("splatmerge: no valid source node");
@@ -1961,14 +2408,14 @@ bool SceneManager::splatMerge(int sourceNodeId) {
 		}
 	}
 
-	_mementoHandler.markNodeRemove(_sceneGraph, *sourceNode);
-	if (_sceneGraph.removeNode(sourceNodeId, false)) {
-		_sceneRenderer->removeNode(sourceNodeId);
-	}
+	nodeRemove(sourceNodeId, false);
 	return true;
 }
 
 bool SceneManager::mergeActiveToBackground() {
+	if (isLocked()) {
+		return false;
+	}
 	const int sourceNodeId = activeNode();
 	scenegraph::SceneGraphNode *sourceNode = sceneGraphModelNode(sourceNodeId);
 	if (sourceNode == nullptr) {
@@ -2281,14 +2728,14 @@ bool SceneManager::mergeActiveToBackground() {
 		modified(entry.nodeId, entry.localRegion, SceneModifiedFlags::All);
 	}
 
-	_mementoHandler.markNodeRemove(_sceneGraph, *sourceNode);
-	if (_sceneGraph.removeNode(sourceNodeId, false)) {
-		_sceneRenderer->removeNode(sourceNodeId);
-	}
+	nodeRemove(sourceNodeId, false);
 	return true;
 }
 
 int SceneManager::mergeVisibleToTemp() {
+	if (isLocked()) {
+		return InvalidNodeId;
+	}
 	core::Buffer<int> visibleNodeIds;
 	visibleNodeIds.reserve(_sceneGraph.size());
 	for (auto iter = _sceneGraph.beginModel(); iter != _sceneGraph.end(); ++iter) {
@@ -2537,6 +2984,9 @@ int SceneManager::mergeLockedToTemp(bool onlySelected) {
 }
 
 void SceneManager::selectionInvert(int nodeId) {
+	if (isLocked()) {
+		return;
+	}
 	scenegraph::SceneGraphNode *node = sceneGraphModelNode(nodeId);
 	if (node == nullptr) {
 		return;
@@ -2549,6 +2999,9 @@ void SceneManager::selectionInvert(int nodeId) {
 }
 
 void SceneManager::selectionUnselect(int nodeId) {
+	if (isLocked()) {
+		return;
+	}
 	scenegraph::SceneGraphNode *node = sceneGraphModelNode(nodeId);
 	if (node == nullptr) {
 		return;
@@ -2556,11 +3009,14 @@ void SceneManager::selectionUnselect(int nodeId) {
 	// Only re-extract where voxels actually had FlagOutline set
 	const voxel::Region dirtyRegion = selectionCalculateRegion(*node);
 	node->clearSelection();
-	_modifierFacade.selectBrush().box3D().setSelectionRegion(voxel::Region::InvalidRegion);
+	_modifier.selectBrush().box3D().setSelectionRegion(voxel::Region::InvalidRegion);
 	modified(nodeId, dirtyRegion.isValid() ? dirtyRegion : node->region(), SceneModifiedFlags::NoUndo);
 }
 
 void SceneManager::selectionSelectAll(int nodeId) {
+	if (isLocked()) {
+		return;
+	}
 	scenegraph::SceneGraphNode *node = sceneGraphModelNode(nodeId);
 	if (node == nullptr) {
 		return;
@@ -2570,8 +3026,8 @@ void SceneManager::selectionSelectAll(int nodeId) {
 		return;
 	}
 	node->select(volume->region());
-	if (_modifierFacade.selectBrush().selectMode() == SelectMode::Box3D) {
-		_modifierFacade.selectBrush().box3D().setSelectionRegion(volume->region());
+	if (_modifier.selectBrush().selectMode() == SelectMode::Box3D) {
+		_modifier.selectBrush().box3D().setSelectionRegion(volume->region());
 	}
 	// Mark mesh dirty to trigger re-extraction with updated FlagOutline
 	modified(nodeId, node->region(), SceneModifiedFlags::NoUndo);
@@ -2616,6 +3072,9 @@ voxel::Region SceneManager::selectionCalculateRegion(int nodeId) const {
 }
 
 void SceneManager::selectionSetBounds(int nodeId, const voxel::Region &region) {
+	if (isLocked()) {
+		return;
+	}
 	scenegraph::SceneGraphNode *node = sceneGraphModelNode(nodeId);
 	if (node == nullptr) {
 		return;
@@ -2636,7 +3095,7 @@ void SceneManager::selectionSetBounds(int nodeId, const voxel::Region &region) {
 	}
 	node->clearSelection();
 	node->select(clamped);
-	SelectBrush &selectBrush = _modifierFacade.selectBrush();
+	SelectBrush &selectBrush = _modifier.selectBrush();
 	if (selectBrush.selectMode() == SelectMode::Box3D) {
 		selectBrush.box3D().setSelectionRegion(clamped);
 	}
@@ -2644,11 +3103,14 @@ void SceneManager::selectionSetBounds(int nodeId, const voxel::Region &region) {
 }
 
 void SceneManager::selectionSetEllipse(int nodeId) {
+	if (isLocked()) {
+		return;
+	}
 	scenegraph::SceneGraphNode *node = sceneGraphModelNode(nodeId);
 	if (node == nullptr) {
 		return;
 	}
-	SelectBrush &brush = _modifierFacade.selectBrush();
+	SelectBrush &brush = _modifier.selectBrush();
 	if (!brush.circle().valid()) {
 		return;
 	}
@@ -2722,7 +3184,7 @@ void SceneManager::selectionFinalizeLasso(int nodeId) {
 	if (node == nullptr) {
 		return;
 	}
-	SelectBrush &brush = _modifierFacade.selectBrush();
+	SelectBrush &brush = _modifier.selectBrush();
 	select::PolygonLasso &lasso = brush.polygonLasso();
 	if (!lasso.accumulating() || lasso.path().size() < 3) {
 		return;
@@ -2764,7 +3226,7 @@ void SceneManager::selectionFinalizeLasso(int nodeId) {
 }
 
 void SceneManager::selectionCancelLasso(int nodeId) {
-	SelectBrush &brush = _modifierFacade.selectBrush();
+	SelectBrush &brush = _modifier.selectBrush();
 	select::PolygonLasso &lasso = brush.polygonLasso();
 	if (lasso.hasPendingChanges()) {
 		scenegraph::SceneGraphNode *node = sceneGraphModelNode(nodeId);
@@ -2780,7 +3242,7 @@ void SceneManager::selectionCancelLasso(int nodeId) {
 }
 
 void SceneManager::selectionLassoUndoVertex(int nodeId) {
-	SelectBrush &brush = _modifierFacade.selectBrush();
+	SelectBrush &brush = _modifier.selectBrush();
 	select::PolygonLasso &lasso = brush.polygonLasso();
 	if (!lasso.accumulating() || lasso.path().size() < 2) {
 		return;
@@ -2902,6 +3364,9 @@ int SceneManager::mergeNodes(const core::Buffer<int>& nodeIds) {
 }
 
 int SceneManager::mergeNodes(NodeMergeFlags flags) {
+	if (isLocked()) {
+		return InvalidNodeId;
+	}
 	core::Buffer<int> nodeIds;
 	nodeIds.reserve(_sceneGraph.size());
 	for (auto iter = _sceneGraph.beginModel(); iter != _sceneGraph.end(); ++iter) {
@@ -2920,6 +3385,9 @@ int SceneManager::mergeNodes(NodeMergeFlags flags) {
 }
 
 int SceneManager::mergeNodes(int nodeId1, int nodeId2) {
+	if (isLocked()) {
+		return InvalidNodeId;
+	}
 	if (!_sceneGraph.hasNode(nodeId1) || !_sceneGraph.hasNode(nodeId2)) {
 		return InvalidNodeId;
 	}
@@ -2940,7 +3408,7 @@ int SceneManager::mergeNodes(int nodeId1, int nodeId2) {
 void SceneManager::resetSceneState() {
 	// this also resets the cursor voxel - but nodeActivate() will set it to the first usable index
 	// that's why this call must happen before the nodeActivate() call.
-	_modifierFacade.reset();
+	_modifier.reset();
 	int nodeId = (*_sceneGraph.beginModel()).id();
 	for (const auto &entry : _sceneGraph.nodes()) {
 		const scenegraph::SceneGraphNode &node = entry->second;
@@ -2960,7 +3428,7 @@ void SceneManager::resetSceneState() {
 	_mementoHandler.markInitialSceneState(_sceneGraph);
 	_dirty = false;
 	_result = voxelutil::PickResult();
-	_modifierFacade.setCursorVoxel(voxel::createVoxel(node.palette(), 0));
+	_modifier.setCursorVoxel(voxel::createVoxel(node.palette(), 0));
 	{
 		// TODO: happens in nodeActivate already
 		setCursorPosition(cursorPosition(), voxel::FaceNames::Max, true);
@@ -3012,6 +3480,9 @@ void SceneManager::onNewNodeAdded(int newNodeId, bool isChildren) {
 }
 
 int SceneManager::moveNodeToSceneGraph(scenegraph::SceneGraphNode &node, int parent) {
+	if (isLocked()) {
+		return InvalidNodeId;
+	}
 	const int newNodeId = scenegraph::moveNodeToSceneGraph(_sceneGraph, node, parent);
 	onNewNodeAdded(newNodeId, false);
 	return newNodeId;
@@ -3066,6 +3537,9 @@ bool SceneManager::loadSceneGraph(scenegraph::SceneGraph&& sceneGraph, bool disc
 }
 
 bool SceneManager::splitVolumes() {
+	if (isLocked()) {
+		return false;
+	}
 	const int splitSize = _maxSuggestedVolumeSize->intVal();
 	const glm::ivec3 maxSize(splitSize);
 	scenegraph::SceneGraph newSceneGraph;
@@ -3123,10 +3597,16 @@ scenegraph::SceneGraph &SceneManager::sceneGraph() {
 }
 
 bool SceneManager::setAnimation(const core::String &animation) {
+	if (isLocked()) {
+		return false;
+	}
 	return _sceneGraph.setAnimation(animation);
 }
 
 bool SceneManager::addAnimation(const core::String &animation) {
+	if (isLocked()) {
+		return false;
+	}
 	if (_sceneGraph.addAnimation(animation)) {
 		_mementoHandler.markAnimationAdded(_sceneGraph, animation);
 		return true;
@@ -3135,6 +3615,9 @@ bool SceneManager::addAnimation(const core::String &animation) {
 }
 
 bool SceneManager::duplicateAnimation(const core::String &animation, const core::String &newName) {
+	if (isLocked()) {
+		return false;
+	}
 	if (_sceneGraph.duplicateAnimation(animation, newName)) {
 		_mementoHandler.markAnimationAdded(_sceneGraph, animation);
 		return true;
@@ -3143,6 +3626,9 @@ bool SceneManager::duplicateAnimation(const core::String &animation, const core:
 }
 
 bool SceneManager::removeAnimation(const core::String &animation) {
+	if (isLocked()) {
+		return false;
+	}
 	if (_sceneGraph.removeAnimation(animation)) {
 		_mementoHandler.markAnimationRemoved(_sceneGraph, animation);
 		return true;
@@ -3172,17 +3658,19 @@ bool SceneManager::setSceneGraphNodeVolume(scenegraph::SceneGraphNode &node, vox
 	_sceneRenderer->removeNode(node.id());
 
 	const voxel::Region& region = volume->region();
-	_sceneRenderer->updateGridRegion(region);
 
-	_dirty = false;
+	_dirty = false; // TODO: why is this not dirty? should it be dirty when the volume changes?
 	_result = voxelutil::PickResult();
-	setCursorPosition(cursorPosition(), _modifierFacade.cursorFace(), true);
+	setCursorPosition(cursorPosition(), _modifier.cursorFace(), true);
 	setReferencePosition(region.getLowerCenter());
 	resetLastTrace();
 	return true;
 }
 
 bool SceneManager::newScene(bool force, const core::String &name, voxel::RawVolume *v) {
+	if (isLocked()) {
+		return false;
+	}
 	_sceneGraph.clear();
 	_sceneRenderer->clear();
 
@@ -3211,10 +3699,20 @@ bool SceneManager::newScene(bool force, const core::String &name, voxel::RawVolu
 }
 
 bool SceneManager::newScene(bool force, const core::String& name, const voxel::Region& region) {
+	if (isLocked()) {
+		return false;
+	}
 	if (dirty() && !force) {
 		return false;
 	}
-	voxel::RawVolume* v = new voxel::RawVolume(region);
+	const size_t bytes = voxel::RawVolume::size(region);
+	if (!app::App::getInstance()->hasEnoughMemory(bytes)) {
+		const core::String &humanReadableSize = core::string::humanSize(bytes);
+		Log::error("Not enough memory to create new scene with region %s (need %s)", region.toString().c_str(),
+				   humanReadableSize.c_str());
+		return false;
+	}
+	voxel::RawVolume *v = new voxel::RawVolume(region);
 	return newScene(force, name, v);
 }
 
@@ -3237,8 +3735,8 @@ void SceneManager::nodeGroupRotate(math::Axis axis) {
 		r.accumulate(v->region());
 		setSceneGraphNodeVolume(*node, newVolume);
 		modified(groupNodeId, r);
-		for (const auto &kfAnim : node->allKeyFrames()) {
-			for (auto &kf : kfAnim->second) {
+		for (auto *kfAnim : node->allKeyFrames()) {
+			for (auto &kf : kfAnim->value) {
 				scenegraph::SceneGraphTransform &transform = kf.transform();
 				transform.rotate(axis);
 			}
@@ -3300,8 +3798,8 @@ void SceneManager::nodeRotateAll(math::Axis axis) {
 		setSceneGraphNodeVolume(node, newVolume);
 		modified(node.id(), r);
 
-		for (const auto &kfAnim : node.allKeyFrames()) {
-			for (auto &kf : kfAnim->second) {
+		for (auto *kfAnim : node.allKeyFrames()) {
+			for (auto &kf : kfAnim->value) {
 				scenegraph::SceneGraphTransform &transform = kf.transform();
 				// Rotate the volume's world-space center around the scene pivot,
 				// then back-compute the new translation so the center lands correctly.
@@ -3321,6 +3819,9 @@ void SceneManager::nodeRotateAll(math::Axis axis) {
 }
 
 void SceneManager::nodeMoveVoxels(int nodeId, const glm::ivec3& m) {
+	if (isLocked()) {
+		return;
+	}
 	voxel::RawVolume* v = volume(nodeId);
 	if (v == nullptr) {
 		return;
@@ -3361,6 +3862,9 @@ void SceneManager::nodeMoveVoxels(int nodeId, const glm::ivec3& m) {
 }
 
 void SceneManager::nodeGroupMoveVoxels(int x, int y, int z) {
+	if (isLocked()) {
+		return;
+	}
 	const glm::ivec3 v(x, y, z);
 	nodeForeachGroup([&] (int groupNodeId) {
 		nodeMoveVoxels(groupNodeId, v);
@@ -3368,6 +3872,9 @@ void SceneManager::nodeGroupMoveVoxels(int x, int y, int z) {
 }
 
 void SceneManager::nodeShift(int nodeId, const glm::ivec3& m) {
+	if (isLocked()) {
+		return;
+	}
 	scenegraph::SceneGraphNode* node = sceneGraphNode(nodeId);
 	if (node == nullptr) {
 		return;
@@ -3379,11 +3886,13 @@ void SceneManager::nodeShift(int nodeId, const glm::ivec3& m) {
 	voxel::Region region = v->region();
 	v->translate(m);
 	region.accumulate(v->region());
-	_dirtyRenderer = DirtyRendererLockedAxis | DirtyRendererGridRenderer;
 	modified(nodeId, region);
 }
 
 void SceneManager::nodeGroupShift(int x, int y, int z) {
+	if (isLocked()) {
+		return;
+	}
 	const glm::ivec3 v(x, y, z);
 	nodeForeachGroup([&] (int groupNodeId) {
 		nodeShift(groupNodeId, v);
@@ -3391,18 +3900,19 @@ void SceneManager::nodeGroupShift(int x, int y, int z) {
 }
 
 bool SceneManager::setGridResolution(int resolution) {
-	if (_modifierFacade.gridResolution() == resolution) {
+	if (isLocked()) {
 		return false;
 	}
-	_modifierFacade.setGridResolution(resolution);
-	setCursorPosition(cursorPosition(), _modifierFacade.cursorFace(), true);
+	if (_modifier.gridResolution() == resolution) {
+		return false;
+	}
+	_modifier.setGridResolution(resolution);
+	setCursorPosition(cursorPosition(), _modifier.cursorFace(), true);
 	return true;
 }
 
 void SceneManager::render(voxelrender::RenderContext &renderContext, voxelrender::RenderContext &modifierRenderContext, const video::Camera& camera, uint8_t renderMask) {
 	renderContext.frameBuffer.bind(true);
-	_sceneRenderer->updateLockedPlanes(_modifierFacade.lockedAxis(), _sceneGraph, cursorPosition());
-
 	renderContext.frame = _currentFrameIdx;
 	renderContext.sceneGraph = &_sceneGraph;
 	renderContext.markedNodes = &_markedNodes;
@@ -3416,7 +3926,7 @@ void SceneManager::render(voxelrender::RenderContext &renderContext, voxelrender
 		_sceneRenderer->renderUI(renderContext, camera);
 		if (renderContext.isEditMode()) {
 			const glm::mat4 &mat = worldMatrix(renderContext.frame, renderContext.applyTransforms());
-			_modifierFacade.render(modifierRenderContext, camera, activePalette(), mat);
+			_modifier.render(modifierRenderContext, camera, activePalette(), mat);
 		}
 	}
 
@@ -3511,6 +4021,8 @@ void SceneManager::construct() {
 	core::Var::registerVar(voxEditModelGizmo);
 	const core::VarDef voxEditBrushGizmo(cfg::VoxEditBrushGizmo, true, N_("Brush gizmo"), N_("Show the gizmo for brushes that support it"));
 	core::Var::registerVar(voxEditBrushGizmo);
+	const core::VarDef voxEditBrushHud(cfg::VoxEditBrushHud, true, N_("Brush HUD"), N_("Show brush status and hints in the viewport"));
+	core::Var::registerVar(voxEditBrushHud);
 	const core::VarDef voxEditLastPalette(cfg::VoxEditLastPalette, palette::Palette::builtIn[0], N_("Last palette"), N_("The last used palette"));
 	core::Var::registerVar(voxEditLastPalette);
 	const core::VarDef voxEditViewports(cfg::VoxEditViewports, 2, 1, cfg::MaxViewports, N_("Viewports"), N_("The amount of viewports (not in simple ui mode)"));
@@ -3545,7 +4057,7 @@ void SceneManager::construct() {
 
 	voxelformat::FormatConfig::init();
 
-	_modifierFacade.construct();
+	_modifier.construct();
 	_mementoHandler.construct();
 	_sceneRenderer->construct();
 	_camMovement.construct();
@@ -3563,7 +4075,7 @@ void SceneManager::construct() {
 				return;
 			}
 			const voxel::Region &region = selectionCalculateRegion(*node);
-			nodeResize(activeNodeId, region);
+			nodeResizeAsync(activeNodeId, region);
 		}).setHelp(_("Resize the volume to the current selection"));
 
 	command::Command::registerCommand("xs")
@@ -3934,28 +4446,28 @@ void SceneManager::construct() {
 		.addArg({"nodeid", command::ArgType::String, true, "", "Node ID or UUID to crop"})
 		.setHandler([&] (const command::CommandArgs& args) {
 			const int nodeId = toNodeId(args, activeNode());
-			nodeCrop(nodeId);
+			startSceneJob(SceneJobType::CropVolume, nodeId);
 		}).setHelp(_("Crop the given node to the voxel boundaries"));
 
 	command::Command::registerCommand("splitobjects")
 		.addArg({"nodeid", command::ArgType::String, true, "", "Node ID or UUID to split"})
 		.setHandler([&] (const command::CommandArgs& args) {
 			const int nodeId = toNodeId(args, activeNode());
-			nodeSplitObjects(nodeId);
+			startSceneJob(SceneJobType::SplitObjects, nodeId);
 		}).setHelp(_("Split the given node into multiple nodes"));
 
 	command::Command::registerCommand("scaledown")
 		.addArg({"nodeid", command::ArgType::String, true, "", "Node ID or UUID to scale"})
 		.setHandler([&] (const command::CommandArgs& args) {
 			const int nodeId = toNodeId(args, activeNode());
-			nodeScaleDown(nodeId);
+			startSceneJob(SceneJobType::ScaleDownVolume, nodeId);
 		}).setHelp(_("Scale the given node down")).setArgumentCompleter(nodeCompleter(_sceneGraph));
 
 	command::Command::registerCommand("scaleup")
 		.addArg({"nodeid", command::ArgType::String, true, "", "Node ID or UUID to scale"})
 		.setHandler([&] (const command::CommandArgs& args) {
 			const int nodeId = toNodeId(args, activeNode());
-			nodeScaleUp(nodeId);
+			startSceneJob(SceneJobType::ScaleUpVolume, nodeId);
 		}).setHelp(_("Scale the given node up")).setArgumentCompleter(nodeCompleter(_sceneGraph));
 
 	command::Command::registerCommand("colortomodel")
@@ -3980,61 +4492,63 @@ void SceneManager::construct() {
 					Log::warn("No valid palette index given for colortomodel");
 					return;
 				}
-				nodeColorToNewNode(nodeId, indices);
+				nodeColorToNewNodeAsync(nodeId, indices);
 			} else {
-				const voxel::Voxel voxel = _modifierFacade.cursorVoxel();
-				nodeColorToNewNode(nodeId, voxel);
+				const voxel::Voxel voxel = _modifier.cursorVoxel();
+				core::Buffer<uint8_t> indices;
+				indices.push_back(voxel.getColor());
+				nodeColorToNewNodeAsync(nodeId, indices);
 			}
 		}).setHelp(_("Move the voxels of the current selected palette index, the given index or a comma-separated list of indices into a new node"));
 
 	command::Command::registerCommand("abortaction")
 		.setHandler([&] (const command::CommandArgs& args) {
-			_modifierFacade.abort();
+			_modifier.abort();
 		}).setHelp(_("Aborts the current modifier action"));
 
 	command::Command::registerCommand("brushapply")
 		.setHandler([&] (const command::CommandArgs& args) {
-			_modifierFacade.brushApply();
+			_modifier.brushApply();
 		}).setHelp(_("Apply pending brush changes without switching brushes"));
 
 	command::Command::registerCommand("fillhollow")
 		.setHandler([&] (const command::CommandArgs& args) {
-			nodeGroupFillHollow();
+			queueSceneJobForGroup(SceneJobType::FillHollowVolume);
 		}).setHelp(_("Fill the inner parts of closed models"));
 
 	command::Command::registerCommand("hollow")
 		.setHandler([&] (const command::CommandArgs& args) {
-			nodeGroupHollow();
+			queueSceneJobForGroup(SceneJobType::HollowVolume);
 		}).setHelp(_("Remove non visible voxels"));
 
 	command::Command::registerCommand("fill")
 		.setHandler([&] (const command::CommandArgs& args) {
-			nodeGroupFill();
+			queueSceneJobForGroup(SceneJobType::FillVolume);
 		}).setHelp(_("Fill voxels in the current selection"));
 
 	command::Command::registerCommand("clear")
 		.setHandler([&] (const command::CommandArgs& args) {
-			nodeGroupClear();
+			queueSceneJobForGroup(SceneJobType::ClearVolume);
 		}).setHelp(_("Remove all voxels in the current selection"));
 
 	command::Command::registerCommand("deleteselected")
 		.setHandler([&] (const command::CommandArgs& args) {
-			nodeGroupDeleteSelected();
+			queueSceneJobForGroup(SceneJobType::DeleteSelectedVolume);
 		}).setHelp(_("Remove selected voxels"));
 
 	command::Command::registerCommand("colorselected")
 		.setHandler([&] (const command::CommandArgs& args) {
-			nodeGroupColorSelected(_modifierFacade.cursorVoxel().getColor());
+			nodeGroupColorSelected(_modifier.cursorVoxel().getColor());
 		}).setHelp(_("Recolor selected voxels with the active palette color"));
 
 	command::Command::registerCommand("deselectcolor")
 		.setHandler([&] (const command::CommandArgs& args) {
-			nodeGroupDeselectColor(_modifierFacade.cursorVoxel().getColor());
+			nodeGroupDeselectColor(_modifier.cursorVoxel().getColor());
 		}).setHelp(_("Deselect all voxels matching the active palette color"));
 
 	command::Command::registerCommand("selectonlycolor")
 		.setHandler([&] (const command::CommandArgs& args) {
-			nodeGroupSelectOnlyColor(_modifierFacade.cursorVoxel().getColor());
+			nodeGroupSelectOnlyColor(_modifier.cursorVoxel().getColor());
 		}).setHelp(_("Deselect all voxels not matching the active palette color"));
 
 	command::Command::registerCommand("selectonlyedges")
@@ -4112,7 +4626,7 @@ void SceneManager::construct() {
 			const int x = args.intVal("x");
 			const int y = args.intVal("y");
 			const int z = args.intVal("z");
-			setCursorPosition(glm::ivec3(x, y, z), _modifierFacade.cursorFace(), true);
+			setCursorPosition(glm::ivec3(x, y, z), _modifier.cursorFace(), true);
 			_traceViaMouse = false;
 		}).setHelp(_("Set the cursor to the specified position"));
 
@@ -4131,7 +4645,7 @@ void SceneManager::construct() {
 			const int y = args.intVal("y", x);
 			const int z = args.intVal("z", y);
 			const int nodeId = toNodeId(args, activeNode());
-			nodeResize(nodeId, glm::ivec3(x, y, z));
+			nodeResizeAsync(nodeId, glm::ivec3(x, y, z));
 		}).setHelp(_("Resize your current model node by the specified size"));
 
 	command::Command::registerCommand("rescalecontent")
@@ -4260,7 +4774,7 @@ void SceneManager::construct() {
 	command::Command::registerCommand("splatmerge")
 		.setHandler([&] (const command::CommandArgs&) {
 			splatMerge(activeNode());
-		}).setHelp(_("Blend merge: merge active node voxels into all overlapping nodes"));
+		}).setHelp(_("Blend merge: merge active node voxels into all overlapping nodes; remainder becomes new node, source removed"));
 
 	command::Command::registerCommand("mergeactivetobackground")
 		.setHandler([&] (const command::CommandArgs&) {
@@ -4383,7 +4897,7 @@ void SceneManager::construct() {
 		.setHandler([&] (const command::CommandArgs& args) {
 			const uint8_t index = (uint8_t)args.intVal("index");
 			const voxel::Voxel voxel = voxel::createVoxel(activePalette(), index);
-			_modifierFacade.setCursorVoxel(voxel);
+			_modifier.setCursorVoxel(voxel);
 		}).setHelp(_("Use the given index to select the color from the current palette"));
 
 	command::Command::registerCommand("setcolorrgb")
@@ -4397,7 +4911,7 @@ void SceneManager::construct() {
 			const color::RGBA color(red, green, blue);
 			const int index = activePalette().getClosestMatch(color);
 			const voxel::Voxel voxel = voxel::createVoxel(activePalette(), index);
-			_modifierFacade.setCursorVoxel(voxel);
+			_modifier.setCursorVoxel(voxel);
 		}).setHelp(_("Set the current selected color by finding the closest rgb match in the palette"));
 
 	command::Command::registerCommand("pickcolor")
@@ -4406,14 +4920,14 @@ void SceneManager::construct() {
 			// depends on the mode you are editing in), thus we should use the cursor voxel in
 			// that case
 			if (_traceViaMouse && !voxel::isAir(hitCursorVoxel().getMaterial())) {
-				_modifierFacade.setCursorVoxel(hitCursorVoxel());
+				_modifier.setCursorVoxel(hitCursorVoxel());
 				return;
 			}
 			// resolve the voxel via cursor position. This allows to use also get the proper
 			// result if we moved the cursor via keys (and thus might have skipped tracing)
 			if (const voxel::RawVolume *v = activeVolume()) {
 				const voxel::Voxel& voxel = v->voxel(cursorPosition());
-				_modifierFacade.setCursorVoxel(voxel);
+				_modifier.setCursorVoxel(voxel);
 			}
 		}).setHelp(_("Pick the current selected color from current cursor voxel"));
 
@@ -4421,12 +4935,12 @@ void SceneManager::construct() {
 		.setHandler([&] (const command::CommandArgs& args) {
 			if (_traceViaMouse && !voxel::isAir(hitCursorVoxel().getMaterial())) {
 				const voxel::Voxel& voxel = hitCursorVoxel();
-				if (voxel.getColor() == _modifierFacade.cursorVoxel().getColor()) {
+				if (voxel.getColor() == _modifier.cursorVoxel().getColor()) {
 					return;
 				}
 				palette::Palette &palette = activePalette();
 				const palette::Material &material = palette.material(voxel.getColor());
-				palette.setMaterial(_modifierFacade.cursorVoxel().getColor(), material);
+				palette.setMaterial(_modifier.cursorVoxel().getColor(), material);
 				return;
 			}
 		}).setHelp(_("Pick the current selected material from current cursor voxel"));
@@ -4543,7 +5057,7 @@ void SceneManager::construct() {
 		.setHandler([&] (const command::CommandArgs& args) {
 			for (auto iter = _sceneGraph.beginAll(); iter != _sceneGraph.end(); ++iter) {
 				scenegraph::SceneGraphNode &node = *iter;
-				node.setVisible(true);
+				nodeSetVisible(node.id(), true);
 			}
 		}).setHelp(_("Show all nodes"));
 
@@ -4551,7 +5065,7 @@ void SceneManager::construct() {
 		.setHandler([&](const command::CommandArgs &args) {
 			for (auto iter = _sceneGraph.beginAll(); iter != _sceneGraph.end(); ++iter) {
 				scenegraph::SceneGraphNode &node = *iter;
-				node.setVisible(false);
+				nodeSetVisible(node.id(), false);
 			}
 		}).setHelp(_("Hide all nodes"));
 
@@ -4559,11 +5073,11 @@ void SceneManager::construct() {
 		.addArg({"nodeid", command::ArgType::String, true, "", "Node ID or UUID"})
 		.setHandler([&] (const command::CommandArgs& args) {
 			const int nodeId = toNodeId(args, activeNode());
-			_sceneGraph.visitChildren(nodeId, true, [] (scenegraph::SceneGraphNode &node) {
-				node.setVisible(true);
+			_sceneGraph.visitChildren(nodeId, true, [&] (scenegraph::SceneGraphNode &node) {
+				nodeSetVisible(node.id(), true);
 			});
 			if (scenegraph::SceneGraphNode *node = sceneGraphNode(nodeId)) {
-				node->setVisible(true);
+				nodeSetVisible(node->id(), true);
 			}
 		}).setHelp(_("Show all children nodes"));
 
@@ -4571,11 +5085,11 @@ void SceneManager::construct() {
 		.addArg({"nodeid", command::ArgType::String, true, "", "Node ID or UUID"})
 		.setHandler([&](const command::CommandArgs &args) {
 			const int nodeId = toNodeId(args, activeNode());
-			_sceneGraph.visitChildren(nodeId, true, [] (scenegraph::SceneGraphNode &node) {
-				node.setVisible(false);
+			_sceneGraph.visitChildren(nodeId, true, [&] (scenegraph::SceneGraphNode &node) {
+				nodeSetVisible(node.id(), false);
 			});
 			if (scenegraph::SceneGraphNode *node = sceneGraphNode(nodeId)) {
-				node->setVisible(false);
+				nodeSetVisible(node->id(), false);
 			}
 		}).setHelp(_("Hide all children nodes"));
 
@@ -4586,10 +5100,10 @@ void SceneManager::construct() {
 			for (auto iter = _sceneGraph.beginAll(); iter != _sceneGraph.end(); ++iter) {
 				scenegraph::SceneGraphNode &node = *iter;
 				if (node.id() == nodeId) {
-					node.setVisible(true);
+					nodeSetVisible(node.id(), true);
 					continue;
 				}
-				node.setVisible(false);
+				nodeSetVisible(node.id(), false);
 			}
 		}).setHelp(_("Hide all model nodes except the active one")).setArgumentCompleter(nodeCompleter(_sceneGraph));
 
@@ -4597,19 +5111,30 @@ void SceneManager::construct() {
 		.setHandler([&](const command::CommandArgs &args) {
 			for (auto iter = _sceneGraph.beginModel(); iter != _sceneGraph.end(); ++iter) {
 				scenegraph::SceneGraphNode &node = *iter;
-				node.setLocked(true);
+				nodeSetLocked(node.id(), true);
 			}
-			_sceneRenderer->markDirty();
 		}).setHelp(_("Lock all nodes"));
 
 	command::Command::registerCommand("modelunlockall")
 		.setHandler([&] (const command::CommandArgs& args) {
 			for (auto iter = _sceneGraph.beginModel(); iter != _sceneGraph.end(); ++iter) {
 				scenegraph::SceneGraphNode &node = *iter;
-				node.setLocked(false);
+				nodeSetLocked(node.id(), false);
 			}
-			_sceneRenderer->markDirty();
 		}).setHelp(_("Unlock all nodes"));
+
+	command::Command::registerCommand("nodesetpivot")
+		.addArg({"nodeid", command::ArgType::String, false, "", "Node ID or UUID"})
+		.addArg({"x", command::ArgType::Float, false, "", "X coordinate of the pivot"})
+		.addArg({"y", command::ArgType::Float, false, "", "Y coordinate of the pivot"})
+		.addArg({"z", command::ArgType::Float, false, "", "Z coordinate of the pivot"})
+		.setHandler([&](const command::CommandArgs& args) {
+			const int nodeId = toNodeId(args, activeNode());
+			const float x = args.floatVal("x");
+			const float y = args.floatVal("y");
+			const float z = args.floatVal("z");
+			nodeUpdatePivot(nodeId, glm::vec3(x, y, z));
+		}).setHelp(_("Set the pivot point for a node")).setArgumentCompleter(nodeCompleter(_sceneGraph));
 
 	command::Command::registerCommand("noderename")
 		.addArg({"nodeid", command::ArgType::String, false, "", "Node ID or UUID"})
@@ -4746,7 +5271,7 @@ void SceneManager::construct() {
 		}).setHelp(_("Set the camera orbit target position"));
 
 	command::Command::registerCommand("camera_projection")
-		.addArg({"mode", command::ArgType::String, true, "", "Projection mode: perspective|orthogonal (toggles if not specified)"})
+		.addArg({"mode", command::ArgType::String, true, "", "Projection mode: perspective|orthogonal|isometric (cycles if not specified)"})
 		.setHandler([&] (const command::CommandArgs& args) {
 			video::Camera *camera = activeCamera();
 			if (camera == nullptr) {
@@ -4756,6 +5281,8 @@ void SceneManager::construct() {
 			if (!args.has("mode")) {
 				if (camera->mode() == video::CameraMode::Perspective) {
 					camera->setMode(video::CameraMode::Orthogonal);
+				} else if (camera->mode() == video::CameraMode::Orthogonal) {
+					camera->setMode(video::CameraMode::Isometric);
 				} else {
 					camera->setMode(video::CameraMode::Perspective);
 				}
@@ -4766,10 +5293,13 @@ void SceneManager::construct() {
 				camera->setMode(video::CameraMode::Perspective);
 			} else if (modeStr == "orthogonal") {
 				camera->setMode(video::CameraMode::Orthogonal);
+			} else if (modeStr == "isometric") {
+				camera->setMode(video::CameraMode::Isometric);
 			} else {
-				Log::error("Unknown projection mode: %s (valid are: perspective, orthogonal)", modeStr.c_str());
+				Log::error("Unknown projection mode: %s (valid are: perspective, orthogonal, isometric)", modeStr.c_str());
 			}
-		}).setHelp(_("Set or toggle the camera projection mode (perspective or orthogonal)")).setArgumentCompleter(command::valueCompleter({"perspective", "orthogonal"}));
+		}).setHelp(_("Set or cycle the camera projection mode (perspective, orthogonal or isometric)"))
+			.setArgumentCompleter(command::valueCompleter({"perspective", "orthogonal", "isometric"}));
 
 	command::Command::registerCommand("net_server_start")
 		.addArg({"port", command::ArgType::Int, true, "", "Port to listen on (default: ve_netport cvar)"})
@@ -4808,6 +5338,9 @@ void SceneManager::construct() {
 }
 
 void SceneManager::nodeRemoveUnusedColors(int nodeId, bool reindexPalette) {
+	if (isLocked()) {
+		return;
+	}
 	scenegraph::SceneGraphNode &node = _sceneGraph.node(nodeId);
 	node.removeUnusedColors(reindexPalette);
 	if (reindexPalette) {
@@ -4820,6 +5353,9 @@ void SceneManager::nodeRemoveUnusedColors(int nodeId, bool reindexPalette) {
 }
 
 int SceneManager::addPointChild(const core::String& name, const glm::ivec3& position, const glm::quat& orientation, const core::UUID &uuid) {
+	if (isLocked()) {
+		return InvalidNodeId;
+	}
 	scenegraph::SceneGraphNode newNode(scenegraph::SceneGraphNodeType::Point, uuid);
 	scenegraph::SceneGraphTransform transform;
 	transform.setWorldTranslation(position);
@@ -4840,6 +5376,9 @@ int SceneManager::addPointChild(const core::String& name, const glm::ivec3& posi
 }
 
 int SceneManager::addModelChild(const core::String& name, int width, int height, int depth, const core::UUID &uuid) {
+	if (isLocked()) {
+		return InvalidNodeId;
+	}
 	const voxel::Region region(0, 0, 0, width - 1, height - 1, depth - 1);
 	if (!region.isValid()) {
 		Log::warn("Invalid size provided (%i:%i:%i)", width, height, depth);
@@ -4901,7 +5440,7 @@ bool SceneManager::init() {
 		Log::error("Failed to initialize the scene renderer");
 		return false;
 	}
-	if (!_modifierFacade.init()) {
+	if (!_modifier.init()) {
 		Log::error("Failed to initialize the modifier");
 		return false;
 	}
@@ -4916,7 +5455,7 @@ bool SceneManager::init() {
 
 	_gridSize = core::getVar(cfg::VoxEditGridsize);
 	_lastAutoSave = _timeProvider->tickSeconds();
-	_modifierFacade.setLockedAxis(math::Axis::None, true);
+	_modifier.setLockedAxis(math::Axis::None, true);
 	return true;
 }
 
@@ -4925,6 +5464,9 @@ bool SceneManager::isScriptRunning() const {
 }
 
 bool SceneManager::runScript(const core::String& luaCode, const core::DynamicArray<core::String>& args) {
+	if (isLocked()) {
+		return false;
+	}
 	if (luaCode.empty()) {
 		Log::warn("No script selected");
 		return false;
@@ -4940,7 +5482,7 @@ bool SceneManager::runScript(const core::String& luaCode, const core::DynamicArr
 	// TODO: MEMENTO: there are still no memento states for direct node modifications during the script run
 	//                we can e.g. set or modify the transforms, properties and so on of a node.
 	_sceneGraph.registerListener(&_luaApiListener);
-	if (!_luaApi.exec(luaCode, _sceneGraph, nodeId, region, _modifierFacade.cursorVoxel(), args)) {
+	if (!_luaApi.exec(luaCode, _sceneGraph, nodeId, region, _modifier.cursorVoxel(), args)) {
 		_sceneGraph.unregisterListener(&_luaApiListener);
 		_mementoHandler.endGroup();
 		return false;
@@ -5029,6 +5571,283 @@ void SceneManager::animateFrames(double nowSeconds) {
 
 bool SceneManager::isLoading() const {
 	return _loadingFuture.valid();
+}
+
+bool SceneManager::isLocked() const {
+	if (isSceneJobRunning()) {
+		return true;
+	}
+	return false;
+}
+
+bool SceneManager::isCommandRunning() const {
+	return isSceneJobRunning();
+}
+
+bool SceneManager::isSceneJobRunning() const {
+	return _sceneJobFuture.valid();
+}
+
+const core::String &SceneManager::sceneJobText() const {
+	return _sceneJobText;
+}
+
+float SceneManager::sceneJobProgress() const {
+	return _sceneJobProgress;
+}
+
+bool SceneManager::cancelSceneJob() {
+	if (!isSceneJobRunning()) {
+		return false;
+	}
+	_sceneJobCancelRequested = true;
+	_sceneJobText = _("Cancelling");
+	return true;
+}
+
+bool SceneManager::cancelPendingSceneJob(int index) {
+	if (index < 0 || index >= (int)_sceneJobQueue.size()) {
+		return false;
+	}
+	_sceneJobQueue.erase(_sceneJobQueue.begin() + index);
+	return true;
+}
+
+void SceneManager::clearPendingSceneJobs() {
+	_sceneJobQueue.clear();
+}
+
+int SceneManager::pendingSceneJobs() const {
+	return (int)_sceneJobQueue.size();
+}
+
+const core::String &SceneManager::pendingSceneJobText(int index) const {
+	if (index < 0 || index >= (int)_sceneJobQueue.size()) {
+		return core::String::Empty;
+	}
+	return _sceneJobQueue[index].text;
+}
+
+bool SceneManager::startSceneJob(SceneJobType type, int nodeId) {
+	SceneJobRequest request;
+	request.type = type;
+	request.nodeId = nodeId;
+	return startSceneJob(core::move(request));
+}
+
+bool SceneManager::startSceneJob(SceneJobRequest &&request) {
+	if (isLoading()) {
+		Log::warn("Scene is loading - can't schedule background task");
+		return false;
+	}
+	request.text = voxedit::sceneJobText(request.type);
+	if (isSceneJobRunning()) {
+		_sceneJobQueue.push_back(core::move(request));
+		return true;
+	}
+
+	switch (request.type) {
+	case SceneJobType::CropVolume:
+		return startCropSceneJob(request.nodeId, request.text);
+	case SceneJobType::ScaleUpVolume:
+		return startScaleUpSceneJob(request.nodeId, request.text);
+	case SceneJobType::ScaleDownVolume:
+		return startScaleDownSceneJob(request.nodeId, request.text);
+	case SceneJobType::ResizeVolume:
+		return startResizeSceneJob(request);
+	// These jobs all snapshot one volume and select the concrete edit by request.type.
+	case SceneJobType::FillVolume:
+	case SceneJobType::ClearVolume:
+	case SceneJobType::DeleteSelectedVolume:
+	case SceneJobType::HollowVolume:
+	case SceneJobType::FillHollowVolume:
+		return startVolumeOperationSceneJob(request);
+	case SceneJobType::SplitObjects:
+		return startSplitObjectsSceneJob(request.nodeId, request.text);
+	case SceneJobType::ColorToModel:
+		return startColorToModelSceneJob(request);
+	case SceneJobType::SplatMerge:
+		return startSplatMergeSceneJob(request.nodeId, request.text);
+	case SceneJobType::None:
+	case SceneJobType::Max:
+		break;
+	}
+	return false;
+}
+
+bool SceneManager::startActiveSceneJob(SceneJobType type, const core::String &text, core::Future<SceneJobResult> &&future) {
+	if (isSceneJobRunning() || isLoading()) {
+		Log::warn("Another background task is already running");
+		return false;
+	}
+	_sceneJobType = type;
+	_sceneJobText = text;
+	_sceneJobProgress = -1.0f;
+	_sceneJobCancelRequested = false;
+	_sceneJobFuture = core::move(future);
+	return true;
+}
+
+void SceneManager::startNextQueuedSceneJob() {
+	while (!_sceneJobQueue.empty() && !isSceneJobRunning()) {
+		SceneJobRequest request = core::move(_sceneJobQueue.front());
+		_sceneJobQueue.erase(_sceneJobQueue.begin());
+		if (!startSceneJob(core::move(request))) {
+			Log::warn("Failed to start pending background scene job");
+		}
+	}
+}
+
+bool SceneManager::applySceneJobResult(SceneJobResult &&result) {
+	if (!result.success) {
+		Log::warn("Background scene job failed: %s", result.error.c_str());
+		return false;
+	}
+
+	switch (result.type) {
+	case SceneJobType::CropVolume:
+	case SceneJobType::ScaleUpVolume:
+	case SceneJobType::ScaleDownVolume:
+	case SceneJobType::FillVolume:
+	case SceneJobType::ClearVolume:
+	case SceneJobType::DeleteSelectedVolume:
+	case SceneJobType::HollowVolume:
+	case SceneJobType::FillHollowVolume: {
+		scenegraph::SceneGraphNode *node = sceneGraphModelNode(result.nodeId);
+		if (node == nullptr) {
+			Log::warn("Can't apply background scene job result - node %i no longer exists", result.nodeId);
+			return false;
+		}
+		voxel::RawVolume *newVolume = result.releaseVolume();
+		if (!setNewVolume(result.nodeId, newVolume, true)) {
+			delete newVolume;
+			return false;
+		}
+		modified(result.nodeId, result.modifiedRegion);
+		return true;
+	}
+	case SceneJobType::ResizeVolume: {
+		scenegraph::SceneGraphNode *node = sceneGraphModelNode(result.nodeId);
+		if (node == nullptr) {
+			Log::warn("Can't apply background scene job result - node %i no longer exists", result.nodeId);
+			return false;
+		}
+		const voxel::Region oldRegion = node->region();
+		voxel::RawVolume *newVolume = result.releaseVolume();
+		if (!setNewVolume(result.nodeId, newVolume, false)) {
+			delete newVolume;
+			return false;
+		}
+		const voxel::Region &newRegion = newVolume->region();
+		const glm::ivec3 oldMins = oldRegion.getLowerCorner();
+		const glm::ivec3 oldMaxs = oldRegion.getUpperCorner();
+		const glm::ivec3 mins = newRegion.getLowerCorner();
+		const glm::ivec3 maxs = newRegion.getUpperCorner();
+		if (glm::all(glm::greaterThanEqual(maxs, oldMaxs)) && glm::all(glm::lessThanEqual(mins, oldMins))) {
+			modified(result.nodeId, result.modifiedRegion, SceneModifiedFlags::NoRegionUpdate);
+		} else {
+			modified(result.nodeId, result.modifiedRegion);
+		}
+		if (activeNode() == result.nodeId) {
+			const glm::ivec3 &refPos = referencePosition();
+			if (!newRegion.containsPoint(refPos)) {
+				setReferencePosition(newRegion.getCenter());
+			}
+		}
+		return true;
+	}
+	case SceneJobType::SplitObjects:
+	case SceneJobType::ColorToModel: {
+		memento::ScopedMementoGroup mementoGroup(_mementoHandler, "scenejob");
+		if (result.volume != nullptr) {
+			scenegraph::SceneGraphNode *node = sceneGraphModelNode(result.nodeId);
+			if (node == nullptr) {
+				return false;
+			}
+			voxel::RawVolume *newVolume = result.releaseVolume();
+			if (!setNewVolume(result.nodeId, newVolume, true)) {
+				delete newVolume;
+				return false;
+			}
+			modified(result.nodeId, result.modifiedRegion);
+		}
+		for (SceneJobNewNode &newNodeResult : result.newNodes) {
+			scenegraph::SceneGraphNode newNode(scenegraph::SceneGraphNodeType::Model);
+			if (scenegraph::SceneGraphNode *sourceNode = sceneGraphModelNode(newNodeResult.sourceNodeId)) {
+				scenegraph::copyNode(*sourceNode, newNode, false, true);
+			}
+			newNode.setName(newNodeResult.name);
+			newNode.setPalette(newNodeResult.palette);
+			newNode.setVolume(newNodeResult.releaseVolume());
+			moveNodeToSceneGraph(newNode, newNodeResult.parentNodeId);
+		}
+		return true;
+	}
+	case SceneJobType::SplatMerge: {
+		memento::ScopedMementoGroup mementoGroup(_mementoHandler, "splatmerge");
+		for (SceneJobVolumeResult &volumeResult : result.volumes) {
+			scenegraph::SceneGraphNode *node = sceneGraphModelNode(volumeResult.nodeId);
+			if (node == nullptr) {
+				continue;
+			}
+			voxel::RawVolume *newVolume = volumeResult.releaseVolume();
+			if (!setNewVolume(volumeResult.nodeId, newVolume, true)) {
+				delete newVolume;
+				continue;
+			}
+			modified(volumeResult.nodeId, volumeResult.modifiedRegion, SceneModifiedFlags::All);
+		}
+		if (result.removeSourceNode) {
+			nodeRemove(result.nodeId, false);
+		}
+		return !result.volumes.empty();
+	}
+	case SceneJobType::None:
+	case SceneJobType::Max:
+		break;
+	}
+	return false;
+}
+
+bool SceneManager::queueSceneJobForGroup(SceneJobType type) {
+	bool queued = false;
+	_sceneGraph.foreachGroup([&](int groupNodeId) {
+		scenegraph::SceneGraphNode *node = sceneGraphModelNode(groupNodeId);
+		if (node == nullptr || node->volume() == nullptr) {
+			return;
+		}
+		SceneJobRequest request;
+		request.type = type;
+		request.nodeId = groupNodeId;
+		request.voxel = _modifier.cursorVoxel();
+		request.overrideVoxels = _modifier.isMode(ModifierType::Override);
+		queued |= startSceneJob(core::move(request));
+	});
+	return queued;
+}
+
+void SceneManager::updateSceneJob() {
+	if (!_sceneJobFuture.ready()) {
+		return;
+	}
+
+	SceneJobResult result = _sceneJobFuture.get();
+	_sceneJobFuture = {};
+	const bool cancelled = _sceneJobCancelRequested;
+	_sceneJobType = SceneJobType::None;
+	_sceneJobProgress = -1.0f;
+	_sceneJobCancelRequested = false;
+	_sceneJobText = "";
+
+	if (cancelled) {
+		Log::debug("Discarded cancelled background scene job result");
+		startNextQueuedSceneJob();
+		return;
+	}
+	if (applySceneJobResult(core::move(result))) {
+		Log::debug("Applied background scene job");
+	}
+	startNextQueuedSceneJob();
 }
 
 void SceneManager::stopLocalServer() {
@@ -5123,6 +5942,8 @@ bool SceneManager::update(double nowSeconds) {
 		_loadingFuture = {};
 	}
 
+	updateSceneJob();
+
 	voxelgenerator::ScriptState state = _luaApi.update(nowSeconds);
 	if (state == voxelgenerator::ScriptState::Error) {
 		_sceneGraph.unregisterListener(&_luaApiListener);
@@ -5152,7 +5973,7 @@ bool SceneManager::update(double nowSeconds) {
 	scenegraph::FrameIndex frameIdx = currentFrame();
 	// TODO: Set to InvalidFrameIndex if transforms should not get applied
 	_camMovement.update(_nowSeconds, camera, _sceneGraph, frameIdx);
-	_modifierFacade.update(nowSeconds, camera);
+	_modifier.update(nowSeconds, camera);
 
 	_sceneGraph.updateTransforms();
 	updateDirtyRendererStates();
@@ -5160,7 +5981,7 @@ bool SceneManager::update(double nowSeconds) {
 	// Flush pending brush changes before mesh extraction to ensure the volume
 	// is in its final state. This prevents stale/partial mesh extraction that
 	// occurs when extractions read from a volume that's about to be modified.
-	_modifierFacade.flushPendingBrushChanges();
+	_modifier.flushPendingBrushChanges();
 
 	_sceneRenderer->update();
 	setGridResolution(_gridSize->intVal());
@@ -5225,7 +6046,7 @@ void SceneManager::shutdown() {
 	_sceneGraph.clear();
 
 	_camMovement.shutdown();
-	_modifierFacade.shutdown();
+	_modifier.shutdown();
 	_mementoHandler.unregisterListener(&_client);
 	_mementoHandler.unregisterListener(&_recorder);
 	_mementoHandler.shutdown();
@@ -5244,6 +6065,9 @@ void SceneManager::shutdown() {
 }
 
 void SceneManager::lsystemAbort() {
+	if (isLocked()) {
+		return;
+	}
 	if (_lsystemRunning) {
 		_mementoHandler.endGroup();
 		_lsystemRunning = false;
@@ -5253,6 +6077,9 @@ void SceneManager::lsystemAbort() {
 }
 
 void SceneManager::lsystem(const voxelgenerator::lsystem::LSystemConfig &conf) {
+	if (isLocked()) {
+		return;
+	}
 	lsystemAbort();
 	_lsystemConfig = conf;
 	_lsystemNodeId = activeNode();
@@ -5260,7 +6087,7 @@ void SceneManager::lsystem(const voxelgenerator::lsystem::LSystemConfig &conf) {
 	if (v == nullptr) {
 		return;
 	}
-	_lsystemVoxel = _modifierFacade.cursorVoxel();
+	_lsystemVoxel = _modifier.cursorVoxel();
 	voxelgenerator::lsystem::prepareState(_lsystemConfig, _lsystemState);
 	_lsystemRunning = true;
 	_mementoHandler.beginGroup("LSystem generation");
@@ -5276,7 +6103,7 @@ void SceneManager::stepLSystem() {
 		_mementoHandler.endGroup();
 		return;
 	}
-	voxel::RawVolumeWrapper wrapper = _modifierFacade.createRawVolumeWrapper(v);
+	voxel::RawVolumeWrapper wrapper = _modifier.createRawVolumeWrapper(v);
 	if (!voxelgenerator::lsystem::step(wrapper, _lsystemVoxel, _lsystemState, _lsystemExecState)) {
 		_lsystemRunning = false;
 		_mementoHandler.endGroup();
@@ -5292,20 +6119,20 @@ float SceneManager::lsystemProgress() const {
 }
 
 void SceneManager::setReferencePosition(const glm::ivec3& pos) {
-	_modifierFacade.setReferencePosition(pos);
+	_modifier.setReferencePosition(pos);
 }
 
 void SceneManager::moveCursor(int x, int y, int z) {
 	glm::ivec3 p = cursorPosition();
-	const int res = _modifierFacade.gridResolution();
+	const int res = _modifier.gridResolution();
 	p.x += x * res;
 	p.y += y * res;
 	p.z += z * res;
-	setCursorPosition(p, _modifierFacade.cursorFace(), true);
+	setCursorPosition(p, _modifier.cursorFace(), true);
 	_traceViaMouse = false;
 	if (const voxel::RawVolume *v = activeVolume()) {
 		const voxel::Voxel &voxel = v->voxel(cursorPosition());
-		_modifierFacade.setHitCursorVoxel(voxel);
+		_modifier.setHitCursorVoxel(voxel);
 	}
 }
 
@@ -5315,7 +6142,7 @@ void SceneManager::setCursorPosition(glm::ivec3 pos, voxel::FaceNames hitFace, b
 		return;
 	}
 
-	const int res = _modifierFacade.gridResolution();
+	const int res = _modifier.gridResolution();
 	const voxel::Region& region = v->region();
 	const glm::ivec3& mins = region.getLowerCorner();
 	const glm::ivec3 delta = pos - mins;
@@ -5329,7 +6156,7 @@ void SceneManager::setCursorPosition(glm::ivec3 pos, voxel::FaceNames hitFace, b
 		pos.z = mins.z + (delta.z / res) * res;
 	}
 
-	const math::Axis lockedAxis = _modifierFacade.lockedAxis();
+	const math::Axis lockedAxis = _modifier.lockedAxis();
 
 	// make a copy here - no reference - otherwise the comparison below won't
 	// do anything else than comparing the same values.
@@ -5349,26 +6176,18 @@ void SceneManager::setCursorPosition(glm::ivec3 pos, voxel::FaceNames hitFace, b
 	if (!region.containsPoint(pos)) {
 		pos = region.moveInto(pos.x, pos.y, pos.z);
 	}
-	_modifierFacade.setCursorPosition(pos, hitFace);
+	_modifier.setCursorPosition(pos, hitFace);
 	if (oldCursorPos == pos) {
 		return;
 	}
-	_dirtyRenderer |= DirtyRendererLockedAxis;
+
 }
 
 void SceneManager::updateDirtyRendererStates() {
-	if (_dirtyRenderer & DirtyRendererLockedAxis) {
-		_dirtyRenderer &= ~DirtyRendererLockedAxis;
-		_sceneRenderer->updateLockedPlanes(_modifierFacade.lockedAxis(), _sceneGraph, cursorPosition());
-	}
-	if (_dirtyRenderer & DirtyRendererGridRenderer) {
-		_dirtyRenderer &= ~DirtyRendererGridRenderer;
-		_sceneRenderer->updateGridRegion(_sceneGraph.node(activeNode()).region());
-	}
 }
 
 bool SceneManager::trace(bool sceneMode, bool force, const glm::mat4 &invModel) {
-	if (_modifierFacade.isLocked()) {
+	if (_modifier.isLocked()) {
 		return false;
 	}
 	if (sceneMode) {
@@ -5419,7 +6238,7 @@ int SceneManager::traceScene() {
 
 void SceneManager::updateCursor() {
 	voxel::FaceNames hitFace = _result.hitFace;
-	if (_modifierFacade.modifierTypeRequiresExistingVoxel()) {
+	if (_modifier.modifierTypeRequiresExistingVoxel()) {
 		if (_result.didHit) {
 			setCursorPosition(_result.hitVoxel, hitFace);
 		} else if (_result.validPreviousPosition) {
@@ -5433,12 +6252,12 @@ void SceneManager::updateCursor() {
 
 	const voxel::RawVolume *v = activeVolume();
 	if (_result.didHit && v != nullptr) {
-		_modifierFacade.setHitCursorVoxel(v->voxel(_result.hitVoxel));
+		_modifier.setHitCursorVoxel(v->voxel(_result.hitVoxel));
 	} else {
-		_modifierFacade.setHitCursorVoxel(voxel::Voxel());
+		_modifier.setHitCursorVoxel(voxel::Voxel());
 	}
 	if (v) {
-		_modifierFacade.setVoxelAtCursor(v->voxel(_modifierFacade.cursorPosition()));
+		_modifier.setVoxelAtCursor(v->voxel(_modifier.cursorPosition()));
 	}
 }
 
@@ -5485,7 +6304,7 @@ bool SceneManager::mouseRayTrace(bool force, const glm::mat4 &invModel) {
 	_result = {};
 	_result.direction = ray.direction;
 
-	const math::Axis lockedAxis = _modifierFacade.lockedAxis();
+	const math::Axis lockedAxis = _modifier.lockedAxis();
 	// TODO: we could optionally limit the raycast to the selection
 
 	const float offset = voxelutil::RaycastOffset;
@@ -5578,6 +6397,9 @@ bool SceneManager::nodeUpdatePivot(scenegraph::SceneGraphNode &node, const glm::
 }
 
 bool SceneManager::nodeGroupUpdatePivot(const glm::vec3 &pivot) {
+	if (isLocked()) {
+		return false;
+	}
 	nodeForeachGroup([&] (int groupNodeId) {
 		if (scenegraph::SceneGraphNode *node = sceneGraphNode(groupNodeId)) {
 			nodeUpdatePivot(*node, pivot);
@@ -5587,6 +6409,9 @@ bool SceneManager::nodeGroupUpdatePivot(const glm::vec3 &pivot) {
 }
 
 bool SceneManager::nodeUpdatePivot(int nodeId, const glm::vec3 &pivot) {
+	if (isLocked()) {
+		return false;
+	}
 	if (scenegraph::SceneGraphNode *node = sceneGraphNode(nodeId)) {
 		return nodeUpdatePivot(*node, pivot);
 	}
@@ -5608,6 +6433,9 @@ bool SceneManager::nodeUpdateKeyFrameInterpolation(scenegraph::SceneGraphNode &n
 }
 
 bool SceneManager::nodeUpdateKeyFrameInterpolation(int nodeId, scenegraph::KeyFrameIndex keyFrameIdx, scenegraph::InterpolationType interpolation) {
+	if (isLocked()) {
+		return false;
+	}
 	if (nodeId == InvalidNodeId) {
 		return false;
 	}
@@ -5643,6 +6471,9 @@ bool SceneManager::nodeTransformMirror(scenegraph::SceneGraphNode &node, scenegr
 }
 
 bool SceneManager::nodeTransformMirror(int nodeId, scenegraph::KeyFrameIndex keyFrameIdx, math::Axis axis) {
+	if (isLocked()) {
+		return false;
+	}
 	if (scenegraph::SceneGraphNode *node = sceneGraphNode(nodeId)) {
 		return nodeTransformMirror(*node, keyFrameIdx, axis);
 	}
@@ -5651,6 +6482,9 @@ bool SceneManager::nodeTransformMirror(int nodeId, scenegraph::KeyFrameIndex key
 
 bool SceneManager::nodeGroupUpdateTransform(const glm::vec3 &angles, const glm::vec3 &scale, const glm::vec3 &translation,
 											scenegraph::FrameIndex frameIdx, bool local) {
+	if (isLocked()) {
+		return false;
+	}
 	nodeForeachGroup([&] (int groupNodeId) {
 		if (scenegraph::SceneGraphNode *node = sceneGraphNode(groupNodeId)) {
 			const scenegraph::KeyFrameIndex keyFrameIdx = node->keyFrameForFrame(frameIdx);
@@ -5663,6 +6497,9 @@ bool SceneManager::nodeGroupUpdateTransform(const glm::vec3 &angles, const glm::
 }
 
 void SceneManager::nodeUpdatePartialVolume(scenegraph::SceneGraphNode &node, const voxel::RawVolume &volume) {
+	if (isLocked()) {
+		return;
+	}
 	if (!node.isAnyModelNode()) {
 		return;
 	}
@@ -5674,6 +6511,9 @@ void SceneManager::nodeUpdatePartialVolume(scenegraph::SceneGraphNode &node, con
 
 bool SceneManager::nodeUpdateTransform(int nodeId, const glm::vec3 &angles, const glm::vec3 &scale, const glm::vec3 &translation,
 							 scenegraph::KeyFrameIndex keyFrameIdx, bool local) {
+	if (isLocked()) {
+		return false;
+	}
 	if (scenegraph::SceneGraphNode *node = sceneGraphNode(nodeId)) {
 		return nodeUpdateTransform(*node, angles, scale, translation, keyFrameIdx, local);
 	}
@@ -5689,6 +6529,9 @@ bool SceneManager::nodeUpdateTransform(int nodeId, const glm::mat4 &matrix,
 }
 
 void SceneManager::nodeGroupResetTransform(scenegraph::KeyFrameIndex keyFrameIdx) {
+	if (isLocked()) {
+		return;
+	}
 	nodeForeachGroup([&] (int groupNodeId) {
 		if (scenegraph::SceneGraphNode *node = sceneGraphNode(groupNodeId)) {
 			nodeResetTransform(*node, keyFrameIdx);
@@ -5697,6 +6540,9 @@ void SceneManager::nodeGroupResetTransform(scenegraph::KeyFrameIndex keyFrameIdx
 }
 
 bool SceneManager::nodeResetTransform(int nodeId, scenegraph::KeyFrameIndex keyFrameIdx) {
+	if (isLocked()) {
+		return false;
+	}
 	if (scenegraph::SceneGraphNode *node = sceneGraphNode(nodeId)) {
 		return nodeResetTransform(*node, keyFrameIdx);
 	}
@@ -5739,6 +6585,9 @@ bool SceneManager::nodeAddKeyframe(scenegraph::SceneGraphNode &node, scenegraph:
 }
 
 void SceneManager::nodeGroupAddKeyFrame(scenegraph::FrameIndex frameIdx) {
+	if (isLocked()) {
+		return;
+	}
 	nodeForeachGroup([&](int groupNodeId) {
 		scenegraph::SceneGraphNode &node = _sceneGraph.node(groupNodeId);
 		nodeAddKeyframe(node, frameIdx);
@@ -5746,6 +6595,9 @@ void SceneManager::nodeGroupAddKeyFrame(scenegraph::FrameIndex frameIdx) {
 }
 
 bool SceneManager::nodeAddKeyFrame(int nodeId, scenegraph::FrameIndex frameIdx) {
+	if (isLocked()) {
+		return false;
+	}
 	if (scenegraph::SceneGraphNode *node = sceneGraphNode(nodeId)) {
 		return nodeAddKeyframe(*node, frameIdx);
 	}
@@ -5753,6 +6605,9 @@ bool SceneManager::nodeAddKeyFrame(int nodeId, scenegraph::FrameIndex frameIdx) 
 }
 
 bool SceneManager::nodeAllAddKeyFrames(scenegraph::FrameIndex frameIdx) {
+	if (isLocked()) {
+		return false;
+	}
 	for (auto iter = sceneGraph().beginAllModels(); iter != sceneGraph().end(); ++iter) {
 		scenegraph::SceneGraphNode &node = *iter;
 		if (!node.hasKeyFrame(frameIdx)) {
@@ -5763,6 +6618,9 @@ bool SceneManager::nodeAllAddKeyFrames(scenegraph::FrameIndex frameIdx) {
 }
 
 void SceneManager::nodeGroupRemoveKeyFrame(scenegraph::FrameIndex frameIdx) {
+	if (isLocked()) {
+		return;
+	}
 	nodeForeachGroup([&](int groupNodeId) {
 		scenegraph::SceneGraphNode &node = _sceneGraph.node(groupNodeId);
 		nodeRemoveKeyFrame(node, frameIdx);
@@ -5770,6 +6628,9 @@ void SceneManager::nodeGroupRemoveKeyFrame(scenegraph::FrameIndex frameIdx) {
 }
 
 bool SceneManager::nodeRemoveKeyFrame(int nodeId, scenegraph::FrameIndex frameIdx) {
+	if (isLocked()) {
+		return false;
+	}
 	if (scenegraph::SceneGraphNode *node = sceneGraphNode(nodeId)) {
 		return nodeRemoveKeyFrame(*node, frameIdx);
 	}
@@ -5777,6 +6638,9 @@ bool SceneManager::nodeRemoveKeyFrame(int nodeId, scenegraph::FrameIndex frameId
 }
 
 bool SceneManager::nodeRemoveKeyFrameByIndex(int nodeId, scenegraph::KeyFrameIndex keyFrameIdx) {
+	if (isLocked()) {
+		return false;
+	}
 	if (scenegraph::SceneGraphNode *node = sceneGraphNode(nodeId)) {
 		return nodeRemoveKeyFrameByIndex(*node, keyFrameIdx);
 	}
@@ -5820,6 +6684,9 @@ bool SceneManager::nodeShiftAllKeyframes(scenegraph::SceneGraphNode &node, const
 }
 
 bool SceneManager::nodeShiftAllKeyframes(int nodeId, const glm::vec3 &shift) {
+	if (isLocked()) {
+		return false;
+	}
 	if (scenegraph::SceneGraphNode *node = sceneGraphNode(nodeId)) {
 		return nodeShiftAllKeyframes(*node, shift);
 	}
@@ -5903,6 +6770,9 @@ bool SceneManager::nodeResetTransform(scenegraph::SceneGraphNode &node, scenegra
 }
 
 int SceneManager::nodeReference(int nodeId) {
+	if (isLocked()) {
+		return InvalidNodeId;
+	}
 	if (scenegraph::SceneGraphNode *node = sceneGraphNode(nodeId)) {
 		if (node->isReferenceNode()) {
 			return nodeReference(node->reference());
@@ -5913,6 +6783,9 @@ int SceneManager::nodeReference(int nodeId) {
 }
 
 bool SceneManager::nodeDuplicate(int nodeId, int *newNodeId) {
+	if (isLocked()) {
+		return false;
+	}
 	if (nodeId == InvalidNodeId) {
 		return false;
 	}
@@ -5924,6 +6797,9 @@ bool SceneManager::nodeDuplicate(int nodeId, int *newNodeId) {
 }
 
 bool SceneManager::nodeMove(int sourceNodeId, int targetNodeId, scenegraph::NodeMoveFlag flags) {
+	if (isLocked()) {
+		return false;
+	}
 	if (_sceneGraph.changeParent(sourceNodeId, targetNodeId, flags)) {
 		scenegraph::SceneGraphNode *node = sceneGraphNode(sourceNodeId);
 		core_assert(node != nullptr);
@@ -5935,6 +6811,9 @@ bool SceneManager::nodeMove(int sourceNodeId, int targetNodeId, scenegraph::Node
 }
 
 bool SceneManager::nodeSetProperty(int nodeId, const core::String &key, const core::String &value) {
+	if (isLocked()) {
+		return false;
+	}
 	if (scenegraph::SceneGraphNode *node = sceneGraphNode(nodeId)) {
 		if (node->setProperty(key, value)) {
 			_mementoHandler.markNodePropertyChange(_sceneGraph, *node);
@@ -5945,6 +6824,9 @@ bool SceneManager::nodeSetProperty(int nodeId, const core::String &key, const co
 }
 
 bool SceneManager::nodeRemoveProperty(int nodeId, const core::String &key) {
+	if (isLocked()) {
+		return false;
+	}
 	if (scenegraph::SceneGraphNode *node = sceneGraphNode(nodeId)) {
 		if (node->properties().remove(key)) {
 			_mementoHandler.markNodePropertyChange(_sceneGraph, *node);
@@ -5955,6 +6837,9 @@ bool SceneManager::nodeRemoveProperty(int nodeId, const core::String &key) {
 }
 
 bool SceneManager::nodeSetIKConstraint(int nodeId, const scenegraph::IKConstraint &constraint) {
+	if (isLocked()) {
+		return false;
+	}
 	if (scenegraph::SceneGraphNode *node = sceneGraphNode(nodeId)) {
 		node->setIkConstraint(constraint);
 		_mementoHandler.markIKConstraintChange(_sceneGraph, *node);
@@ -5965,6 +6850,9 @@ bool SceneManager::nodeSetIKConstraint(int nodeId, const scenegraph::IKConstrain
 }
 
 bool SceneManager::nodeRemoveIKConstraint(int nodeId) {
+	if (isLocked()) {
+		return false;
+	}
 	if (scenegraph::SceneGraphNode *node = sceneGraphNode(nodeId)) {
 		if (!node->hasIKConstraint()) {
 			return false;
@@ -5978,6 +6866,9 @@ bool SceneManager::nodeRemoveIKConstraint(int nodeId) {
 }
 
 bool SceneManager::nodeRename(int nodeId, const core::String &name) {
+	if (isLocked()) {
+		return false;
+	}
 	if (scenegraph::SceneGraphNode *node = sceneGraphNode(nodeId)) {
 		return nodeRename(*node, name);
 	}
@@ -6038,6 +6929,9 @@ bool SceneManager::nodeRename(scenegraph::SceneGraphNode &node, const core::Stri
 }
 
 bool SceneManager::nodeSetVisible(int nodeId, bool visible) {
+	if (isLocked()) {
+		return false;
+	}
 	if (scenegraph::SceneGraphNode *node = sceneGraphNode(nodeId)) {
 		node->setVisible(visible);
 		if (node->type() == scenegraph::SceneGraphNodeType::Group) {
@@ -6045,22 +6939,28 @@ bool SceneManager::nodeSetVisible(int nodeId, bool visible) {
 				childNode.setVisible(visible);
 			});
 		}
-		_sceneRenderer->markDirty();
+		markDirty();
 		return true;
 	}
 	return false;
 }
 
 bool SceneManager::nodeSetLocked(int nodeId, bool locked) {
+	if (isLocked()) {
+		return false;
+	}
 	if (scenegraph::SceneGraphNode *node = sceneGraphNode(nodeId)) {
 		node->setLocked(locked);
-		_sceneRenderer->markDirty();
+		markDirty();
 		return true;
 	}
 	return false;
 }
 
 bool SceneManager::nodeRemove(int nodeId, bool recursive) {
+	if (isLocked()) {
+		return false;
+	}
 	if (scenegraph::SceneGraphNode* node = sceneGraphNode(nodeId)) {
 		return nodeRemove(*node, recursive);
 	}
@@ -6079,6 +6979,9 @@ bool SceneManager::exceedsMaxSuggestedVolumeSize(const voxel::Region &region) co
 }
 
 void SceneManager::markDirty() {
+	if (isLocked()) {
+		return;
+	}
 	_sceneGraph.markMaxFramesDirty();
 	// we only autosave if the volumes in the scene graph are not exceeding the
 	// max suggested voxel count
@@ -6181,6 +7084,9 @@ bool SceneManager::nodeUnreference(scenegraph::SceneGraphNode &node) {
 }
 
 bool SceneManager::nodeUnreference(int nodeId) {
+	if (isLocked()) {
+		return false;
+	}
 	if (scenegraph::SceneGraphNode* node = sceneGraphNode(nodeId)) {
 		return nodeUnreference(*node);
 	}
@@ -6194,7 +7100,7 @@ bool SceneManager::nodeReduceColors(scenegraph::SceneGraphNode &node, const core
 	}
 	palette::Palette &palette = node.palette();
 	const voxel::Voxel replacementVoxel = voxel::createVoxel(palette, targetPalIdx);
-	voxel::RawVolumeWrapper wrapper = _modifierFacade.createRawVolumeWrapper(v);
+	voxel::RawVolumeWrapper wrapper = _modifier.createRawVolumeWrapper(v);
 	auto func = [&wrapper, &srcPalIdx, replacementVoxel](int x, int y, int z, const voxel::Voxel &voxel) {
 		for (uint8_t srcPal : srcPalIdx) {
 			if (voxel.getColor() == srcPal) {
@@ -6220,14 +7126,14 @@ bool SceneManager::nodeRemoveColor(scenegraph::SceneGraphNode &node, uint8_t pal
 		palette.markSave();
 		const voxel::Voxel replacementVoxel = voxel::createVoxel(palette, replacement);
 		_mementoHandler.markPaletteChange(_sceneGraph, node);
-		voxel::RawVolumeWrapper wrapper = _modifierFacade.createRawVolumeWrapper(v);
+		voxel::RawVolumeWrapper wrapper = _modifier.createRawVolumeWrapper(v);
 		auto func = [&wrapper, replacementVoxel](int x, int y, int z, const voxel::Voxel &) {
 			wrapper.setVoxel(x, y, z, replacementVoxel);
 		};
 		voxelutil::visitVolumeParallel(wrapper, func, voxelutil::VisitVoxelColor(palIdx));
 		modified(node.id(), wrapper.dirtyRegion());
-		if (_modifierFacade.cursorVoxel().getColor() == palIdx) {
-			_modifierFacade.setCursorVoxel(replacementVoxel);
+		if (_modifier.cursorVoxel().getColor() == palIdx) {
+			_modifier.setCursorVoxel(replacementVoxel);
 		}
 		return true;
 	}
@@ -6235,6 +7141,9 @@ bool SceneManager::nodeRemoveColor(scenegraph::SceneGraphNode &node, uint8_t pal
 }
 
 bool SceneManager::nodeReduceColors(int nodeId, const core::Buffer<uint8_t> &srcPalIdx, uint8_t targetPalIdx) {
+	if (isLocked()) {
+		return false;
+	}
 	if (scenegraph::SceneGraphNode *node = sceneGraphNode(nodeId)) {
 		return nodeReduceColors(*node, srcPalIdx, targetPalIdx);
 	}
@@ -6317,7 +7226,7 @@ bool SceneManager::nodeQuantizeColors(scenegraph::SceneGraphNode &node, const co
 		if (!srcPalIdx.empty()) {
 			// remap voxels from the other indices to the keeper
 			const voxel::Voxel replacementVoxel = voxel::createVoxel(palette, keeperPalIdx);
-			voxel::RawVolumeWrapper wrapper = _modifierFacade.createRawVolumeWrapper(v);
+			voxel::RawVolumeWrapper wrapper = _modifier.createRawVolumeWrapper(v);
 			auto func = [&wrapper, &srcPalIdx, replacementVoxel](int x, int y, int z, const voxel::Voxel &voxel) {
 				for (uint8_t srcPal : srcPalIdx) {
 					if (voxel.getColor() == srcPal) {
@@ -6342,6 +7251,9 @@ bool SceneManager::nodeQuantizeColors(scenegraph::SceneGraphNode &node, const co
 }
 
 bool SceneManager::nodeQuantizeColors(int nodeId, const core::Buffer<uint8_t> &selectedIndices, int targetColorCount) {
+	if (isLocked()) {
+		return false;
+	}
 	if (scenegraph::SceneGraphNode *node = sceneGraphNode(nodeId)) {
 		return nodeQuantizeColors(*node, selectedIndices, targetColorCount);
 	}
@@ -6349,6 +7261,9 @@ bool SceneManager::nodeQuantizeColors(int nodeId, const core::Buffer<uint8_t> &s
 }
 
 bool SceneManager::nodeRemoveColor(int nodeId, uint8_t palIdx) {
+	if (isLocked()) {
+		return false;
+	}
 	if (scenegraph::SceneGraphNode *node = sceneGraphNode(nodeId)) {
 		return nodeRemoveColor(*node, palIdx);
 	}
@@ -6364,6 +7279,9 @@ bool SceneManager::nodeDuplicateColor(scenegraph::SceneGraphNode &node, uint8_t 
 }
 
 bool SceneManager::nodeDuplicateColor(int nodeId, uint8_t palIdx) {
+	if (isLocked()) {
+		return false;
+	}
 	if (scenegraph::SceneGraphNode *node = sceneGraphNode(nodeId)) {
 		return nodeDuplicateColor(*node, palIdx);
 	}
@@ -6393,6 +7311,9 @@ bool SceneManager::nodeResetMaterial(scenegraph::SceneGraphNode &node, uint8_t p
 }
 
 bool SceneManager::nodeResetMaterial(int nodeId, uint8_t palIdx) {
+	if (isLocked()) {
+		return false;
+	}
 	if (scenegraph::SceneGraphNode *node = sceneGraphNode(nodeId)) {
 		return nodeResetMaterial(*node, palIdx);
 	}
@@ -6400,6 +7321,9 @@ bool SceneManager::nodeResetMaterial(int nodeId, uint8_t palIdx) {
 }
 
 bool SceneManager::nodeRemoveAlpha(int nodeId, uint8_t palIdx) {
+	if (isLocked()) {
+		return false;
+	}
 	if (scenegraph::SceneGraphNode *node = sceneGraphNode(nodeId)) {
 		return nodeRemoveAlpha(*node, palIdx);
 	}
@@ -6415,6 +7339,9 @@ bool SceneManager::nodeSetMaterial(scenegraph::SceneGraphNode &node, uint8_t pal
 }
 
 bool SceneManager::nodeSetMaterial(int nodeId, uint8_t palIdx, palette::MaterialProperty material, float value) {
+	if (isLocked()) {
+		return false;
+	}
 	if (scenegraph::SceneGraphNode *node = sceneGraphNode(nodeId)) {
 		return nodeSetMaterial(*node, palIdx, material, value);
 	}
@@ -6440,6 +7367,9 @@ bool SceneManager::nodeSetColor(scenegraph::SceneGraphNode &node, uint8_t palIdx
 }
 
 bool SceneManager::nodeSetColor(int nodeId, uint8_t palIdx, const color::RGBA &color) {
+	if (isLocked()) {
+		return false;
+	}
 	if (scenegraph::SceneGraphNode *node = sceneGraphNode(nodeId)) {
 		return nodeSetColor(*node, palIdx, color);
 	}
@@ -6452,12 +7382,18 @@ void SceneManager::nodeForeachGroup(const core::Function<void(int)>& f) {
 }
 
 void SceneManager::nodeGroupRemoveNormals() {
+	if (isLocked()) {
+		return;
+	}
 	nodeForeachGroup([&] (int groupNodeId) {
 		nodeRemoveNormals(groupNodeId);
 	});
 }
 
 bool SceneManager::nodeRemoveNormals(int nodeId) {
+	if (isLocked()) {
+		return false;
+	}
 	if (scenegraph::SceneGraphNode *node = sceneGraphNode(nodeId)) {
 		if (!node->isAnyModelNode()) {
 			return false;
@@ -6466,7 +7402,7 @@ bool SceneManager::nodeRemoveNormals(int nodeId) {
 		if (v == nullptr) {
 			return false;
 		}
-		voxel::RawVolumeWrapper wrapper = _modifierFacade.createRawVolumeWrapper(v);
+		voxel::RawVolumeWrapper wrapper = _modifier.createRawVolumeWrapper(v);
 		auto func = [&wrapper](int x, int y, int z, const voxel::Voxel &voxel) {
 			if (voxel.getNormal() == NO_NORMAL) {
 				return;
@@ -6483,6 +7419,9 @@ bool SceneManager::nodeRemoveNormals(int nodeId) {
 }
 
 bool SceneManager::nodeActivate(int nodeId) {
+	if (isLocked()) {
+		return false;
+	}
 	if (nodeId == InvalidNodeId) {
 		return false;
 	}
@@ -6495,7 +7434,7 @@ bool SceneManager::nodeActivate(int nodeId) {
 	}
 	Log::debug("Activate node %i", nodeId);
 	// cancel any in-progress brush operation before switching nodes
-	_modifierFacade.abort();
+	_modifier.abort();
 	const scenegraph::SceneGraphNode &node = _sceneGraph.node(nodeId);
 	// a node switch will disable the locked axis as the positions might have changed anyway
 	modifier().setLockedAxis(math::Axis::X | math::Axis::Y | math::Axis::Z, true);
@@ -6503,14 +7442,13 @@ bool SceneManager::nodeActivate(int nodeId) {
 	const palette::Palette &palette = node.palette();
 	for (int i = 0; i < palette.colorCount(); ++i) {
 		if (palette.color(i).a > 0) {
-			_modifierFacade.setCursorVoxel(voxel::createVoxel(palette, i));
+			_modifier.setCursorVoxel(voxel::createVoxel(palette, i));
 			break;
 		}
 	}
 
 	if (node.isModelNode()) {
 		const voxel::Region& region = node.region();
-		_dirtyRenderer |= DirtyRendererGridRenderer;
 		if (!region.containsPoint(referencePosition())) {
 			const glm::ivec3 pivot = region.getLowerCorner() + glm::ivec3(node.pivot() * glm::vec3(region.getDimensionsInVoxels()));
 			setReferencePosition(glm::ivec3(pivot));

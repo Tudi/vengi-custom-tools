@@ -48,6 +48,8 @@
 #include "voxelformat/private/mesh/PLYFormat.h"
 #include "voxelformat/private/mesh/STLFormat.h"
 #include "voxelformat/private/mesh/lego/LDrawFormat.h"
+#include "voxelformat/private/mesh/lego/LXFFormat.h"
+#include "voxelformat/private/mesh/lego/StudioIOFormat.h"
 #include "voxelformat/private/mesh/gis/GMLFormat.h"
 #include "voxelformat/private/mesh/gis/OSMFormat.h"
 #include "voxelformat/private/mesh/quake/MD2Format.h"
@@ -56,6 +58,7 @@
 #include "voxelformat/private/mesh/quake/MapFormat.h"
 #include "voxelformat/private/mesh/quake/QuakeBSPFormat.h"
 #include "voxelformat/private/minecraft/DatFormat.h"
+#include "voxelformat/private/minecraft/LuantiWorldEditFormat.h"
 #include "voxelformat/private/minecraft/MCRFormat.h"
 #include "voxelformat/private/minecraft/MCWorldFormat.h"
 #include "voxelformat/private/minecraft/MTSFormat.h"
@@ -128,10 +131,13 @@ const io::FormatDescription *voxelFormats() {
 												 AnimaToonFormat::format(),
 												 VBXFormat::format(),
 												 TeardownFormat::format(),
+												 LuantiWorldEditFormat::format(),
 												 OBJFormat::format(),
 												 GLTFFormat::format(),
 												 STLFormat::format(),
 												 LDrawFormat::format(),
+												 LXFFormat::format(),
+												 StudioIOFormat::format(),
 												 PLYFormat::format(),
 												 GMLFormat::format(),
 												 OSMFormat::format(),
@@ -262,6 +268,10 @@ static core::SharedPtr<Format> getFormat(const io::FormatDescription &desc, uint
 			return core::make_shared<STLFormat>();
 		} else if (io::isA(LDrawFormat::format(), desc, ext, magic)) {
 			return core::make_shared<LDrawFormat>();
+		} else if (io::isA(LXFFormat::format(), desc, ext, magic)) {
+			return core::make_shared<LXFFormat>();
+		} else if (io::isA(StudioIOFormat::format(), desc, ext, magic)) {
+			return core::make_shared<StudioIOFormat>();
 		} else if (io::isA(QuakeBSPFormat::formatUFOAI(), desc, ext, magic) || isA(QuakeBSPFormat::formatQuake1(), desc, ext, magic)) {
 			return core::make_shared<QuakeBSPFormat>();
 		} else if (io::isA(MapFormat::format(), desc, ext, magic)) {
@@ -270,6 +280,8 @@ static core::SharedPtr<Format> getFormat(const io::FormatDescription &desc, uint
 			return core::make_shared<PLYFormat>();
 		} else if (io::isA(TeardownFormat::format(), desc, ext, magic)) {
 			return core::make_shared<TeardownFormat>();
+		} else if (io::isA(LuantiWorldEditFormat::format(), desc, ext, magic)) {
+			return core::make_shared<LuantiWorldEditFormat>();
 		} else if (io::isA(FBXFormat::format(), desc, ext, magic)) {
 			return core::make_shared<FBXFormat>();
 		} else if (io::isA(Autodesk3DSFormat::format(), desc, ext, magic)) {

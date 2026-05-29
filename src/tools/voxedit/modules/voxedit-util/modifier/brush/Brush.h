@@ -130,7 +130,7 @@ protected:
 	 * target volume boundaries. When enabled, the cursor position may be adjusted
 	 * to prevent the brush from extending outside the volume.
 	 */
-	bool _brushClamping = false;
+	bool _clampToVolume = false;
 
 	Brush(BrushType brushType, ModifierType defaultModifier = ModifierType::Place,
 		  ModifierType supportedModifiers = (ModifierType::Place | ModifierType::Erase | ModifierType::Override))
@@ -317,6 +317,16 @@ public:
 		return false;
 	}
 
+	/**
+	 * @brief Whether this brush needs its pending changes flushed to the real
+	 * volume every frame (e.g. TransformBrush, ExtrudeBrush, SculptBrush).
+	 * Brushes that accumulate state for a deferred commit (e.g. LineBrush in
+	 * bezier mode) should return false.
+	 */
+	virtual bool needsPerFrameFlush() const {
+		return hasPendingChanges();
+	}
+
 	virtual bool isSimplePreview() const {
 		return false;
 	}
@@ -434,14 +444,14 @@ public:
 	 * the target volume boundaries. The cursor position may be modified to
 	 * achieve this.
 	 *
-	 * @param[in] brushClamping True to enable clamping
+	 * @param[in] clampToVolume True to enable clamping
 	 */
-	void setBrushClamping(bool brushClamping);
+	void setClampToVolume(bool clampToVolume);
 
 	/**
 	 * @return True if brush clamping is enabled
 	 */
-	bool brushClamping() const;
+	bool clampToVolume() const;
 
 	/**
 	 * @brief Determine whether the brush should be rendered
@@ -471,7 +481,7 @@ public:
 	 * @sa setMirrorAxis() - enables mirroring
 	 * @sa mirrorAxis() - queries the current mirror state
 	 */
-	bool getMirrorAABB(glm::ivec3 &mins, glm::ivec3 &maxs) const;
+	bool getMirrorBox(glm::ivec3 &mins, glm::ivec3 &maxs) const;
 
 	/**
 	 * @brief Set or change the mirror axis and position
@@ -483,7 +493,7 @@ public:
 	 * @param[in] mirrorPos The position of the mirror plane
 	 * @return True if the mirror state changed
 	 *
-	 * @sa getMirrorAABB() - calculates mirrored region bounds
+	 * @sa getMirrorBox() - calculates mirrored region bounds
 	 * @sa mirrorAxis() - queries current axis
 	 * @sa mirrorPos() - queries current position
 	 */
