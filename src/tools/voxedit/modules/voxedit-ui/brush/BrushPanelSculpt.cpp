@@ -349,6 +349,13 @@ void BrushPanelSculpt::update(BrushPanelContext &ctx, command::CommandExecutionL
 		if (ImGui::Checkbox(_("Extend only"), &extendOnly)) {
 			brush.setExtendOnly(extendOnly);
 		}
+		ImGui::TooltipTextUnformatted(_("Only place voxels adjacent to existing solid voxels"));
+		bool removeOnly = brush.removeOnly();
+		if (ImGui::Checkbox(_("Remove only"), &removeOnly)) {
+			brush.setRemoveOnly(removeOnly);
+		}
+		ImGui::TooltipTextUnformatted(
+			_("Do not place any voxels - only carve away the voxels above the plane (set the Remove above depth)"));
 		int removeDepth = brush.removeAboveDepth();
 		ImGui::TextUnformatted(_("Remove above"));
 		if (ImGui::Button("-##remove_depth")) {

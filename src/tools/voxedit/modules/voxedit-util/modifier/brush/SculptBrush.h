@@ -96,6 +96,8 @@ private:
 	// ExtendPlane parameters
 	int _removeAboveDepth = 0;
 	bool _extendOnly = true;
+	/** When set, ExtendPlane only removes voxels above the plane and never places new ones. */
+	bool _removeOnly = false;
 	int _brushRadius = 3;
 	float _planeGradU = 0.0f;
 	float _planeGradV = 0.0f;
@@ -228,11 +230,13 @@ public:
 
 	// ExtendPlane accessors
 	static constexpr int MaxBrushRadius = 32;
-	static constexpr int MaxRemoveAboveDepth = 32;
+	static constexpr int MaxRemoveAboveDepth = 64;
 	int removeAboveDepth() const;
 	void setRemoveAboveDepth(int depth);
 	bool extendOnly() const;
 	void setExtendOnly(bool extend);
+	bool removeOnly() const;
+	void setRemoveOnly(bool removeOnly);
 	int brushRadius() const;
 	void setBrushRadius(int radius);
 	bool planeFitted() const;
@@ -504,6 +508,14 @@ inline bool SculptBrush::extendOnly() const {
 
 inline void SculptBrush::setExtendOnly(bool extend) {
 	_extendOnly = extend;
+}
+
+inline bool SculptBrush::removeOnly() const {
+	return _removeOnly;
+}
+
+inline void SculptBrush::setRemoveOnly(bool removeOnly) {
+	_removeOnly = removeOnly;
 }
 
 inline int SculptBrush::brushRadius() const {

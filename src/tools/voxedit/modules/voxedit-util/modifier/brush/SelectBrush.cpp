@@ -11,7 +11,7 @@ namespace voxedit {
 SelectBrush::SelectBrush(SceneManager *sceneManager)
 	: Super(BrushType::Select, ModifierType::Override, ModifierType::Override | ModifierType::Erase),
 	  _sceneManager(sceneManager), _lassoStrategy(sceneManager), _polygonLassoStrategy(sceneManager),
-	  _scriptStrategy(sceneManager) {
+	  _rectangleStrategy(sceneManager), _lineStrategy(sceneManager), _scriptStrategy(sceneManager) {
 	setClampToVolume(true);
 	_strategies[(int)SelectMode::All] = &_selectAll;
 	_strategies[(int)SelectMode::Surface] = &_selectSurface;
@@ -20,6 +20,8 @@ SelectBrush::SelectBrush(SceneManager *sceneManager)
 	_strategies[(int)SelectMode::Connected] = &_selectConnected;
 	_strategies[(int)SelectMode::FlatSurface] = &_flatSurfaceStrategy;
 	_strategies[(int)SelectMode::Box3D] = &_box3DStrategy;
+	_strategies[(int)SelectMode::Rectangle] = &_rectangleStrategy;
+	_strategies[(int)SelectMode::Line] = &_lineStrategy;
 	_strategies[(int)SelectMode::Circle] = &_circleStrategy;
 	_strategies[(int)SelectMode::Lasso] = &_lassoStrategy;
 	_strategies[(int)SelectMode::PolygonLasso] = &_polygonLassoStrategy;
@@ -67,24 +69,16 @@ bool SelectBrush::hasPendingChanges() const {
 	if (_selectMode == SelectMode::Paint) {
 		return _paintStrategy.hasPendingChanges();
 	}
-	if (_selectMode == SelectMode::PolygonLasso) {
-		return _polygonLassoStrategy.hasPendingChanges();
-	}
 	return Super::hasPendingChanges();
 }
 
 voxel::Region SelectBrush::revertChanges(voxel::RawVolume *volume) {
-	if (_selectMode == SelectMode::PolygonLasso) {
-		return _polygonLassoStrategy.revertChanges(volume);
-	}
 	return Super::revertChanges(volume);
 }
 
 bool SelectBrush::onDeactivated() {
-	// A mid-accumulation PolygonLasso has FlagOutline marks on the real volume (edge
-	// and rubber-band lines). Revert them via SceneManager so we get a clean dirty
-	// region; otherwise the orphaned marks would stay as a phantom selection after
-	// the brush switch.
+	// Discard a mid-accumulation PolygonLasso when switching away. The polygon is only a
+	// viewport overlay (no volume marks), so this just clears the in-progress vertex list.
 	if (_selectMode == SelectMode::PolygonLasso && _polygonLassoStrategy.accumulating() && _sceneManager != nullptr) {
 		_sceneManager->selectionCancelLasso(_sceneManager->sceneGraph().activeNode());
 	}
@@ -107,11 +101,29 @@ voxel::Region SelectBrush::consumePendingUndoRegion() {
 void SelectBrush::update(const BrushContext &ctx, double nowSeconds) {
 	Super::update(ctx, nowSeconds);
 	activeStrategy()->update(ctx, nowSeconds);
-	// During polygon-lasso accumulation _aabbMode is false but the brush stays active
-	// via active(). Trigger preview refresh when the cursor moves so the rubber-band
-	// segment updates in real time.
-	if (_selectMode == SelectMode::PolygonLasso && _polygonLassoStrategy.accumulating()) {
-		markDirty();
+	// The polygon-lasso rubber band is now a viewport overlay (BrushGizmo_WorldPolyline)
+	// rebuilt in PolygonLasso::update(), so no per-frame volume flush is needed here.
+
+	// Feed the line gizmo its live endpoints while dragging. This is the preview for the Line
+	// mode (a cheap world-space line) instead of a preview volume that would vanish past the
+	// preview-size cap for long lines.
+	if (_selectMode == SelectMode::Line) {
+		if (Super::active()) {
+			const select::AABBBrushState state = buildState(ctx);
+			_lineStrategy.setPreview(state.aabbFirstPos, state.cursorPosition);
+		} else {
+			_lineStrategy.clearPreview();
+		}
+	}
+
+	// Rectangle previews its outline as a world-space polyline gizmo (no preview-size cap).
+	if (_selectMode == SelectMode::Rectangle) {
+		if (Super::active()) {
+			const select::AABBBrushState state = buildState(ctx);
+			_rectangleStrategy.setPreview(Super::calcRegion(ctx), state.aabbFace);
+		} else {
+			_rectangleStrategy.clearPreview();
+		}
 	}
 }
 

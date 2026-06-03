@@ -476,6 +476,58 @@ TEST_F(SculptBrushTest, testExtendPlaneRemoveAbove) {
 	brush.shutdown();
 }
 
+TEST_F(SculptBrushTest, testExtendPlaneRemoveOnly) {
+	// Remove-only: the brush must never place voxels, only carve away the ones above the plane.
+	voxel::RawVolume volume(voxel::Region(-10, 10));
+
+	for (int x = -2; x <= 2; ++x) {
+		for (int z = -2; z <= 2; ++z) {
+			volume.setVoxel(x, 0, z, selectedVoxel());
+		}
+	}
+	// Stack above at x=0
+	volume.setVoxel(0, 1, 0, voxel::createVoxel(voxel::VoxelType::Generic, 5));
+	volume.setVoxel(0, 2, 0, voxel::createVoxel(voxel::VoxelType::Generic, 5));
+	volume.setVoxel(0, 5, 0, voxel::createVoxel(voxel::VoxelType::Generic, 5));
+
+	scenegraph::SceneGraphNode node(scenegraph::SceneGraphNodeType::Model);
+	node.setUnownedVolume(&volume);
+
+	SculptBrush brush;
+	ASSERT_TRUE(brush.init());
+	brush.onActivated();
+	brush.setSculptMode(SculptMode::ExtendPlane);
+	brush.setBrushRadius(1);
+	brush.setRemoveAboveDepth(2);
+	brush.setRemoveOnly(true);
+
+	BrushContext ctx;
+	ctx.targetVolumeRegion = volume.region();
+	ctx.cursorFace = voxel::FaceNames::PositiveY;
+
+	// First click at (0,0,0): fits the plane and carves the stack above (within depth=2).
+	ASSERT_TRUE(brush.beginBrush(ctx));
+	executeSculpt(brush, node, ctx);
+	brush.endBrush(ctx);
+	ASSERT_TRUE(brush.planeFitted());
+
+	EXPECT_TRUE(voxel::isAir(volume.voxel(0, 1, 0).getMaterial())) << "Voxel above the plane should be removed";
+	EXPECT_TRUE(voxel::isAir(volume.voxel(0, 2, 0).getMaterial())) << "Voxel above the plane should be removed";
+	EXPECT_TRUE(voxel::isBlocked(volume.voxel(0, 5, 0).getMaterial())) << "Voxel beyond depth=2 should survive";
+	EXPECT_TRUE(voxel::isBlocked(volume.voxel(0, 0, 0).getMaterial())) << "The plane surface itself must NOT be removed";
+
+	// Paint over air at the plane height where extend would normally place a voxel.
+	ctx.cursorPosition = glm::ivec3(3, 0, 0);
+	ASSERT_TRUE(brush.beginBrush(ctx));
+	executeSculpt(brush, node, ctx);
+	brush.endBrush(ctx);
+
+	EXPECT_TRUE(voxel::isAir(volume.voxel(3, 0, 0).getMaterial()))
+		<< "Remove-only must not place any voxel where extend normally would";
+
+	brush.shutdown();
+}
+
 TEST_F(SculptBrushTest, testExtendPlaneNoPlaneFitted) {
 	// Without clicking a face, painting should be a no-op
 	voxel::RawVolume volume(voxel::Region(-10, 10));

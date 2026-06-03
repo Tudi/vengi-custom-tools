@@ -100,6 +100,7 @@ void SculptBrush::reset() {
 	_smoothWallFillHoles = true;
 	_removeAboveDepth = 0;
 	_extendOnly = true;
+	_removeOnly = false;
 	_brushRadius = 3;
 	_planeFitted = false;
 	_planeGradU = 0.0f;
@@ -889,8 +890,10 @@ void SculptBrush::paintExtendPlane(ModifierVolumeWrapper &wrapper, const BrushCo
 				}
 			}
 
-			// Place voxels at predicted plane height
-			if (canPlace) {
+			// Place voxels at predicted plane height. In remove-only mode the brush never
+			// places anything - it just carves away the voxels above the plane (handled by
+			// the remove-above pass above), so skip the placement entirely.
+			if (canPlace && !_removeOnly) {
 				for (int h = loH; h <= hiH; ++h) {
 					glm::ivec3 pos;
 					pos[_planeUAxis] = u;

@@ -2669,6 +2669,171 @@ TEST_F(SceneManagerTest, testMergeActiveToBackgroundExpandsNode) {
 	EXPECT_FALSE(voxel::isAir(resultVol->voxel(8, 8, 8).getMaterial()));
 }
 
+// Regression: the active node must overwrite (including carving air into) an overlapping
+// background node even when that node is NOT aligned to the chunk grid. Matching background
+// nodes by grid-cell origin equality missed non-aligned nodes, so the source carved air into
+// a freshly created solid-only node instead of the real overlapping node, and air never
+// appeared to overwrite the destination.
+TEST_F(SceneManagerTest, testMergeActiveToBackgroundCarvesNonGridAlignedNode) {
+	// Use the smallest allowed chunk grid (32) and straddle a cell boundary.
+	util::ScopedVarChange chunk(cfg::VoxEditMaxSuggestedVolumeSize, "32");
+
+	// Background node spans several 32^3 cells; its lower corner is in cell 0 but the overlap
+	// with the source falls in cell (32,32,32) - the case the old origin match never matched.
+	const voxel::Region targetRegion(0, 79);
+	ASSERT_TRUE(_sceneMgr->newScene(true, "merge_nonaligned", targetRegion));
+	const int targetNodeId = _sceneMgr->sceneGraph().activeNode();
+	voxel::RawVolume *targetVol = _sceneMgr->volume(targetNodeId);
+	ASSERT_NE(nullptr, targetVol);
+	targetVol->setVoxel(5, 5, 5, voxel::createVoxel(voxel::VoxelType::Generic, 1));	 // outside overlap
+	targetVol->setVoxel(45, 45, 45, voxel::createVoxel(voxel::VoxelType::Generic, 1)); // must be carved
+	_sceneMgr->modified(targetNodeId, targetVol->region());
+
+	// Source node in cell (32,32,32): solid at (42,42,42), air at (45,45,45) to carve the target.
+	const int rootNodeId = _sceneMgr->sceneGraph().root().id();
+	scenegraph::SceneGraphNode sourceNode(scenegraph::SceneGraphNodeType::Model);
+	sourceNode.createVolume(voxel::Region(40, 50));
+	sourceNode.setName("source_nonaligned");
+	const int sourceNodeId = _sceneMgr->moveNodeToSceneGraph(sourceNode, rootNodeId);
+	ASSERT_NE(InvalidNodeId, sourceNodeId);
+	voxel::RawVolume *sourceVol = _sceneMgr->volume(sourceNodeId);
+	ASSERT_NE(nullptr, sourceVol);
+	sourceVol->setVoxel(42, 42, 42, voxel::createVoxel(voxel::VoxelType::Generic, 2));
+	// (45,45,45) intentionally air in source
+	_sceneMgr->modified(sourceNodeId, sourceVol->region());
+
+	_sceneMgr->nodeActivate(sourceNodeId);
+	ASSERT_TRUE(_sceneMgr->mergeActiveToBackground());
+
+	// Source removed
+	EXPECT_EQ(nullptr, _sceneMgr->sceneGraphNode(sourceNodeId));
+
+	// The existing background node must have been carved/overwritten in place.
+	const scenegraph::SceneGraphNode *resultNode = _sceneMgr->sceneGraphModelNode(targetNodeId);
+	ASSERT_NE(nullptr, resultNode);
+	const voxel::RawVolume *resultVol = resultNode->volume();
+	ASSERT_NE(nullptr, resultVol);
+	EXPECT_TRUE(voxel::isAir(resultVol->voxel(45, 45, 45).getMaterial()))
+		<< "source air must carve the overlapping background voxel";
+	EXPECT_FALSE(voxel::isAir(resultVol->voxel(42, 42, 42).getMaterial()))
+		<< "source solid must be stamped into the background node";
+	EXPECT_FALSE(voxel::isAir(resultVol->voxel(5, 5, 5).getMaterial()))
+		<< "a voxel outside the source overlap must be untouched";
+}
+
+// Regression: merging a node back whose bounding box is huge and mostly empty (e.g. the result
+// of merging several spread-out nodes into one) must route each populated region to its owning
+// background node without enumerating or allocating the empty gap between clusters. Previously
+// this enumerated the whole bounding box and grew destination nodes to unbounded unions, which
+// could allocate tens of gigabytes and crash. The work here is bounded by content, so the test
+// completes immediately.
+TEST_F(SceneManagerTest, testMergeActiveToBackgroundSpreadOut) {
+	util::ScopedVarChange chunk(cfg::VoxEditMaxSuggestedVolumeSize, "32");
+
+	// Two background nodes far apart in world space: cell (0,0,0) and cell (320,320,320).
+	const voxel::Region regionA(0, 31);
+	ASSERT_TRUE(_sceneMgr->newScene(true, "merge_spreadout", regionA));
+	const int nodeAId = _sceneMgr->sceneGraph().activeNode();
+
+	const int rootNodeId = _sceneMgr->sceneGraph().root().id();
+	scenegraph::SceneGraphNode nodeB(scenegraph::SceneGraphNodeType::Model);
+	nodeB.createVolume(voxel::Region(320, 351));
+	nodeB.setName("background_b");
+	const int nodeBId = _sceneMgr->moveNodeToSceneGraph(nodeB, rootNodeId);
+	ASSERT_NE(InvalidNodeId, nodeBId);
+
+	const size_t nodeCountBefore = _sceneMgr->sceneGraph().size();
+
+	// Source spans both clusters (a 352^3 mostly-empty bounding box) with content only at the
+	// two cluster locations.
+	scenegraph::SceneGraphNode sourceNode(scenegraph::SceneGraphNodeType::Model);
+	sourceNode.createVolume(voxel::Region(0, 351));
+	sourceNode.setName("spread_source");
+	const int sourceNodeId = _sceneMgr->moveNodeToSceneGraph(sourceNode, rootNodeId);
+	ASSERT_NE(InvalidNodeId, sourceNodeId);
+	voxel::RawVolume *sourceVol = _sceneMgr->volume(sourceNodeId);
+	ASSERT_NE(nullptr, sourceVol);
+	sourceVol->setVoxel(5, 5, 5, voxel::createVoxel(voxel::VoxelType::Generic, 2));
+	sourceVol->setVoxel(325, 325, 325, voxel::createVoxel(voxel::VoxelType::Generic, 2));
+	_sceneMgr->modified(sourceNodeId, sourceVol->region());
+
+	_sceneMgr->nodeActivate(sourceNodeId);
+	ASSERT_TRUE(_sceneMgr->mergeActiveToBackground());
+
+	// Source consumed.
+	EXPECT_EQ(nullptr, _sceneMgr->sceneGraphNode(sourceNodeId));
+
+	// Each cluster landed in its owning background node; no new node was created for the gap.
+	const scenegraph::SceneGraphNode *resultA = _sceneMgr->sceneGraphModelNode(nodeAId);
+	const scenegraph::SceneGraphNode *resultB = _sceneMgr->sceneGraphModelNode(nodeBId);
+	ASSERT_NE(nullptr, resultA);
+	ASSERT_NE(nullptr, resultB);
+	EXPECT_FALSE(voxel::isAir(resultA->volume()->voxel(5, 5, 5).getMaterial()));
+	EXPECT_FALSE(voxel::isAir(resultB->volume()->voxel(325, 325, 325).getMaterial()));
+	EXPECT_EQ(nodeCountBefore, _sceneMgr->sceneGraph().size())
+		<< "the empty gap between clusters must not create extra nodes";
+}
+
+// Regression: two background nodes overlapping each other in the same grid cell. Only the first
+// (primary) owner used to receive the source stamp, so the second node kept its old voxels and
+// they showed through the merged result (the renderer draws the union of all nodes). The source
+// must be stamped into every overlapping background node, carving/replacing the stale content.
+TEST_F(SceneManagerTest, testMergeActiveToBackgroundOverlappingNodes) {
+	util::ScopedVarChange chunk(cfg::VoxEditMaxSuggestedVolumeSize, "32");
+
+	const voxel::Region region(0, 31);
+	ASSERT_TRUE(_sceneMgr->newScene(true, "merge_overlap", region));
+
+	// Background node A (the primary owner of the cell).
+	const int nodeAId = _sceneMgr->sceneGraph().activeNode();
+	voxel::RawVolume *volA = _sceneMgr->volume(nodeAId);
+	ASSERT_NE(nullptr, volA);
+	volA->setVoxel(10, 10, 10, voxel::createVoxel(voxel::VoxelType::Generic, 1)); // must be carved
+	_sceneMgr->modified(nodeAId, volA->region());
+
+	// Background node B fully overlapping A in world space (same region, identity transform).
+	const int rootNodeId = _sceneMgr->sceneGraph().root().id();
+	scenegraph::SceneGraphNode nodeB(scenegraph::SceneGraphNodeType::Model);
+	nodeB.createVolume(region);
+	nodeB.setName("background_b");
+	const int nodeBId = _sceneMgr->moveNodeToSceneGraph(nodeB, rootNodeId);
+	ASSERT_NE(InvalidNodeId, nodeBId);
+	voxel::RawVolume *volB = _sceneMgr->volume(nodeBId);
+	ASSERT_NE(nullptr, volB);
+	volB->setVoxel(10, 10, 10, voxel::createVoxel(voxel::VoxelType::Generic, 1)); // must be carved too
+	_sceneMgr->modified(nodeBId, volB->region());
+
+	// Source: solid at (20,20,20), air at (10,10,10) to carve both background nodes.
+	scenegraph::SceneGraphNode sourceNode(scenegraph::SceneGraphNodeType::Model);
+	sourceNode.createVolume(region);
+	sourceNode.setName("overlap_source");
+	const int sourceNodeId = _sceneMgr->moveNodeToSceneGraph(sourceNode, rootNodeId);
+	ASSERT_NE(InvalidNodeId, sourceNodeId);
+	voxel::RawVolume *sourceVol = _sceneMgr->volume(sourceNodeId);
+	ASSERT_NE(nullptr, sourceVol);
+	sourceVol->setVoxel(20, 20, 20, voxel::createVoxel(voxel::VoxelType::Generic, 2));
+	// (10,10,10) intentionally air in source
+	_sceneMgr->modified(sourceNodeId, sourceVol->region());
+
+	_sceneMgr->nodeActivate(sourceNodeId);
+	ASSERT_TRUE(_sceneMgr->mergeActiveToBackground());
+
+	// Source consumed; both background nodes survive.
+	EXPECT_EQ(nullptr, _sceneMgr->sceneGraphNode(sourceNodeId));
+	const scenegraph::SceneGraphNode *resultA = _sceneMgr->sceneGraphModelNode(nodeAId);
+	const scenegraph::SceneGraphNode *resultB = _sceneMgr->sceneGraphModelNode(nodeBId);
+	ASSERT_NE(nullptr, resultA);
+	ASSERT_NE(nullptr, resultB);
+
+	// Both nodes get the source stamped: solid placed, stale voxel carved away.
+	EXPECT_FALSE(voxel::isAir(resultA->volume()->voxel(20, 20, 20).getMaterial()));
+	EXPECT_FALSE(voxel::isAir(resultB->volume()->voxel(20, 20, 20).getMaterial()))
+		<< "source solid must be stamped into the secondary overlapping node too";
+	EXPECT_TRUE(voxel::isAir(resultA->volume()->voxel(10, 10, 10).getMaterial()));
+	EXPECT_TRUE(voxel::isAir(resultB->volume()->voxel(10, 10, 10).getMaterial()))
+		<< "source air must carve the stale voxel in the secondary overlapping node";
+}
+
 TEST_F(SceneManagerTest, testMergeVisibleToTemp) {
 	const voxel::Region region{0, 9};
 	ASSERT_TRUE(_sceneMgr->newScene(true, "mergevisible_test", region));
@@ -3161,6 +3326,71 @@ TEST_F(SceneManagerTest, testUndoLassoOverlappingSelection) {
 			EXPECT_EQ(expected, actual) << "post-undo x=" << x << " z=" << z;
 		}
 	}
+}
+
+// The in-progress polygon is rendered as a viewport overlay (BrushGizmo_WorldPolyline),
+// not by writing FlagOutline marks onto the volume. Dropping vertices during accumulation
+// must therefore leave the volume completely unmarked; the selection only appears on close.
+TEST_F(SceneManagerTest, testLassoAccumulationLeavesVolumeUnmarked) {
+	const voxel::Region region{0, 9};
+	ASSERT_TRUE(_sceneMgr->newScene(true, "lasso_overlay", region));
+	const int nodeId = _sceneMgr->sceneGraph().activeNode();
+	voxel::RawVolume *v = _sceneMgr->volume(nodeId);
+	ASSERT_NE(nullptr, v);
+	for (int z = 0; z <= 9; ++z) {
+		for (int x = 0; x <= 9; ++x) {
+			v->setVoxel(x, 0, z, voxel::createVoxel(voxel::VoxelType::Generic, 1));
+		}
+	}
+
+	Modifier &modifier = _sceneMgr->modifier();
+	modifier.setBrushType(BrushType::Select);
+	SelectBrush &selBrush = modifier.selectBrush();
+	selBrush.setSelectMode(SelectMode::PolygonLasso);
+
+	auto clickVertex = [&](const glm::ivec3 &pos) {
+		modifier.setCursorPosition(pos, voxel::FaceNames::PositiveY);
+		modifier.beginBrush();
+	};
+	clickVertex(glm::ivec3(2, 0, 2));
+	clickVertex(glm::ivec3(6, 0, 2));
+	clickVertex(glm::ivec3(6, 0, 6));
+	clickVertex(glm::ivec3(2, 0, 6));
+
+	ASSERT_TRUE(selBrush.polygonLasso().accumulating());
+	ASSERT_EQ((int)selBrush.polygonLasso().path().size(), 4);
+
+	// During accumulation nothing must be written to the volume.
+	for (int z = 0; z <= 9; ++z) {
+		for (int x = 0; x <= 9; ++x) {
+			EXPECT_EQ(0, v->voxel(x, 0, z).getFlags() & voxel::FlagOutline)
+				<< "accumulation must not mark the volume at x=" << x << " z=" << z;
+		}
+	}
+
+	// Dropping a vertex stays overlay-only too.
+	_sceneMgr->selectionLassoUndoVertex(nodeId);
+	EXPECT_EQ((int)selBrush.polygonLasso().path().size(), 3);
+	for (int z = 0; z <= 9; ++z) {
+		for (int x = 0; x <= 9; ++x) {
+			EXPECT_EQ(0, v->voxel(x, 0, z).getFlags() & voxel::FlagOutline)
+				<< "vertex undo must not mark the volume at x=" << x << " z=" << z;
+		}
+	}
+
+	// On close the selection finally appears on the volume.
+	_sceneMgr->selectionFinalizeLasso(nodeId);
+	EXPECT_FALSE(selBrush.polygonLasso().accumulating());
+	bool anySelected = false;
+	for (int z = 0; z <= 9 && !anySelected; ++z) {
+		for (int x = 0; x <= 9; ++x) {
+			if (v->voxel(x, 0, z).getFlags() & voxel::FlagOutline) {
+				anySelected = true;
+				break;
+			}
+		}
+	}
+	EXPECT_TRUE(anySelected) << "closing the polygon must produce a selection";
 }
 
 // Large-volume variant: user reported the bug on a panel >= 128x128. Exercise the lasso

@@ -455,7 +455,7 @@ void ExtrudeBrush::generate(scenegraph::SceneGraph &, ModifierVolumeWrapper &wra
 		for (const glm::ivec3 &pos : _cachedSelectedPositions) {
 			selectedSet.insert(pos);
 		}
-		const voxel::Region &volRegion = vol->region();
+		// volRegion is already declared at the top of generate() and is still in scope here.
 		for (const glm::ivec3 &selPos : _cachedSelectedPositions) {
 			bool isBrim = false;
 			for (const glm::ivec3 &offset : voxel::arrayPathfinderFaces) {

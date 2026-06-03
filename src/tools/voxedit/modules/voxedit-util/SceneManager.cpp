@@ -21,6 +21,7 @@
 #include "core/TimeProvider.h"
 #include "core/UUID.h"
 #include "core/collection/DynamicArray.h"
+#include "core/collection/DynamicMap.h"
 #include "io/Archive.h"
 #include "io/File.h"
 #include "io/Filesystem.h"
@@ -2479,45 +2480,64 @@ bool SceneManager::mergeActiveToBackground() {
 		return cell * chunkSize + gridOffset;
 	};
 
-	// Enumerate all grid cells the source overlaps
-	struct GridCell {
-		glm::ivec3 origin;
-		voxel::Region cellRegion;
-		int existingNodeId;
-	};
-	const glm::ivec3 firstCell = gridCellOrigin(sourceWorldRegion.getLowerCorner());
-	const glm::ivec3 lastCell = gridCellOrigin(sourceWorldRegion.getUpperCorner());
-	core::DynamicArray<GridCell> neededCells;
-	for (int y = firstCell.y; y <= lastCell.y; y += chunkSize) {
-		for (int z = firstCell.z; z <= lastCell.z; z += chunkSize) {
-			for (int x = firstCell.x; x <= lastCell.x; x += chunkSize) {
-				const glm::ivec3 origin(x, y, z);
-				const voxel::Region cellRegion(origin, origin + glm::ivec3(chunkSize - 1));
-				if (!voxel::intersects(sourceWorldRegion, cellRegion)) {
-					continue;
-				}
-				neededCells.push_back({origin, cellRegion, InvalidNodeId});
-			}
-		}
-	}
+	// Decide, per grid cell, which background node (if any) owns it. The merge is driven by
+	// (a) the background nodes that overlap the source and (b) the source's populated cells -
+	// never by enumerating the source's bounding box. For a node merged from spread-out parts
+	// that box is mostly empty air; the previous box enumeration plus unbounded node resizes
+	// could allocate tens of gigabytes for a single merge. Here every allocation is bounded by
+	// the grid cell size (chunkSize^3) and the work is proportional to real content.
+	const glm::ivec3 cellExtent(chunkSize - 1);
+	core::DynamicMap<glm::ivec3, int, 1031, glm::hash<glm::ivec3>> cellOwner;
 
-	// Match existing background nodes to grid cells
+	// (a) Background nodes overlapping the source claim the grid cells they cover. Only nodes
+	// with a pure-translation transform can be stamped in place: the world<->local mapping used
+	// below is a translation only, so a scaled or rotated node would map to a bogus (possibly
+	// enormous) local region. Skip those with a warning instead of crashing on a huge resize.
 	for (auto iter = _sceneGraph.beginModel(); iter != _sceneGraph.end(); ++iter) {
 		const scenegraph::SceneGraphNode &node = *iter;
 		if (node.id() == sourceNodeId || !node.isModelNode()) {
 			continue;
 		}
-		const voxel::Region wr = _sceneGraph.sceneRegion(node, _currentFrameIdx);
-		if (!wr.isValid()) {
+		const voxel::RawVolume *vol = node.volume();
+		if (vol == nullptr) {
 			continue;
 		}
-		const glm::ivec3 nodeCell = gridCellOrigin(wr.getLowerCorner());
-		for (GridCell &cell : neededCells) {
-			if (cell.origin == nodeCell && cell.existingNodeId == InvalidNodeId) {
-				cell.existingNodeId = node.id();
-				break;
+		const voxel::Region wr = _sceneGraph.sceneRegion(node, _currentFrameIdx);
+		if (!wr.isValid() || !voxel::intersects(wr, sourceWorldRegion)) {
+			continue;
+		}
+		if (wr.getDimensionsInVoxels() != vol->region().getDimensionsInVoxels()) {
+			Log::warn("mergeactivetobackground: skipping node %i with a non-translation transform", node.id());
+			continue;
+		}
+		voxel::Region overlap = wr;
+		overlap.cropTo(sourceWorldRegion);
+		const glm::ivec3 firstCell = gridCellOrigin(overlap.getLowerCorner());
+		const glm::ivec3 lastCell = gridCellOrigin(overlap.getUpperCorner());
+		for (int y = firstCell.y; y <= lastCell.y; y += chunkSize) {
+			for (int z = firstCell.z; z <= lastCell.z; z += chunkSize) {
+				for (int x = firstCell.x; x <= lastCell.x; x += chunkSize) {
+					const glm::ivec3 origin(x, y, z);
+					if (!cellOwner.hasKey(origin)) {
+						cellOwner.put(origin, node.id());
+					}
+				}
 			}
 		}
+	}
+
+	// (b) Source-populated cells that no background node claimed become new grid nodes. This is
+	// the only full pass over the source, and it is read-only (no allocation).
+	voxelutil::visitVolume(*worldSource, [&](int x, int y, int z, const voxel::Voxel &) {
+		const glm::ivec3 origin = gridCellOrigin(glm::ivec3(x, y, z));
+		if (!cellOwner.hasKey(origin)) {
+			cellOwner.put(origin, InvalidNodeId);
+		}
+	}, voxelutil::VisitSolid());
+
+	if (cellOwner.empty()) {
+		Log::warn("mergeactivetobackground: no overlapping content for active node %i", sourceNodeId);
+		return false;
 	}
 
 	memento::ScopedMementoGroup mementoGroup(_mementoHandler, "mergeactivetobackground");
@@ -2525,192 +2545,208 @@ bool SceneManager::mergeActiveToBackground() {
 	struct StampedNode {
 		int nodeId;
 		voxel::Region localRegion;
-		voxel::Region worldRegion;
 	};
 	core::DynamicArray<StampedNode> stampedNodes;
-	stampedNodes.reserve(neededCells.size());
+	stampedNodes.reserve(cellOwner.size());
 	int stampedCount = 0;
 
-	for (const GridCell &cell : neededCells) {
-		// Compute the overlap of the source with this grid cell (in world coords)
-		voxel::Region cellSourceOverlap = sourceWorldRegion;
-		cellSourceOverlap.cropTo(cell.cellRegion);
+	// Stamp the source into the background nodes that own cells. Each node is processed once:
+	// its palette is merged a single time and it is grown (if needed) only to the union of the
+	// cells it owns - bounded by the number of grid cells it covers, never an arbitrary region.
+	for (auto iter = _sceneGraph.beginModel(); iter != _sceneGraph.end(); ++iter) {
+		const int nodeId = (*iter).id();
+		if (nodeId == sourceNodeId || !(*iter).isModelNode()) {
+			continue;
+		}
+		scenegraph::SceneGraphNode &targetNode = _sceneGraph.node(nodeId);
+		voxel::RawVolume *targetVolume = targetNode.volume();
+		if (targetVolume == nullptr) {
+			continue;
+		}
+		const voxel::Region targetWorldRegion = _sceneGraph.sceneRegion(targetNode, _currentFrameIdx);
+		if (!targetWorldRegion.isValid() || !voxel::intersects(targetWorldRegion, sourceWorldRegion)) {
+			continue;
+		}
+		// For a pure-translation transform the world<->local delta is constant, so it stays
+		// valid even after the volume is resized below.
+		const glm::ivec3 worldToLocal =
+			targetVolume->region().getLowerCorner() - targetWorldRegion.getLowerCorner();
 
-		if (cell.existingNodeId != InvalidNodeId) {
-			// Existing node: expand if needed, then stamp
-			scenegraph::SceneGraphNode &targetNode = _sceneGraph.node(cell.existingNodeId);
-			voxel::RawVolume *targetVolume = targetNode.volume();
-			if (targetVolume == nullptr) {
-				continue;
-			}
-
-			const voxel::Region targetWorldRegion =
-				_sceneGraph.sceneRegion(targetNode, _currentFrameIdx);
-			const glm::ivec3 worldToLocal =
-				targetVolume->region().getLowerCorner() - targetWorldRegion.getLowerCorner();
-
-			// The local region we need to write into
-			const voxel::Region neededLocalRegion(
-				cellSourceOverlap.getLowerCorner() + worldToLocal,
-				cellSourceOverlap.getUpperCorner() + worldToLocal);
-
-			// Expand the volume if it doesn't contain the needed region
-			const voxel::Region currentLocalRegion = targetVolume->region();
-			if (!currentLocalRegion.containsRegion(neededLocalRegion)) {
-				const voxel::Region expandedRegion(
-					glm::min(currentLocalRegion.getLowerCorner(), neededLocalRegion.getLowerCorner()),
-					glm::max(currentLocalRegion.getUpperCorner(), neededLocalRegion.getUpperCorner()));
-				voxel::RawVolume *newVolume = voxelutil::resize(targetVolume, expandedRegion);
-				if (newVolume == nullptr) {
-					Log::warn("mergeactivetobackground: failed to expand node %i", cell.existingNodeId);
-					continue;
-				}
-				targetNode.setVolume(newVolume);
-				targetVolume = newVolume;
-			}
-
-			// Add missing source colors to the target palette before mapping
-			palette::Palette &destPalette = targetNode.palette();
-			bool paletteChanged = false;
-			for (int i = 0; i < sourcePalette.colorCount(); ++i) {
-				if (destPalette.tryAdd(sourcePalette.color(i), false)) {
-					paletteChanged = true;
-				}
-			}
-			if (paletteChanged) {
-				destPalette.markDirty();
-			}
-			palette::PaletteLookup palLookup(destPalette);
-
-			// Stamp all voxels including air (overwrite destination in overlap)
-			int count = 0;
-			const glm::ivec3 &srcLower = cellSourceOverlap.getLowerCorner();
-			const glm::ivec3 &dstLower = neededLocalRegion.getLowerCorner();
-			const int32_t overlapW = cellSourceOverlap.getWidthInVoxels();
-			const int32_t overlapH = cellSourceOverlap.getHeightInVoxels();
-			const int32_t overlapD = cellSourceOverlap.getDepthInVoxels();
-			for (int32_t z = 0; z < overlapD; ++z) {
-				for (int32_t y = 0; y < overlapH; ++y) {
-					for (int32_t x = 0; x < overlapW; ++x) {
-						const voxel::Voxel srcVoxel = worldSource->voxel(
-							srcLower.x + x, srcLower.y + y, srcLower.z + z);
-						voxel::Voxel destVoxel;
-						if (voxel::isAir(srcVoxel.getMaterial())) {
-							destVoxel = voxel::Voxel();
-						} else {
-							const int idx = palLookup.findClosestIndex(
-								sourcePalette.color(srcVoxel.getColor()));
-							destVoxel = voxel::createVoxel(destPalette,
-								idx == palette::PaletteColorNotFound ? 0 : idx);
-						}
-						targetVolume->setVoxel(
-							dstLower.x + x, dstLower.y + y, dstLower.z + z, destVoxel);
-						++count;
+		// Collect the source overlaps for the cells this node touches and the local region they map
+		// to. A cell has a single primary owner (the first background node that claimed it). The
+		// primary owner absorbs the full source content of the cell and may grow to fit it. Every
+		// OTHER background node that also overlaps the cell is a secondary owner: a second node
+		// sitting under the same cell would otherwise keep showing its old voxels through the
+		// merged result (the renderer draws the union of all nodes). So secondary owners also get
+		// the source stamped, but only over the part they already cover - bounded by their own
+		// region, so they never grow. neededLocalUnion (grow) is driven by primary cells only;
+		// modifiedLocalUnion (the dirty region) covers both so the renderer re-extracts everything.
+		voxel::Region nodeOverlap = targetWorldRegion;
+		nodeOverlap.cropTo(sourceWorldRegion);
+		const glm::ivec3 firstCell = gridCellOrigin(nodeOverlap.getLowerCorner());
+		const glm::ivec3 lastCell = gridCellOrigin(nodeOverlap.getUpperCorner());
+		core::DynamicArray<voxel::Region> ownedOverlaps;
+		voxel::Region neededLocalUnion;
+		bool haveGrowUnion = false;
+		voxel::Region modifiedLocalUnion;
+		bool haveModifiedUnion = false;
+		for (int y = firstCell.y; y <= lastCell.y; y += chunkSize) {
+			for (int z = firstCell.z; z <= lastCell.z; z += chunkSize) {
+				for (int x = firstCell.x; x <= lastCell.x; x += chunkSize) {
+					const glm::ivec3 origin(x, y, z);
+					int owner = InvalidNodeId;
+					if (!cellOwner.get(origin, owner)) {
+						continue;
 					}
-				}
-			}
-			if (count > 0) {
-				stampedNodes.push_back(StampedNode{cell.existingNodeId, neededLocalRegion, cellSourceOverlap});
-				stampedCount += count;
-			}
-		} else {
-			// No existing node for this grid cell: create a new one
-			// Single pass: stamp non-air source voxels into a new volume
-			voxel::RawVolume *newVolume = new voxel::RawVolume(cell.cellRegion);
-			palette::PaletteLookup palLookup(sourcePalette);
-
-			const glm::ivec3 &srcLower = cellSourceOverlap.getLowerCorner();
-			const int32_t overlapW = cellSourceOverlap.getWidthInVoxels();
-			const int32_t overlapH = cellSourceOverlap.getHeightInVoxels();
-			const int32_t overlapD = cellSourceOverlap.getDepthInVoxels();
-			int count = 0;
-			for (int32_t z = 0; z < overlapD; ++z) {
-				for (int32_t y = 0; y < overlapH; ++y) {
-					for (int32_t x = 0; x < overlapW; ++x) {
-						const voxel::Voxel srcVoxel = worldSource->voxel(
-							srcLower.x + x, srcLower.y + y, srcLower.z + z);
-						if (voxel::isAir(srcVoxel.getMaterial())) {
+					voxel::Region cso = sourceWorldRegion;
+					cso.cropTo(voxel::Region(origin, origin + cellExtent));
+					if (!cso.isValid()) {
+						continue;
+					}
+					const bool primary = (owner == nodeId);
+					if (!primary) {
+						// Another node primarily owns this cell. Only overwrite where this node
+						// already has voxels (no growth), so its stale content is carved/replaced.
+						cso.cropTo(targetWorldRegion);
+						if (!cso.isValid()) {
 							continue;
 						}
-						const int idx = palLookup.findClosestIndex(
-							sourcePalette.color(srcVoxel.getColor()));
-						const voxel::Voxel destVoxel = voxel::createVoxel(sourcePalette,
-							idx == palette::PaletteColorNotFound ? 0 : idx);
-						newVolume->setVoxel(srcLower.x + x, srcLower.y + y, srcLower.z + z,
-							destVoxel);
-						++count;
+					}
+					ownedOverlaps.push_back(cso);
+					const voxel::Region local(cso.getLowerCorner() + worldToLocal,
+											  cso.getUpperCorner() + worldToLocal);
+					if (primary) {
+						if (!haveGrowUnion) {
+							neededLocalUnion = local;
+							haveGrowUnion = true;
+						} else {
+							neededLocalUnion.accumulate(local);
+						}
+					}
+					if (!haveModifiedUnion) {
+						modifiedLocalUnion = local;
+						haveModifiedUnion = true;
+					} else {
+						modifiedLocalUnion.accumulate(local);
 					}
 				}
 			}
+		}
+		if (ownedOverlaps.empty()) {
+			continue;
+		}
 
-			if (count == 0) {
-				delete newVolume;
+		// Grow the node once to fit the cells it primarily owns (bounded by chunkSize^3 per cell).
+		// Secondary overlaps are already inside the node's region, so they never trigger a resize.
+		if (haveGrowUnion && !targetVolume->region().containsRegion(neededLocalUnion)) {
+			const voxel::Region expandedRegion(
+				glm::min(targetVolume->region().getLowerCorner(), neededLocalUnion.getLowerCorner()),
+				glm::max(targetVolume->region().getUpperCorner(), neededLocalUnion.getUpperCorner()));
+			voxel::RawVolume *newVolume = voxelutil::resize(targetVolume, expandedRegion);
+			if (newVolume == nullptr) {
+				Log::warn("mergeactivetobackground: failed to expand node %i", nodeId);
 				continue;
 			}
+			targetNode.setVolume(newVolume);
+			targetVolume = newVolume;
+		}
 
-			scenegraph::SceneGraphNode newNode(scenegraph::SceneGraphNodeType::Model);
-			newNode.setVolume(newVolume);
-			newNode.setPalette(sourcePalette);
-			newNode.setName("merged");
-			const int newNodeId = moveNodeToSceneGraph(newNode, backgroundParentId);
-			if (newNodeId != InvalidNodeId) {
-				stampedNodes.push_back(StampedNode{newNodeId, cellSourceOverlap, cellSourceOverlap});
-				stampedCount += count;
+		// Merge the source palette into the destination once for this node.
+		palette::Palette &destPalette = targetNode.palette();
+		bool paletteChanged = false;
+		for (int i = 0; i < sourcePalette.colorCount(); ++i) {
+			if (destPalette.tryAdd(sourcePalette.color(i), false)) {
+				paletteChanged = true;
 			}
+		}
+		if (paletteChanged) {
+			destPalette.markDirty();
+		}
+		palette::PaletteLookup palLookup(destPalette);
+
+		// Stamp every owned overlap including air, so the source fully replaces the destination
+		// content in the cells it covers (source air carves the destination away).
+		for (const voxel::Region &cso : ownedOverlaps) {
+			const glm::ivec3 &srcLower = cso.getLowerCorner();
+			const int32_t overlapW = cso.getWidthInVoxels();
+			const int32_t overlapH = cso.getHeightInVoxels();
+			const int32_t overlapD = cso.getDepthInVoxels();
+			for (int32_t z = 0; z < overlapD; ++z) {
+				for (int32_t y = 0; y < overlapH; ++y) {
+					for (int32_t x = 0; x < overlapW; ++x) {
+						const int wx = srcLower.x + x;
+						const int wy = srcLower.y + y;
+						const int wz = srcLower.z + z;
+						const voxel::Voxel srcVoxel = worldSource->voxel(wx, wy, wz);
+						voxel::Voxel destVoxel;
+						if (!voxel::isAir(srcVoxel.getMaterial())) {
+							const int idx = palLookup.findClosestIndex(sourcePalette.color(srcVoxel.getColor()));
+							destVoxel = voxel::createVoxel(destPalette, idx == palette::PaletteColorNotFound ? 0 : idx);
+						}
+						targetVolume->setVoxel(wx + worldToLocal.x, wy + worldToLocal.y, wz + worldToLocal.z, destVoxel);
+						++stampedCount;
+					}
+				}
+			}
+		}
+		stampedNodes.push_back(StampedNode{nodeId, modifiedLocalUnion});
+	}
+
+	// Source content in cells no background node owns becomes new grid nodes. Each new node is a
+	// single chunk cell holding only the non-air source voxels - bounded by chunkSize^3.
+	for (auto it = cellOwner.begin(); it != cellOwner.end(); ++it) {
+		if ((*it)->value != InvalidNodeId) {
+			continue;
+		}
+		const glm::ivec3 origin = (*it)->key;
+		const voxel::Region cellRegion(origin, origin + cellExtent);
+		voxel::Region cso = sourceWorldRegion;
+		cso.cropTo(cellRegion);
+		if (!cso.isValid()) {
+			continue;
+		}
+		voxel::RawVolume *newVolume = new voxel::RawVolume(cellRegion);
+		palette::PaletteLookup palLookup(sourcePalette);
+		const glm::ivec3 &srcLower = cso.getLowerCorner();
+		const int32_t overlapW = cso.getWidthInVoxels();
+		const int32_t overlapH = cso.getHeightInVoxels();
+		const int32_t overlapD = cso.getDepthInVoxels();
+		int count = 0;
+		for (int32_t z = 0; z < overlapD; ++z) {
+			for (int32_t y = 0; y < overlapH; ++y) {
+				for (int32_t x = 0; x < overlapW; ++x) {
+					const int wx = srcLower.x + x;
+					const int wy = srcLower.y + y;
+					const int wz = srcLower.z + z;
+					const voxel::Voxel srcVoxel = worldSource->voxel(wx, wy, wz);
+					if (voxel::isAir(srcVoxel.getMaterial())) {
+						continue;
+					}
+					const int idx = palLookup.findClosestIndex(sourcePalette.color(srcVoxel.getColor()));
+					const voxel::Voxel destVoxel = voxel::createVoxel(sourcePalette, idx == palette::PaletteColorNotFound ? 0 : idx);
+					newVolume->setVoxel(wx, wy, wz, destVoxel);
+					++count;
+				}
+			}
+		}
+		if (count == 0) {
+			delete newVolume;
+			continue;
+		}
+		scenegraph::SceneGraphNode newNode(scenegraph::SceneGraphNodeType::Model);
+		newNode.setVolume(newVolume);
+		newNode.setPalette(sourcePalette);
+		newNode.setName("merged");
+		const int newNodeId = moveNodeToSceneGraph(newNode, backgroundParentId);
+		if (newNodeId != InvalidNodeId) {
+			stampedNodes.push_back(StampedNode{newNodeId, cso});
+			stampedCount += count;
 		}
 	}
 
 	if (stampedCount == 0) {
 		Log::warn("mergeactivetobackground: no voxels stamped for active node %i", sourceNodeId);
 		return false;
-	}
-
-	// Erase stamped world regions from the working copy, then check for survivors.
-	// Any voxels not covered by any destination node are preserved as a new node.
-	{
-		const voxel::Voxel airVoxel;
-		for (const StampedNode &entry : stampedNodes) {
-			const voxel::Region &wr = entry.worldRegion;
-			for (int32_t z = wr.getLowerZ(); z <= wr.getUpperZ(); ++z) {
-				for (int32_t y = wr.getLowerY(); y <= wr.getUpperY(); ++y) {
-					for (int32_t x = wr.getLowerX(); x <= wr.getUpperX(); ++x) {
-						worldSource->setVoxel(x, y, z, airVoxel);
-					}
-				}
-			}
-		}
-		// cropVolume returns nullptr both when empty AND when region didn't shrink.
-		// Scan the raw voxel array to detect survivors before deciding what to do.
-		const voxel::Region &srcReg = worldSource->region();
-		const voxel::Voxel *voxels = worldSource->voxels();
-		const int voxelCount =
-			srcReg.getWidthInVoxels() * srcReg.getHeightInVoxels() * srcReg.getDepthInVoxels();
-		bool hasRemainder = false;
-		for (int i = 0; i < voxelCount; ++i) {
-			if (!voxel::isAir(voxels[i].getMaterial())) {
-				hasRemainder = true;
-				break;
-			}
-		}
-		if (hasRemainder) {
-			voxel::RawVolume *remainder = voxelutil::cropVolume(worldSource);
-			if (remainder == nullptr) {
-				// cropVolume returns nullptr when region didn't shrink — copy as-is
-				remainder = new voxel::RawVolume(*worldSource);
-			}
-			int remainderParentId = _sceneGraph.root().id();
-			if (!stampedNodes.empty()) {
-				remainderParentId = _sceneGraph.node(stampedNodes[0].nodeId).parent();
-			}
-			scenegraph::SceneGraphNode remainderNode(scenegraph::SceneGraphNodeType::Model);
-			remainderNode.setVolume(remainder);
-			remainderNode.setPalette(sourcePalette);
-			remainderNode.setName(sourceNode->name());
-			const int newId = moveNodeToSceneGraph(remainderNode, remainderParentId);
-			if (newId != InvalidNodeId) {
-				stampedNodes.push_back(StampedNode{newId, remainder->region(), remainder->region()});
-			}
-		}
 	}
 
 	// Show all hidden model nodes and unhide them in the mesh state so that
@@ -3195,15 +3231,13 @@ void SceneManager::selectionFinalizeLasso(int nodeId) {
 	const int vAxis = lasso.vAxis();
 	const int wAxis = lasso.faceAxisIdx();
 	const bool positiveNormal = voxel::isPositiveFace(lasso.face());
+	const int depthTolerance = lasso.depthTolerance();
 
 	voxel::RawVolume *volume = node->volume();
 	voxel::Region dirtyRegion = voxel::Region::InvalidRegion;
 
-	// Restore edge history voxels first so they appear in the dirty region.
-	// This ensures undo also reverts edge marks outside the polygon perimeter.
-	if (lasso.hasPendingChanges()) {
-		dirtyRegion.accumulate(lasso.revertChanges(volume));
-	}
+	// The in-progress polygon is only a viewport overlay (no volume marks), so there is
+	// nothing to revert before applying the selection.
 	lasso.invalidate();
 
 	auto selectFunc = [&](int x, int y, int z, const voxel::Voxel &v) {
@@ -3213,12 +3247,12 @@ void SceneManager::selectionFinalizeLasso(int nodeId) {
 		volume->setVoxel(pos, modified);
 		dirtyRegion.accumulate(pos);
 	};
-	// Flood-fill from seeds rasterized along every polygon edge, walking 26-connected
-	// surface voxels that project inside the polygon. Unlike a raw visitSurfaceVolume +
-	// 2D point-in-polygon filter, this cannot pick up a disjoint structure that merely
-	// shares the (u, v) silhouette - e.g. a tower behind the rooftop the user lassoed.
+	// Flood-fill the front surface inside the polygon: seed along the drawn edges, then expand
+	// across (u,v) cells staying on the same surface (depth continuity within the tolerance).
+	// This keeps the selection on the visible skin instead of wrapping down side walls, and
+	// still skips a disjoint structure that merely shares the (u, v) silhouette.
 	voxelutil::lassoFloodFillSurface(*volume, path, uAxis, vAxis, wAxis, positiveNormal,
-									 volume->region(), selectFunc);
+									 volume->region(), selectFunc, depthTolerance);
 
 	if (dirtyRegion.isValid()) {
 		modified(nodeId, dirtyRegion, SceneModifiedFlags::All);
@@ -3226,19 +3260,10 @@ void SceneManager::selectionFinalizeLasso(int nodeId) {
 }
 
 void SceneManager::selectionCancelLasso(int nodeId) {
+	// The in-progress polygon is only a viewport overlay (no volume marks), so cancelling
+	// just discards the accumulated vertices.
 	SelectBrush &brush = _modifier.selectBrush();
-	select::PolygonLasso &lasso = brush.polygonLasso();
-	if (lasso.hasPendingChanges()) {
-		scenegraph::SceneGraphNode *node = sceneGraphModelNode(nodeId);
-		if (node != nullptr) {
-			voxel::RawVolume *volume = node->volume();
-			const voxel::Region dirtyRegion = lasso.revertChanges(volume);
-			if (dirtyRegion.isValid()) {
-				modified(nodeId, dirtyRegion, SceneModifiedFlags::NoUndo);
-			}
-		}
-	}
-	lasso.invalidate();
+	brush.polygonLasso().invalidate();
 }
 
 void SceneManager::selectionLassoUndoVertex(int nodeId) {
@@ -3247,27 +3272,9 @@ void SceneManager::selectionLassoUndoVertex(int nodeId) {
 	if (!lasso.accumulating() || lasso.path().size() < 2) {
 		return;
 	}
-	scenegraph::SceneGraphNode *node = sceneGraphModelNode(nodeId);
-	if (node == nullptr) {
-		return;
-	}
-	voxel::RawVolume *volume = node->volume();
-	voxel::Region dirtyRegion = voxel::Region::InvalidRegion;
-
-	// Restore all existing edge marks to their original state
-	if (lasso.hasPendingChanges()) {
-		dirtyRegion.accumulate(lasso.revertChanges(volume));
-	}
-
-	// Drop the last vertex and redraw the remaining edges
+	// Drop the last vertex. The overlay polyline is rebuilt from the path on the next
+	// PolygonLasso::update(), so no volume update is needed here.
 	lasso.popLastPathEntry();
-	if (lasso.path().size() >= 2) {
-		lasso.redrawEdgesOnVolume(volume, volume->region(), dirtyRegion);
-	}
-
-	if (dirtyRegion.isValid()) {
-		modified(nodeId, dirtyRegion, SceneModifiedFlags::NoUndo);
-	}
 }
 
 void SceneManager::resetLastTrace() {
