@@ -66,5 +66,10 @@ constexpr const char *VoxEditSceneMode = "ve_scenemode";
 constexpr const char *VoxEditAddNode = "ve_addnode";
 constexpr const char *VoxEditAddNodeIgnoreOverlap = "ve_addnodeignoreoverlap";
 constexpr const char *VoxEditAddNodeCloneVoxels = "ve_addnodeclonevoxels";
+constexpr const char *VoxEditImportSingleNode = "ve_importsinglenode";
+constexpr const char *VoxEditContinueSession = "ve_continuesession";
+constexpr const char *VoxEditLastCameraTarget = "ve_lastcameratarget";
+constexpr const char *VoxEditLastCameraAngles = "ve_lastcameraangles";
+constexpr const char *VoxEditLastCameraDistance = "ve_lastcameradist";
 
 } // namespace cfg

@@ -52,11 +52,40 @@ public:
 
 	size_t bytes() const;
 
-	void set(size_t idx, bool value);
+	inline void set(size_t idx, bool value) {
+		if (idx >= _size) {
+			return;
+		}
+		const size_t arrayIdx = idx / bitsPerValue;
+		const size_t elementIdx = idx % bitsPerValue;
+		Type &ref = _buffer[arrayIdx];
+		if (value) {
+			ref |= (Type(1) << elementIdx);
+		} else {
+			ref &= ~(Type(1) << elementIdx);
+		}
+	}
 
-	bool operator[](size_t idx) const;
+	inline bool operator[](size_t idx) const {
+		if (idx >= _size) {
+			return false;
+		}
+		const size_t arrayIdx = idx / bitsPerValue;
+		const size_t elementIdx = idx % bitsPerValue;
+		const Type &ref = _buffer[arrayIdx];
+		const Type mask = (Type(1) << elementIdx);
+		return (ref & mask) != 0;
+	}
 	bool operator==(const DynamicBitSet &other) const;
 	bool operator!=(const DynamicBitSet &other) const;
+
+	inline const Type *buffer() const {
+		return _buffer;
+	}
+
+	inline size_t words() const {
+		return requiredElements(_size);
+	}
 };
 
 } // namespace core

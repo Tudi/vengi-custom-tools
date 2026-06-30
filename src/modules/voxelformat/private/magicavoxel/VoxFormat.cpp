@@ -16,6 +16,7 @@
 #include "scenegraph/SceneGraphNodeProperties.h"
 #include "voxel/RawVolume.h"
 #include "voxelformat/external/ogt_vox.h"
+#include "voxelutil/VolumeCropper.h"
 #include "voxelutil/VolumeVisitor.h"
 #include <climits>
 #include <glm/gtc/quaternion.hpp>

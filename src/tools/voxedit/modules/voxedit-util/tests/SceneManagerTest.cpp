@@ -5,6 +5,7 @@
 #include "voxedit-util/SceneManager.h"
 #include "voxedit-util/Config.h"
 #include "AbstractSceneManagerTest.h"
+#include "command/Command.h"
 #include "command/CommandHandler.h"
 #include "image/Image.h"
 #include "io/FilesystemArchive.h"
@@ -924,6 +925,52 @@ TEST_F(SceneManagerTest, testDuplicateAndRemoveChild) {
 	ASSERT_EQ(4u, _sceneMgr->sceneGraph().nodeSize());
 }
 
+TEST_F(SceneManagerTest, testNodeRemoveLockedNone) {
+	const int nodeId = _sceneMgr->sceneGraph().activeNode();
+	ASSERT_NE(nodeId, InvalidNodeId);
+	const size_t modelsBefore = _sceneMgr->sceneGraph().size();
+	EXPECT_EQ(0, _sceneMgr->nodeRemoveLocked());
+	EXPECT_EQ(modelsBefore, _sceneMgr->sceneGraph().size());
+}
+
+TEST_F(SceneManagerTest, testNodeRemoveLockedSubset) {
+	const int aId = _sceneMgr->sceneGraph().activeNode();
+	ASSERT_NE(aId, InvalidNodeId);
+	const int bId = _sceneMgr->addModelChild("b", 1, 1, 1);
+	ASSERT_NE(bId, InvalidNodeId);
+	const int cId = _sceneMgr->addModelChild("c", 1, 1, 1);
+	ASSERT_NE(cId, InvalidNodeId);
+	ASSERT_EQ(3u, _sceneMgr->sceneGraph().size());
+
+	ASSERT_TRUE(_sceneMgr->nodeSetLocked(aId, true));
+	ASSERT_TRUE(_sceneMgr->nodeSetLocked(cId, true));
+
+	EXPECT_EQ(2, _sceneMgr->nodeRemoveLocked());
+	EXPECT_EQ(1u, _sceneMgr->sceneGraph().size());
+	EXPECT_TRUE(_sceneMgr->sceneGraph().hasNode(bId));
+	EXPECT_FALSE(_sceneMgr->sceneGraph().hasNode(aId));
+	EXPECT_FALSE(_sceneMgr->sceneGraph().hasNode(cId));
+}
+
+TEST_F(SceneManagerTest, testNodeRemoveLockedUndo) {
+	const int aId = _sceneMgr->sceneGraph().activeNode();
+	const int bId = _sceneMgr->addModelChild("b", 1, 1, 1);
+	const int cId = _sceneMgr->addModelChild("c", 1, 1, 1);
+	ASSERT_EQ(3u, _sceneMgr->sceneGraph().size());
+
+	ASSERT_TRUE(_sceneMgr->nodeSetLocked(aId, true));
+	ASSERT_TRUE(_sceneMgr->nodeSetLocked(cId, true));
+
+	EXPECT_EQ(2, _sceneMgr->nodeRemoveLocked());
+	EXPECT_EQ(1u, _sceneMgr->sceneGraph().size());
+	EXPECT_TRUE(_sceneMgr->sceneGraph().hasNode(bId));
+
+	// a single undo should restore both locked nodes (grouped memento). Node IDs are
+	// re-assigned on restore, so verify by model count rather than by original id.
+	ASSERT_TRUE(_sceneMgr->undo());
+	EXPECT_EQ(3u, _sceneMgr->sceneGraph().size());
+}
+
 // https://github.com/vengi-voxel/vengi/issues/425
 TEST_F(SceneManagerTest, testUnReferenceAndUndo) {
 	const int nodeId = _sceneMgr->sceneGraph().activeNode();
@@ -1315,7 +1362,11 @@ TEST_F(SceneManagerTest, testImportPalette) {
 	EXPECT_GT((int)palette.size(), 0);
 }
 
+#ifdef VENGI_COMPACT_VOXEL
+TEST_F(SceneManagerTest, DISABLED_testCalculateNormals) {
+#else
 TEST_F(SceneManagerTest, testCalculateNormals) {
+#endif
 	const voxel::Region region{0, 5};
 	ASSERT_TRUE(_sceneMgr->newScene(true, "normals_test", region));
 	const int nodeId = _sceneMgr->sceneGraph().activeNode();
@@ -1371,6 +1422,347 @@ TEST_F(SceneManagerTest, testFillHollow) {
 	sceneMgr()->testFillHollow();
 	const int voxelsAfter = voxelutil::countVoxels(*v);
 	EXPECT_GT(voxelsAfter, voxelsBefore) << "fillHollow should have filled the interior";
+}
+
+// Total non-air voxel count across every model node in the scene graph.
+// Helper for tests that run after `3dprint regrid`, which replaces the single
+// source node with many regridded cell-aligned nodes -- the original volume
+// pointer becomes stale and we need a scene-wide count to reason about fillholes
+// and erode results.
+static int64_t totalSolidVoxelsAcrossScene(scenegraph::SceneGraph &graph) {
+	int64_t total = 0;
+	for (auto iter = graph.beginModel(); iter != graph.end(); ++iter) {
+		scenegraph::SceneGraphNode &node = *iter;
+		const voxel::RawVolume *rv = node.volume();
+		if (rv == nullptr) {
+			continue;
+		}
+		total += (int64_t)voxelutil::countVoxels(*rv);
+	}
+	return total;
+}
+
+TEST_F(SceneManagerTest, test3dPrintFillHoles) {
+	// 21x21x21 hollow shell with a 1-voxel hole on the front face at world
+	// (10,10,0). Region width 21 chosen so that after `3dprint regrid 3` the
+	// scene splits into many cs=3 cells -- the chunked-cs=1 pipeline's coarse
+	// hierarchy needs more than one cs-aligned cell to find an interior cavity,
+	// so single-node tiny test scenes (the original 7x7x7 setup) abort with
+	// "no enclosed interior at coarse scale".
+	const voxel::Region region{0, 20};
+	ASSERT_TRUE(_sceneMgr->newScene(true, "3dprint_fillholes_test", region));
+	const int nodeId = _sceneMgr->sceneGraph().activeNode();
+	voxel::RawVolume *v = _sceneMgr->volume(nodeId);
+	ASSERT_NE(nullptr, v);
+
+	for (int x = 0; x <= 20; ++x) {
+		for (int y = 0; y <= 20; ++y) {
+			for (int z = 0; z <= 20; ++z) {
+				const bool onShell = (x == 0 || x == 20 || y == 0 || y == 20 || z == 0 || z == 20);
+				if (onShell) {
+					v->setVoxel(x, y, z, voxel::createVoxel(voxel::VoxelType::Generic, 1));
+				}
+			}
+		}
+	}
+	const glm::ivec3 holePos(10, 10, 0);
+	v->setVoxel(holePos, voxel::Voxel());
+	ASSERT_TRUE(voxel::isAir(v->voxel(holePos).getMaterial())) << "hole must start empty";
+
+	// Regrid first so the chunked pipeline has a real cs=3 hierarchy to work
+	// with. After regrid the original volume pointer `v` is stale -- the source
+	// node is replaced with many cell-aligned nodes.
+	ASSERT_EQ(1, command::Command::execute("3dprint regrid 3"));
+
+	const int64_t voxelsBefore = totalSolidVoxelsAcrossScene(_sceneMgr->sceneGraph());
+	ASSERT_EQ(1, command::Command::execute("3dprint fillholes"));
+	const int64_t voxelsAfter = totalSolidVoxelsAcrossScene(_sceneMgr->sceneGraph());
+
+	// Fillholes plugs the leak by placing solid voxel(s) along the BFS path
+	// where exterior meets interior -- not necessarily at the original hole
+	// position. Total voxel count must rise (something got plugged) and the
+	// model must now be voxel-watertight, which we verify by re-running
+	// fillholes and asserting 0 new voxels are added.
+	EXPECT_GT(voxelsAfter, voxelsBefore) << "fillholes should have plugged at least one voxel";
+	ASSERT_EQ(1, command::Command::execute("3dprint fillholes"));
+	const int64_t voxelsAfter2 = totalSolidVoxelsAcrossScene(_sceneMgr->sceneGraph());
+	EXPECT_EQ(voxelsAfter, voxelsAfter2) << "second fillholes call should find the model already watertight";
+}
+
+TEST_F(SceneManagerTest, test3dPrintFillHolesArgsAccepted) {
+	// Verifies the 3-arg form `3dprint fillholes <maxHoleSize> <minSolidNeighbors> <debugColor>`
+	// is parseable and runs successfully on the same hollow-shell scene as
+	// test3dPrintFillHoles. The debugColor arg is currently declared in the
+	// command schema but not wired through to runHoleFill (plug voxels always
+	// take the kFillColor palette entry); this test guards the dispatch path,
+	// not the color override semantics.
+	const voxel::Region region{0, 20};
+	ASSERT_TRUE(_sceneMgr->newScene(true, "3dprint_fillholes_args_test", region));
+	const int nodeId = _sceneMgr->sceneGraph().activeNode();
+	voxel::RawVolume *v = _sceneMgr->volume(nodeId);
+	ASSERT_NE(nullptr, v);
+
+	for (int x = 0; x <= 20; ++x) {
+		for (int y = 0; y <= 20; ++y) {
+			for (int z = 0; z <= 20; ++z) {
+				const bool onShell = (x == 0 || x == 20 || y == 0 || y == 20 || z == 0 || z == 20);
+				if (onShell) {
+					v->setVoxel(x, y, z, voxel::createVoxel(voxel::VoxelType::Generic, 1));
+				}
+			}
+		}
+	}
+	v->setVoxel(10, 10, 0, voxel::Voxel());
+
+	ASSERT_EQ(1, command::Command::execute("3dprint regrid 3"));
+	const int64_t voxelsBefore = totalSolidVoxelsAcrossScene(_sceneMgr->sceneGraph());
+	ASSERT_EQ(1, command::Command::execute("3dprint fillholes 1000 3 7"));
+	const int64_t voxelsAfter = totalSolidVoxelsAcrossScene(_sceneMgr->sceneGraph());
+	EXPECT_GT(voxelsAfter, voxelsBefore) << "fillholes should have plugged at least one voxel";
+}
+
+TEST_F(SceneManagerTest, test3dPrintErode) {
+	// Hollow shell with a solid block in the center. After regrid+fillholes
+	// (so the model is watertight at coarse scale) erode should remove the
+	// center block (it's buried) and the inner-facing shell voxels, keeping
+	// only the outermost shell skin facing exterior. End result: solid voxel
+	// count drops.
+	const voxel::Region region{0, 20};
+	ASSERT_TRUE(_sceneMgr->newScene(true, "3dprint_erode_test", region));
+	const int nodeId = _sceneMgr->sceneGraph().activeNode();
+	voxel::RawVolume *v = _sceneMgr->volume(nodeId);
+	ASSERT_NE(nullptr, v);
+
+	for (int x = 0; x <= 20; ++x) {
+		for (int y = 0; y <= 20; ++y) {
+			for (int z = 0; z <= 20; ++z) {
+				const bool onShell = (x == 0 || x == 20 || y == 0 || y == 20 || z == 0 || z == 20);
+				const bool inCenterBlock = (x >= 9 && x <= 11 && y >= 9 && y <= 11 && z >= 9 && z <= 11);
+				if (onShell || inCenterBlock) {
+					v->setVoxel(x, y, z, voxel::createVoxel(voxel::VoxelType::Generic, 1));
+				}
+			}
+		}
+	}
+
+	ASSERT_EQ(1, command::Command::execute("3dprint regrid 3"));
+	const int64_t voxelsBeforeErode = totalSolidVoxelsAcrossScene(_sceneMgr->sceneGraph());
+	ASSERT_GT(voxelsBeforeErode, 0);
+	ASSERT_EQ(1, command::Command::execute("3dprint erode"));
+	const int64_t voxelsAfterErode = totalSolidVoxelsAcrossScene(_sceneMgr->sceneGraph());
+	// Erode keeps only ext-facing voxels; the buried 3x3x3 center block must
+	// be gone, so the count must strictly decrease.
+	EXPECT_LT(voxelsAfterErode, voxelsBeforeErode)
+		<< "erode should have removed the buried center block and inner shell voxels";
+}
+
+TEST_F(SceneManagerTest, test3dPrintThicken) {
+	// 21x21x21 hollow shell. Thicken should add a 1-voxel-thick interior layer,
+	// strictly increasing the total solid voxel count.
+	const voxel::Region region{0, 20};
+	ASSERT_TRUE(_sceneMgr->newScene(true, "3dprint_thicken_test", region));
+	const int nodeId = _sceneMgr->sceneGraph().activeNode();
+	voxel::RawVolume *v = _sceneMgr->volume(nodeId);
+	ASSERT_NE(nullptr, v);
+
+	for (int x = 0; x <= 20; ++x) {
+		for (int y = 0; y <= 20; ++y) {
+			for (int z = 0; z <= 20; ++z) {
+				const bool onShell = (x == 0 || x == 20 || y == 0 || y == 20 || z == 0 || z == 20);
+				if (onShell) {
+					v->setVoxel(x, y, z, voxel::createVoxel(voxel::VoxelType::Generic, 1));
+				}
+			}
+		}
+	}
+
+	ASSERT_EQ(1, command::Command::execute("3dprint regrid 3"));
+	const int64_t voxelsBefore = totalSolidVoxelsAcrossScene(_sceneMgr->sceneGraph());
+	ASSERT_GT(voxelsBefore, 0);
+	ASSERT_EQ(1, command::Command::execute("3dprint thicken"));
+	const int64_t voxelsAfter = totalSolidVoxelsAcrossScene(_sceneMgr->sceneGraph());
+	EXPECT_GT(voxelsAfter, voxelsBefore)
+		<< "thicken should have added an interior wall layer";
+}
+
+TEST_F(SceneManagerTest, test3dPrintThickenSolidBlockIsNoop) {
+	// Fully solid block: no enclosed interior at coarse scale -> thicken
+	// warns and returns. Voxel count unchanged.
+	const voxel::Region region{0, 20};
+	ASSERT_TRUE(_sceneMgr->newScene(true, "3dprint_thicken_solid_test", region));
+	const int nodeId = _sceneMgr->sceneGraph().activeNode();
+	voxel::RawVolume *v = _sceneMgr->volume(nodeId);
+	ASSERT_NE(nullptr, v);
+
+	for (int x = 0; x <= 20; ++x) {
+		for (int y = 0; y <= 20; ++y) {
+			for (int z = 0; z <= 20; ++z) {
+				v->setVoxel(x, y, z, voxel::createVoxel(voxel::VoxelType::Generic, 1));
+			}
+		}
+	}
+
+	ASSERT_EQ(1, command::Command::execute("3dprint regrid 3"));
+	const int64_t voxelsBefore = totalSolidVoxelsAcrossScene(_sceneMgr->sceneGraph());
+	ASSERT_EQ(1, command::Command::execute("3dprint thicken"));
+	const int64_t voxelsAfter = totalSolidVoxelsAcrossScene(_sceneMgr->sceneGraph());
+	EXPECT_EQ(voxelsBefore, voxelsAfter)
+		<< "thicken on a fully-solid block has nothing to plug";
+}
+
+TEST_F(SceneManagerTest, test3dPrintThickenRepeatedGrowsWall) {
+	// Each thicken pass adds one cs=1 layer to the inside of the wall. Two
+	// passes should each grow the count -- the second pass operates on the
+	// shell that is now one voxel thicker but still has interior to consume.
+	const voxel::Region region{0, 20};
+	ASSERT_TRUE(_sceneMgr->newScene(true, "3dprint_thicken_repeat_test", region));
+	const int nodeId = _sceneMgr->sceneGraph().activeNode();
+	voxel::RawVolume *v = _sceneMgr->volume(nodeId);
+	ASSERT_NE(nullptr, v);
+
+	for (int x = 0; x <= 20; ++x) {
+		for (int y = 0; y <= 20; ++y) {
+			for (int z = 0; z <= 20; ++z) {
+				const bool onShell = (x == 0 || x == 20 || y == 0 || y == 20 || z == 0 || z == 20);
+				if (onShell) {
+					v->setVoxel(x, y, z, voxel::createVoxel(voxel::VoxelType::Generic, 1));
+				}
+			}
+		}
+	}
+
+	ASSERT_EQ(1, command::Command::execute("3dprint regrid 3"));
+	const int64_t v0 = totalSolidVoxelsAcrossScene(_sceneMgr->sceneGraph());
+	ASSERT_EQ(1, command::Command::execute("3dprint thicken"));
+	const int64_t v1 = totalSolidVoxelsAcrossScene(_sceneMgr->sceneGraph());
+	EXPECT_GT(v1, v0) << "first thicken pass should add voxels";
+	ASSERT_EQ(1, command::Command::execute("3dprint thicken"));
+	const int64_t v2 = totalSolidVoxelsAcrossScene(_sceneMgr->sceneGraph());
+	EXPECT_GT(v2, v1) << "second thicken pass should still add voxels (deeper interior layer)";
+}
+
+TEST_F(SceneManagerTest, test3dPrintFlatBaseRaise) {
+	// 10 columns, 1 outlier at Y=0 and 9 at Y=3. With default trimPercent=10 the
+	// outlier (10% of 10 = 1 sample) is dropped, target Y = 3. The outlier column
+	// should be raised: voxel at Y=0 cleared, voxel placed at Y=3.
+	const voxel::Region region{0, 9};
+	ASSERT_TRUE(_sceneMgr->newScene(true, "flatbase_raise_test", region));
+	const int nodeId = _sceneMgr->sceneGraph().activeNode();
+	voxel::RawVolume *v = _sceneMgr->volume(nodeId);
+	ASSERT_NE(nullptr, v);
+
+	// Outlier column at (0, _, 0) with a single voxel at Y=0.
+	v->setVoxel(0, 0, 0, voxel::createVoxel(voxel::VoxelType::Generic, 1));
+	// 9 cluster columns at z=1, x=0..8, each with a single voxel at Y=3.
+	for (int x = 0; x <= 8; ++x) {
+		v->setVoxel(x, 3, 1, voxel::createVoxel(voxel::VoxelType::Generic, 1));
+	}
+
+	ASSERT_EQ(1, command::Command::execute("3dprint flatbase 5 10 -1"));
+
+	EXPECT_TRUE(voxel::isAir(v->voxel(0, 0, 0).getMaterial())) << "outlier voxel at Y=0 should be cleared";
+	EXPECT_FALSE(voxel::isAir(v->voxel(0, 3, 0).getMaterial())) << "outlier column should be capped at target Y=3";
+	for (int x = 0; x <= 8; ++x) {
+		EXPECT_FALSE(voxel::isAir(v->voxel(x, 3, 1).getMaterial())) << "cluster column x=" << x << " should be untouched";
+	}
+}
+
+TEST_F(SceneManagerTest, test3dPrintFlatBaseLower) {
+	// 1 column at Y=0, 9 columns at Y=3. With trimPercent=0 the target = global min = 0.
+	// The 9 high columns must be lowered: voxels added at Y=0,1,2 in each.
+	const voxel::Region region{0, 9};
+	ASSERT_TRUE(_sceneMgr->newScene(true, "flatbase_lower_test", region));
+	const int nodeId = _sceneMgr->sceneGraph().activeNode();
+	voxel::RawVolume *v = _sceneMgr->volume(nodeId);
+	ASSERT_NE(nullptr, v);
+
+	v->setVoxel(0, 0, 0, voxel::createVoxel(voxel::VoxelType::Generic, 1));
+	for (int x = 0; x <= 8; ++x) {
+		v->setVoxel(x, 3, 1, voxel::createVoxel(voxel::VoxelType::Generic, 1));
+	}
+
+	ASSERT_EQ(1, command::Command::execute("3dprint flatbase 5 0 -1"));
+
+	// The single low column unchanged.
+	EXPECT_FALSE(voxel::isAir(v->voxel(0, 0, 0).getMaterial())) << "low column should remain";
+	// Each high column should now be solid from Y=0 through Y=3.
+	for (int x = 0; x <= 8; ++x) {
+		for (int y = 0; y <= 3; ++y) {
+			EXPECT_FALSE(voxel::isAir(v->voxel(x, y, 1).getMaterial()))
+				<< "lowered column x=" << x << " expected solid at Y=" << y;
+		}
+	}
+}
+
+TEST_F(SceneManagerTest, test3dPrintFlatBaseOutliers) {
+	// Same fixture as the Raise test (1 outlier at Y=0, 9 cluster columns at Y=3) but
+	// run with trimPercent=0 to verify trimming actually changes the target plane.
+	// With no trim, target = 0 -> 9 columns lowered (the inverse of the Raise case).
+	const voxel::Region region{0, 9};
+	ASSERT_TRUE(_sceneMgr->newScene(true, "flatbase_outliers_test", region));
+	const int nodeId = _sceneMgr->sceneGraph().activeNode();
+	voxel::RawVolume *v = _sceneMgr->volume(nodeId);
+	ASSERT_NE(nullptr, v);
+
+	v->setVoxel(0, 0, 0, voxel::createVoxel(voxel::VoxelType::Generic, 1));
+	for (int x = 0; x <= 8; ++x) {
+		v->setVoxel(x, 3, 1, voxel::createVoxel(voxel::VoxelType::Generic, 1));
+	}
+
+	ASSERT_EQ(1, command::Command::execute("3dprint flatbase 5 0 -1"));
+
+	// Outlier column unchanged.
+	EXPECT_FALSE(voxel::isAir(v->voxel(0, 0, 0).getMaterial())) << "outlier column should remain at target Y=0";
+	// Each cluster column got voxels added down to Y=0.
+	for (int x = 0; x <= 8; ++x) {
+		EXPECT_FALSE(voxel::isAir(v->voxel(x, 0, 1).getMaterial()))
+			<< "cluster column x=" << x << " should be lowered to Y=0";
+	}
+}
+
+TEST_F(SceneManagerTest, test3dPrintFlatBaseNonBottomNodeIgnored) {
+	// Two-node scene: a base node at translation (0,0,0) and a tower node sitting far
+	// above (translation Y=20). The tower's regionMinWorldY is well outside slabThickness
+	// of the base, so flatbase must leave it untouched.
+	const voxel::Region region{0, 5};
+	ASSERT_TRUE(_sceneMgr->newScene(true, "flatbase_tower_test", region));
+	const int baseNodeId = _sceneMgr->sceneGraph().activeNode();
+	voxel::RawVolume *baseVol = _sceneMgr->volume(baseNodeId);
+	ASSERT_NE(nullptr, baseVol);
+
+	// Base columns: 1 outlier at Y=0, several at Y=2 -- so trim=10 will raise the outlier.
+	baseVol->setVoxel(0, 0, 0, voxel::createVoxel(voxel::VoxelType::Generic, 1));
+	for (int x = 1; x <= 5; ++x) {
+		baseVol->setVoxel(x, 2, 0, voxel::createVoxel(voxel::VoxelType::Generic, 1));
+	}
+	for (int x = 0; x <= 5; ++x) {
+		baseVol->setVoxel(x, 2, 1, voxel::createVoxel(voxel::VoxelType::Generic, 1));
+	}
+
+	// Tower node sitting 20 units above the base.
+	const int rootNodeId = _sceneMgr->sceneGraph().root().id();
+	scenegraph::SceneGraphNode towerNode(scenegraph::SceneGraphNodeType::Model);
+	towerNode.createVolume(region);
+	towerNode.setName("tower");
+	scenegraph::SceneGraphTransform towerTransform;
+	towerTransform.setWorldTranslation(glm::vec3(0.0f, 20.0f, 0.0f));
+	towerNode.keyFrame(0).setTransform(towerTransform);
+	const int towerNodeId = _sceneMgr->moveNodeToSceneGraph(towerNode, rootNodeId);
+	ASSERT_NE(InvalidNodeId, towerNodeId);
+	voxel::RawVolume *towerVol = _sceneMgr->volume(towerNodeId);
+	ASSERT_NE(nullptr, towerVol);
+	// Single tower-floor voxel at local Y=0 (world Y=20).
+	towerVol->setVoxel(0, 0, 0, voxel::createVoxel(voxel::VoxelType::Generic, 1));
+
+	ASSERT_EQ(1, command::Command::execute("3dprint flatbase 5 10 -1"));
+
+	// Tower must be untouched: still exactly one solid voxel at local (0,0,0).
+	EXPECT_FALSE(voxel::isAir(towerVol->voxel(0, 0, 0).getMaterial())) << "tower's original voxel must remain";
+	EXPECT_EQ(1, voxelutil::countVoxels(*towerVol)) << "tower should not gain any new voxels";
+
+	// Base outlier column raised to target Y=2 (after trim of the lone Y=0 sample).
+	EXPECT_TRUE(voxel::isAir(baseVol->voxel(0, 0, 0).getMaterial())) << "base outlier voxel should be cleared";
+	EXPECT_FALSE(voxel::isAir(baseVol->voxel(0, 2, 0).getMaterial())) << "base outlier column should land at target Y=2";
 }
 
 TEST_F(SceneManagerTest, testFill) {
@@ -1780,7 +2172,11 @@ TEST_F(SceneManagerTest, testFillPlane) {
 	_sceneMgr->fillPlane(img);
 }
 
+#ifdef VENGI_COMPACT_VOXEL
+TEST_F(SceneManagerTest, DISABLED_testNodeUpdateVoxelType) {
+#else
 TEST_F(SceneManagerTest, testNodeUpdateVoxelType) {
+#endif
 	const int nodeId = _sceneMgr->sceneGraph().activeNode();
 	ASSERT_TRUE(testSetVoxel(testMins(), 1));
 	voxel::RawVolume *v = _sceneMgr->volume(nodeId);
@@ -2274,6 +2670,171 @@ TEST_F(SceneManagerTest, testMergeActiveToBackgroundExpandsNode) {
 	EXPECT_FALSE(voxel::isAir(resultVol->voxel(8, 8, 8).getMaterial()));
 }
 
+// Regression: the active node must overwrite (including carving air into) an overlapping
+// background node even when that node is NOT aligned to the chunk grid. Matching background
+// nodes by grid-cell origin equality missed non-aligned nodes, so the source carved air into
+// a freshly created solid-only node instead of the real overlapping node, and air never
+// appeared to overwrite the destination.
+TEST_F(SceneManagerTest, testMergeActiveToBackgroundCarvesNonGridAlignedNode) {
+	// Use the smallest allowed chunk grid (32) and straddle a cell boundary.
+	util::ScopedVarChange chunk(cfg::VoxEditMaxSuggestedVolumeSize, "32");
+
+	// Background node spans several 32^3 cells; its lower corner is in cell 0 but the overlap
+	// with the source falls in cell (32,32,32) - the case the old origin match never matched.
+	const voxel::Region targetRegion(0, 79);
+	ASSERT_TRUE(_sceneMgr->newScene(true, "merge_nonaligned", targetRegion));
+	const int targetNodeId = _sceneMgr->sceneGraph().activeNode();
+	voxel::RawVolume *targetVol = _sceneMgr->volume(targetNodeId);
+	ASSERT_NE(nullptr, targetVol);
+	targetVol->setVoxel(5, 5, 5, voxel::createVoxel(voxel::VoxelType::Generic, 1));	 // outside overlap
+	targetVol->setVoxel(45, 45, 45, voxel::createVoxel(voxel::VoxelType::Generic, 1)); // must be carved
+	_sceneMgr->modified(targetNodeId, targetVol->region());
+
+	// Source node in cell (32,32,32): solid at (42,42,42), air at (45,45,45) to carve the target.
+	const int rootNodeId = _sceneMgr->sceneGraph().root().id();
+	scenegraph::SceneGraphNode sourceNode(scenegraph::SceneGraphNodeType::Model);
+	sourceNode.createVolume(voxel::Region(40, 50));
+	sourceNode.setName("source_nonaligned");
+	const int sourceNodeId = _sceneMgr->moveNodeToSceneGraph(sourceNode, rootNodeId);
+	ASSERT_NE(InvalidNodeId, sourceNodeId);
+	voxel::RawVolume *sourceVol = _sceneMgr->volume(sourceNodeId);
+	ASSERT_NE(nullptr, sourceVol);
+	sourceVol->setVoxel(42, 42, 42, voxel::createVoxel(voxel::VoxelType::Generic, 2));
+	// (45,45,45) intentionally air in source
+	_sceneMgr->modified(sourceNodeId, sourceVol->region());
+
+	_sceneMgr->nodeActivate(sourceNodeId);
+	ASSERT_TRUE(_sceneMgr->mergeActiveToBackground());
+
+	// Source removed
+	EXPECT_EQ(nullptr, _sceneMgr->sceneGraphNode(sourceNodeId));
+
+	// The existing background node must have been carved/overwritten in place.
+	const scenegraph::SceneGraphNode *resultNode = _sceneMgr->sceneGraphModelNode(targetNodeId);
+	ASSERT_NE(nullptr, resultNode);
+	const voxel::RawVolume *resultVol = resultNode->volume();
+	ASSERT_NE(nullptr, resultVol);
+	EXPECT_TRUE(voxel::isAir(resultVol->voxel(45, 45, 45).getMaterial()))
+		<< "source air must carve the overlapping background voxel";
+	EXPECT_FALSE(voxel::isAir(resultVol->voxel(42, 42, 42).getMaterial()))
+		<< "source solid must be stamped into the background node";
+	EXPECT_FALSE(voxel::isAir(resultVol->voxel(5, 5, 5).getMaterial()))
+		<< "a voxel outside the source overlap must be untouched";
+}
+
+// Regression: merging a node back whose bounding box is huge and mostly empty (e.g. the result
+// of merging several spread-out nodes into one) must route each populated region to its owning
+// background node without enumerating or allocating the empty gap between clusters. Previously
+// this enumerated the whole bounding box and grew destination nodes to unbounded unions, which
+// could allocate tens of gigabytes and crash. The work here is bounded by content, so the test
+// completes immediately.
+TEST_F(SceneManagerTest, testMergeActiveToBackgroundSpreadOut) {
+	util::ScopedVarChange chunk(cfg::VoxEditMaxSuggestedVolumeSize, "32");
+
+	// Two background nodes far apart in world space: cell (0,0,0) and cell (320,320,320).
+	const voxel::Region regionA(0, 31);
+	ASSERT_TRUE(_sceneMgr->newScene(true, "merge_spreadout", regionA));
+	const int nodeAId = _sceneMgr->sceneGraph().activeNode();
+
+	const int rootNodeId = _sceneMgr->sceneGraph().root().id();
+	scenegraph::SceneGraphNode nodeB(scenegraph::SceneGraphNodeType::Model);
+	nodeB.createVolume(voxel::Region(320, 351));
+	nodeB.setName("background_b");
+	const int nodeBId = _sceneMgr->moveNodeToSceneGraph(nodeB, rootNodeId);
+	ASSERT_NE(InvalidNodeId, nodeBId);
+
+	const size_t nodeCountBefore = _sceneMgr->sceneGraph().size();
+
+	// Source spans both clusters (a 352^3 mostly-empty bounding box) with content only at the
+	// two cluster locations.
+	scenegraph::SceneGraphNode sourceNode(scenegraph::SceneGraphNodeType::Model);
+	sourceNode.createVolume(voxel::Region(0, 351));
+	sourceNode.setName("spread_source");
+	const int sourceNodeId = _sceneMgr->moveNodeToSceneGraph(sourceNode, rootNodeId);
+	ASSERT_NE(InvalidNodeId, sourceNodeId);
+	voxel::RawVolume *sourceVol = _sceneMgr->volume(sourceNodeId);
+	ASSERT_NE(nullptr, sourceVol);
+	sourceVol->setVoxel(5, 5, 5, voxel::createVoxel(voxel::VoxelType::Generic, 2));
+	sourceVol->setVoxel(325, 325, 325, voxel::createVoxel(voxel::VoxelType::Generic, 2));
+	_sceneMgr->modified(sourceNodeId, sourceVol->region());
+
+	_sceneMgr->nodeActivate(sourceNodeId);
+	ASSERT_TRUE(_sceneMgr->mergeActiveToBackground());
+
+	// Source consumed.
+	EXPECT_EQ(nullptr, _sceneMgr->sceneGraphNode(sourceNodeId));
+
+	// Each cluster landed in its owning background node; no new node was created for the gap.
+	const scenegraph::SceneGraphNode *resultA = _sceneMgr->sceneGraphModelNode(nodeAId);
+	const scenegraph::SceneGraphNode *resultB = _sceneMgr->sceneGraphModelNode(nodeBId);
+	ASSERT_NE(nullptr, resultA);
+	ASSERT_NE(nullptr, resultB);
+	EXPECT_FALSE(voxel::isAir(resultA->volume()->voxel(5, 5, 5).getMaterial()));
+	EXPECT_FALSE(voxel::isAir(resultB->volume()->voxel(325, 325, 325).getMaterial()));
+	EXPECT_EQ(nodeCountBefore, _sceneMgr->sceneGraph().size())
+		<< "the empty gap between clusters must not create extra nodes";
+}
+
+// Regression: two background nodes overlapping each other in the same grid cell. Only the first
+// (primary) owner used to receive the source stamp, so the second node kept its old voxels and
+// they showed through the merged result (the renderer draws the union of all nodes). The source
+// must be stamped into every overlapping background node, carving/replacing the stale content.
+TEST_F(SceneManagerTest, testMergeActiveToBackgroundOverlappingNodes) {
+	util::ScopedVarChange chunk(cfg::VoxEditMaxSuggestedVolumeSize, "32");
+
+	const voxel::Region region(0, 31);
+	ASSERT_TRUE(_sceneMgr->newScene(true, "merge_overlap", region));
+
+	// Background node A (the primary owner of the cell).
+	const int nodeAId = _sceneMgr->sceneGraph().activeNode();
+	voxel::RawVolume *volA = _sceneMgr->volume(nodeAId);
+	ASSERT_NE(nullptr, volA);
+	volA->setVoxel(10, 10, 10, voxel::createVoxel(voxel::VoxelType::Generic, 1)); // must be carved
+	_sceneMgr->modified(nodeAId, volA->region());
+
+	// Background node B fully overlapping A in world space (same region, identity transform).
+	const int rootNodeId = _sceneMgr->sceneGraph().root().id();
+	scenegraph::SceneGraphNode nodeB(scenegraph::SceneGraphNodeType::Model);
+	nodeB.createVolume(region);
+	nodeB.setName("background_b");
+	const int nodeBId = _sceneMgr->moveNodeToSceneGraph(nodeB, rootNodeId);
+	ASSERT_NE(InvalidNodeId, nodeBId);
+	voxel::RawVolume *volB = _sceneMgr->volume(nodeBId);
+	ASSERT_NE(nullptr, volB);
+	volB->setVoxel(10, 10, 10, voxel::createVoxel(voxel::VoxelType::Generic, 1)); // must be carved too
+	_sceneMgr->modified(nodeBId, volB->region());
+
+	// Source: solid at (20,20,20), air at (10,10,10) to carve both background nodes.
+	scenegraph::SceneGraphNode sourceNode(scenegraph::SceneGraphNodeType::Model);
+	sourceNode.createVolume(region);
+	sourceNode.setName("overlap_source");
+	const int sourceNodeId = _sceneMgr->moveNodeToSceneGraph(sourceNode, rootNodeId);
+	ASSERT_NE(InvalidNodeId, sourceNodeId);
+	voxel::RawVolume *sourceVol = _sceneMgr->volume(sourceNodeId);
+	ASSERT_NE(nullptr, sourceVol);
+	sourceVol->setVoxel(20, 20, 20, voxel::createVoxel(voxel::VoxelType::Generic, 2));
+	// (10,10,10) intentionally air in source
+	_sceneMgr->modified(sourceNodeId, sourceVol->region());
+
+	_sceneMgr->nodeActivate(sourceNodeId);
+	ASSERT_TRUE(_sceneMgr->mergeActiveToBackground());
+
+	// Source consumed; both background nodes survive.
+	EXPECT_EQ(nullptr, _sceneMgr->sceneGraphNode(sourceNodeId));
+	const scenegraph::SceneGraphNode *resultA = _sceneMgr->sceneGraphModelNode(nodeAId);
+	const scenegraph::SceneGraphNode *resultB = _sceneMgr->sceneGraphModelNode(nodeBId);
+	ASSERT_NE(nullptr, resultA);
+	ASSERT_NE(nullptr, resultB);
+
+	// Both nodes get the source stamped: solid placed, stale voxel carved away.
+	EXPECT_FALSE(voxel::isAir(resultA->volume()->voxel(20, 20, 20).getMaterial()));
+	EXPECT_FALSE(voxel::isAir(resultB->volume()->voxel(20, 20, 20).getMaterial()))
+		<< "source solid must be stamped into the secondary overlapping node too";
+	EXPECT_TRUE(voxel::isAir(resultA->volume()->voxel(10, 10, 10).getMaterial()));
+	EXPECT_TRUE(voxel::isAir(resultB->volume()->voxel(10, 10, 10).getMaterial()))
+		<< "source air must carve the stale voxel in the secondary overlapping node";
+}
+
 TEST_F(SceneManagerTest, testMergeVisibleToTemp) {
 	const voxel::Region region{0, 9};
 	ASSERT_TRUE(_sceneMgr->newScene(true, "mergevisible_test", region));
@@ -2755,6 +3316,420 @@ TEST_F(SceneManagerTest, testAddModelAdjacentIgnoreOverlap) {
 	EXPECT_EQ(InvalidNodeId, _sceneMgr->addModelAdjacent(sourceNodeId, voxel::FaceNames::PositiveX));
 	core::getVar(cfg::VoxEditAddNodeIgnoreOverlap)->setVal(true);
 	EXPECT_NE(InvalidNodeId, _sceneMgr->addModelAdjacent(sourceNodeId, voxel::FaceNames::PositiveX));
+}
+// Regression: undoing an additive overlapping selection should restore the pre-selection
+// state, i.e. the original selection A plus nothing more. Overlapping second selection
+// with a partially-overlapping region should leave only A selected after undo, but an
+// "invisible box" area may stay selected due to memento capture boundaries.
+TEST_F(SceneManagerTest, testUndoOverlappingSelection) {
+	const voxel::Region region{0, 9};
+	ASSERT_TRUE(_sceneMgr->newScene(true, "overlapsel_test", region));
+	const int nodeId = _sceneMgr->sceneGraph().activeNode();
+	voxel::RawVolume *v = _sceneMgr->volume(nodeId);
+	ASSERT_NE(nullptr, v);
+
+	// Fill with solid voxels so FlagOutline changes are observable
+	for (int z = 0; z <= 9; ++z) {
+		for (int y = 0; y <= 9; ++y) {
+			for (int x = 0; x <= 9; ++x) {
+				v->setVoxel(x, y, z, voxel::createVoxel(voxel::VoxelType::Generic, 1));
+			}
+		}
+	}
+
+	scenegraph::SceneGraphNode *node = _sceneMgr->sceneGraphModelNode(nodeId);
+	ASSERT_NE(nullptr, node);
+
+	// Zone A: x in [0..4] - creates memento state 1
+	const voxel::Region zoneA{glm::ivec3(0, 0, 0), glm::ivec3(4, 9, 9)};
+	node->select(zoneA);
+	_sceneMgr->modified(nodeId, zoneA, SceneModifiedFlags::All);
+
+	// Zone B (overlapping): x in [2..6] - creates memento state 2
+	const voxel::Region zoneB{glm::ivec3(2, 0, 0), glm::ivec3(6, 9, 9)};
+	node->select(zoneB);
+	_sceneMgr->modified(nodeId, zoneB, SceneModifiedFlags::All);
+
+	// Verify pre-undo state: union A ∪ B is selected
+	for (int x = 0; x <= 9; ++x) {
+		const bool expected = (x <= 6);
+		const bool actual = (v->voxel(x, 0, 0).getFlags() & voxel::FlagOutline) != 0;
+		EXPECT_EQ(expected, actual) << "pre-undo x=" << x;
+	}
+
+	// Undo zone B
+	ASSERT_TRUE(_sceneMgr->undo());
+
+	// After undo, only zone A should be selected
+	for (int x = 0; x <= 9; ++x) {
+		const bool expected = (x <= 4);
+		const bool actual = (v->voxel(x, 0, 0).getFlags() & voxel::FlagOutline) != 0;
+		EXPECT_EQ(expected, actual) << "post-undo x=" << x << " (expected zone A only)";
+	}
+}
+
+// Regression: lasso selection + undo on top of an existing zone selection must revert only
+// the voxels the lasso added, leaving zone A untouched. User-reported bug: "invisible box"
+// where polygon-bbox voxels retained the selection flag after undo.
+TEST_F(SceneManagerTest, testUndoLassoOverlappingSelection) {
+	// Flat XZ panel at y=0 so visitSurfaceVolume covers every panel voxel
+	const voxel::Region region{0, 9};
+	ASSERT_TRUE(_sceneMgr->newScene(true, "lasso_overlap", region));
+	const int nodeId = _sceneMgr->sceneGraph().activeNode();
+	voxel::RawVolume *v = _sceneMgr->volume(nodeId);
+	ASSERT_NE(nullptr, v);
+	for (int z = 0; z <= 9; ++z) {
+		for (int x = 0; x <= 9; ++x) {
+			v->setVoxel(x, 0, z, voxel::createVoxel(voxel::VoxelType::Generic, 1));
+		}
+	}
+
+	scenegraph::SceneGraphNode *node = _sceneMgr->sceneGraphModelNode(nodeId);
+	ASSERT_NE(nullptr, node);
+
+	// Zone A: x in [0..4], z in [0..9] - creates memento state 1
+	const voxel::Region zoneA{glm::ivec3(0, 0, 0), glm::ivec3(4, 0, 9)};
+	node->select(zoneA);
+	_sceneMgr->modified(nodeId, zoneA, SceneModifiedFlags::All);
+
+	// Set up lasso: drive beginBrush() to push vertices onto _lassoPath
+	Modifier &modifier = _sceneMgr->modifier();
+	modifier.setBrushType(BrushType::Select);
+	SelectBrush &selBrush = modifier.selectBrush();
+	selBrush.setSelectMode(SelectMode::PolygonLasso);
+
+	// Square polygon over x in [2..6], z in [2..6] - overlaps zone A (x in [2..4])
+	auto clickVertex = [&](const glm::ivec3 &pos) {
+		modifier.setCursorPosition(pos, voxel::FaceNames::PositiveY);
+		modifier.beginBrush();
+	};
+	clickVertex(glm::ivec3(2, 0, 2));
+	clickVertex(glm::ivec3(6, 0, 2));
+	clickVertex(glm::ivec3(6, 0, 6));
+	clickVertex(glm::ivec3(2, 0, 6));
+
+	ASSERT_TRUE(selBrush.polygonLasso().accumulating());
+	ASSERT_EQ((int)selBrush.polygonLasso().path().size(), 4);
+
+	// Finalize the polygon -> creates memento state 2 with All flag
+	_sceneMgr->selectionFinalizeLasso(nodeId);
+
+	// Sanity: after finalize, zone A (x<=4) plus polygon interior (x in [2..6], z in [2..6]) selected
+	// Check panel voxels at z=4 (inside polygon for x in [3..5], edge-inclusive depends on lassoContains)
+	// Voxels on row z=0 should reflect zone A only (not inside polygon at z=0)
+	for (int x = 0; x <= 9; ++x) {
+		const bool expected = (x <= 4); // only zone A (polygon doesn't overlap z=0)
+		const bool actual = (v->voxel(x, 0, 0).getFlags() & voxel::FlagOutline) != 0;
+		EXPECT_EQ(expected, actual) << "pre-undo row z=0 x=" << x;
+	}
+
+	// Undo the lasso
+	ASSERT_TRUE(_sceneMgr->undo());
+
+	// After undo: only zone A must remain. The critical row is z in [2..6] where
+	// polygon voxels OUTSIDE zone A (x in [5..6]) must be cleared AND voxels
+	// INSIDE zone A (x in [2..4]) must still be selected
+	for (int z = 0; z <= 9; ++z) {
+		for (int x = 0; x <= 9; ++x) {
+			const bool expected = (x <= 4); // zone A only
+			const bool actual = (v->voxel(x, 0, z).getFlags() & voxel::FlagOutline) != 0;
+			EXPECT_EQ(expected, actual) << "post-undo x=" << x << " z=" << z;
+		}
+	}
+}
+
+// The in-progress polygon is rendered as a viewport overlay (BrushGizmo_WorldPolyline),
+// not by writing FlagOutline marks onto the volume. Dropping vertices during accumulation
+// must therefore leave the volume completely unmarked; the selection only appears on close.
+TEST_F(SceneManagerTest, testLassoAccumulationLeavesVolumeUnmarked) {
+	const voxel::Region region{0, 9};
+	ASSERT_TRUE(_sceneMgr->newScene(true, "lasso_overlay", region));
+	const int nodeId = _sceneMgr->sceneGraph().activeNode();
+	voxel::RawVolume *v = _sceneMgr->volume(nodeId);
+	ASSERT_NE(nullptr, v);
+	for (int z = 0; z <= 9; ++z) {
+		for (int x = 0; x <= 9; ++x) {
+			v->setVoxel(x, 0, z, voxel::createVoxel(voxel::VoxelType::Generic, 1));
+		}
+	}
+
+	Modifier &modifier = _sceneMgr->modifier();
+	modifier.setBrushType(BrushType::Select);
+	SelectBrush &selBrush = modifier.selectBrush();
+	selBrush.setSelectMode(SelectMode::PolygonLasso);
+
+	auto clickVertex = [&](const glm::ivec3 &pos) {
+		modifier.setCursorPosition(pos, voxel::FaceNames::PositiveY);
+		modifier.beginBrush();
+	};
+	clickVertex(glm::ivec3(2, 0, 2));
+	clickVertex(glm::ivec3(6, 0, 2));
+	clickVertex(glm::ivec3(6, 0, 6));
+	clickVertex(glm::ivec3(2, 0, 6));
+
+	ASSERT_TRUE(selBrush.polygonLasso().accumulating());
+	ASSERT_EQ((int)selBrush.polygonLasso().path().size(), 4);
+
+	// During accumulation nothing must be written to the volume.
+	for (int z = 0; z <= 9; ++z) {
+		for (int x = 0; x <= 9; ++x) {
+			EXPECT_EQ(0, v->voxel(x, 0, z).getFlags() & voxel::FlagOutline)
+				<< "accumulation must not mark the volume at x=" << x << " z=" << z;
+		}
+	}
+
+	// Dropping a vertex stays overlay-only too.
+	_sceneMgr->selectionLassoUndoVertex(nodeId);
+	EXPECT_EQ((int)selBrush.polygonLasso().path().size(), 3);
+	for (int z = 0; z <= 9; ++z) {
+		for (int x = 0; x <= 9; ++x) {
+			EXPECT_EQ(0, v->voxel(x, 0, z).getFlags() & voxel::FlagOutline)
+				<< "vertex undo must not mark the volume at x=" << x << " z=" << z;
+		}
+	}
+
+	// On close the selection finally appears on the volume.
+	_sceneMgr->selectionFinalizeLasso(nodeId);
+	EXPECT_FALSE(selBrush.polygonLasso().accumulating());
+	bool anySelected = false;
+	for (int z = 0; z <= 9 && !anySelected; ++z) {
+		for (int x = 0; x <= 9; ++x) {
+			if (v->voxel(x, 0, z).getFlags() & voxel::FlagOutline) {
+				anySelected = true;
+				break;
+			}
+		}
+	}
+	EXPECT_TRUE(anySelected) << "closing the polygon must produce a selection";
+}
+
+// Large-volume variant: user reported the bug on a panel >= 128x128. Exercise the lasso
+// undo on a 200x200x2 panel to see if any size-dependent path (parallel visitor, memento
+// chunking, selection region cache threshold) triggers the "invisible box" regression.
+TEST_F(SceneManagerTest, testUndoLassoOverlappingSelectionLargeVolume) {
+	const voxel::Region region{glm::ivec3(0, 0, 0), glm::ivec3(199, 1, 199)};
+	ASSERT_TRUE(_sceneMgr->newScene(true, "lasso_overlap_big", region));
+	const int nodeId = _sceneMgr->sceneGraph().activeNode();
+	voxel::RawVolume *v = _sceneMgr->volume(nodeId);
+	ASSERT_NE(nullptr, v);
+
+	// Flat XZ panel at y=0, spanning x,z in [0..199]
+	for (int z = 0; z <= 199; ++z) {
+		for (int x = 0; x <= 199; ++x) {
+			v->setVoxel(x, 0, z, voxel::createVoxel(voxel::VoxelType::Generic, 1));
+		}
+	}
+
+	scenegraph::SceneGraphNode *node = _sceneMgr->sceneGraphModelNode(nodeId);
+	ASSERT_NE(nullptr, node);
+
+	// Zone A: x in [0..100]
+	const voxel::Region zoneA{glm::ivec3(0, 0, 0), glm::ivec3(100, 0, 199)};
+	node->select(zoneA);
+	_sceneMgr->modified(nodeId, zoneA, SceneModifiedFlags::All);
+
+	// Lasso polygon overlapping zone A: square at x in [50..150], z in [50..150]
+	Modifier &modifier = _sceneMgr->modifier();
+	modifier.setBrushType(BrushType::Select);
+	SelectBrush &selBrush = modifier.selectBrush();
+	selBrush.setSelectMode(SelectMode::PolygonLasso);
+
+	auto clickVertex = [&](const glm::ivec3 &pos) {
+		modifier.setCursorPosition(pos, voxel::FaceNames::PositiveY);
+		modifier.beginBrush();
+	};
+	clickVertex(glm::ivec3(50, 0, 50));
+	clickVertex(glm::ivec3(150, 0, 50));
+	clickVertex(glm::ivec3(150, 0, 150));
+	clickVertex(glm::ivec3(50, 0, 150));
+
+	ASSERT_TRUE(selBrush.polygonLasso().accumulating());
+	ASSERT_EQ((int)selBrush.polygonLasso().path().size(), 4);
+
+	_sceneMgr->selectionFinalizeLasso(nodeId);
+
+	// Undo the lasso
+	ASSERT_TRUE(_sceneMgr->undo());
+
+	// After undo: only zone A must remain selected. Sample the critical row at z=100
+	// which intersects both zone A (x<=100) and polygon (x in [50..150]).
+	int unexpectedSelected = 0;
+	glm::ivec3 firstBad(-1);
+	for (int z = 0; z <= 199; ++z) {
+		for (int x = 0; x <= 199; ++x) {
+			const bool expected = (x <= 100); // zone A only
+			const bool actual = (v->voxel(x, 0, z).getFlags() & voxel::FlagOutline) != 0;
+			if (expected != actual) {
+				if (unexpectedSelected == 0) {
+					firstBad = glm::ivec3(x, 0, z);
+				}
+				++unexpectedSelected;
+			}
+		}
+	}
+	EXPECT_EQ(unexpectedSelected, 0)
+		<< "post-undo mismatches: " << unexpectedSelected
+		<< " first at " << firstBad.x << "," << firstBad.y << "," << firstBad.z;
+}
+
+// Same scenario but drive via the real executeBrush flow (Path A - polygon close via
+// beginBrush triggers visitSurfaceVolume through the ModifierVolumeWrapper) rather than
+// the finalizelasso command (Path B - direct selectionFinalizeLasso). This matches the
+// click-to-close UI path the user exercises.
+TEST_F(SceneManagerTest, testUndoLassoOverlappingSelectionViaExecuteBrush) {
+	const voxel::Region region{glm::ivec3(0, 0, 0), glm::ivec3(199, 1, 199)};
+	ASSERT_TRUE(_sceneMgr->newScene(true, "lasso_overlap_exec", region));
+	const int nodeId = _sceneMgr->sceneGraph().activeNode();
+	voxel::RawVolume *v = _sceneMgr->volume(nodeId);
+	ASSERT_NE(nullptr, v);
+
+	for (int z = 0; z <= 199; ++z) {
+		for (int x = 0; x <= 199; ++x) {
+			v->setVoxel(x, 0, z, voxel::createVoxel(voxel::VoxelType::Generic, 1));
+		}
+	}
+
+	scenegraph::SceneGraphNode *node = _sceneMgr->sceneGraphModelNode(nodeId);
+	ASSERT_NE(nullptr, node);
+
+	// Zone A via node->select (simulate a pre-existing selection)
+	const voxel::Region zoneA{glm::ivec3(0, 0, 0), glm::ivec3(100, 0, 199)};
+	node->select(zoneA);
+	_sceneMgr->modified(nodeId, zoneA, SceneModifiedFlags::All);
+
+	// Drive the real brush flow: beginBrush + execute for each click
+	Modifier &modifier = _sceneMgr->modifier();
+	modifier.setBrushType(BrushType::Select);
+	SelectBrush &selBrush = modifier.selectBrush();
+	selBrush.setSelectMode(SelectMode::PolygonLasso);
+
+	scenegraph::SceneGraph &sg = _sceneMgr->sceneGraph();
+	auto clickAndExecute = [&](const glm::ivec3 &pos) {
+		modifier.setCursorPosition(pos, voxel::FaceNames::PositiveY);
+		EXPECT_TRUE(modifier.beginBrush());
+		auto cb = [&](const voxel::Region &modRegion, ModifierType, SceneModifiedFlags flags) {
+			_sceneMgr->modified(nodeId, modRegion, flags);
+		};
+		EXPECT_TRUE(modifier.execute(sg, *node, cb));
+	};
+
+	// 4 vertices + 5th click at first vertex to close polygon (triggers Path A)
+	clickAndExecute(glm::ivec3(50, 0, 50));
+	clickAndExecute(glm::ivec3(150, 0, 50));
+	clickAndExecute(glm::ivec3(150, 0, 150));
+	clickAndExecute(glm::ivec3(50, 0, 150));
+	clickAndExecute(glm::ivec3(50, 0, 50)); // close
+
+	// After polygon close execute runs visitSurfaceVolume -> wrapper.setFlagAt over polygon
+	// interior. Pre-undo sanity: expect selected = (x<=100) OR inside polygon bbox surface
+	// Undo must revert to zone A only.
+	ASSERT_TRUE(_sceneMgr->undo());
+
+	int unexpectedSelected = 0;
+	glm::ivec3 firstBad(-1);
+	for (int z = 0; z <= 199; ++z) {
+		for (int x = 0; x <= 199; ++x) {
+			const bool expected = (x <= 100);
+			const bool actual = (v->voxel(x, 0, z).getFlags() & voxel::FlagOutline) != 0;
+			if (expected != actual) {
+				if (unexpectedSelected == 0) {
+					firstBad = glm::ivec3(x, 0, z);
+				}
+				++unexpectedSelected;
+			}
+		}
+	}
+	EXPECT_EQ(unexpectedSelected, 0)
+		<< "post-undo mismatches: " << unexpectedSelected
+		<< " first at " << firstBad.x << "," << firstBad.y << "," << firstBad.z;
+}
+
+// Matches the exact user scenario: Select brush in "All" mode with an AABB rectangle
+// (the "pole"), then Lasso drawing a crossing polygon, then undo. User reports that
+// only part of the crossing pole gets reverted.
+TEST_F(SceneManagerTest, testUndoLassoAfterSelectAllRectangle) {
+	const voxel::Region fullRegion{glm::ivec3(0, 0, 0), glm::ivec3(199, 1, 199)};
+	ASSERT_TRUE(_sceneMgr->newScene(true, "lasso_crossing", fullRegion));
+	const int nodeId = _sceneMgr->sceneGraph().activeNode();
+	voxel::RawVolume *v = _sceneMgr->volume(nodeId);
+	ASSERT_NE(nullptr, v);
+
+	for (int z = 0; z <= 199; ++z) {
+		for (int x = 0; x <= 199; ++x) {
+			v->setVoxel(x, 0, z, voxel::createVoxel(voxel::VoxelType::Generic, 1));
+		}
+	}
+
+	scenegraph::SceneGraphNode *node = _sceneMgr->sceneGraphModelNode(nodeId);
+	ASSERT_NE(nullptr, node);
+
+	Modifier &modifier = _sceneMgr->modifier();
+	SelectBrush &selBrush = modifier.selectBrush();
+	scenegraph::SceneGraph &sg = _sceneMgr->sceneGraph();
+
+	auto runSelectCallback = [&](const voxel::Region &region, ModifierType, SceneModifiedFlags flags) {
+		_sceneMgr->modified(nodeId, region, flags);
+	};
+
+	// Zone A: vertical pole via Select/All AABB. Select brush defaults to SelectMode::All
+	modifier.setBrushType(BrushType::Select);
+	selBrush.setSelectMode(SelectMode::All);
+	modifier.setCursorPosition(glm::ivec3(80, 0, 0), voxel::FaceNames::PositiveY);
+	ASSERT_TRUE(modifier.beginBrush());
+	modifier.setCursorPosition(glm::ivec3(120, 0, 199), voxel::FaceNames::PositiveY);
+	modifier.executeAdditionalAction();
+	ASSERT_TRUE(modifier.execute(sg, *node, runSelectCallback));
+	modifier.endBrush();
+
+	// Sanity: pole selected at (100, 0, 100)
+	ASSERT_NE(v->voxel(100, 0, 100).getFlags() & voxel::FlagOutline, 0)
+		<< "Zone A pole should be selected before lasso";
+	// Voxels outside pole should not be selected
+	ASSERT_EQ(v->voxel(10, 0, 100).getFlags() & voxel::FlagOutline, 0);
+	ASSERT_EQ(v->voxel(180, 0, 100).getFlags() & voxel::FlagOutline, 0);
+
+	// Lasso: crossing HORIZONTAL pole (z in [80..120], x in [0..199])
+	selBrush.setSelectMode(SelectMode::PolygonLasso);
+	auto clickAndExecute = [&](const glm::ivec3 &pos) {
+		modifier.setCursorPosition(pos, voxel::FaceNames::PositiveY);
+		EXPECT_TRUE(modifier.beginBrush());
+		EXPECT_TRUE(modifier.execute(sg, *node, runSelectCallback));
+	};
+	clickAndExecute(glm::ivec3(0, 0, 80));
+	clickAndExecute(glm::ivec3(199, 0, 80));
+	clickAndExecute(glm::ivec3(199, 0, 120));
+	clickAndExecute(glm::ivec3(0, 0, 120));
+	clickAndExecute(glm::ivec3(0, 0, 80)); // close
+
+	// After close: union of vertical pole + horizontal pole should be selected. Spot-check.
+	ASSERT_NE(v->voxel(10, 0, 100).getFlags() & voxel::FlagOutline, 0)
+		<< "Horizontal pole (from lasso) should be selected at (10,0,100)";
+	ASSERT_NE(v->voxel(180, 0, 100).getFlags() & voxel::FlagOutline, 0)
+		<< "Horizontal pole (from lasso) should be selected at (180,0,100)";
+	ASSERT_NE(v->voxel(100, 0, 100).getFlags() & voxel::FlagOutline, 0)
+		<< "Intersection should stay selected";
+
+	// Undo: must revert entire lasso (both sides of vertical pole) and leave only Zone A
+	ASSERT_TRUE(_sceneMgr->undo());
+
+	int unexpectedSelected = 0;
+	glm::ivec3 firstBad(-1);
+	for (int z = 0; z <= 199; ++z) {
+		for (int x = 0; x <= 199; ++x) {
+			const bool inZoneA = (x >= 80 && x <= 120);
+			const bool expected = inZoneA;
+			const bool actual = (v->voxel(x, 0, z).getFlags() & voxel::FlagOutline) != 0;
+			if (expected != actual) {
+				if (unexpectedSelected == 0) {
+					firstBad = glm::ivec3(x, 0, z);
+				}
+				++unexpectedSelected;
+			}
+		}
+	}
+	EXPECT_EQ(unexpectedSelected, 0)
+		<< "post-undo mismatches: " << unexpectedSelected
+		<< " first at " << firstBad.x << "," << firstBad.y << "," << firstBad.z;
 }
 
 } // namespace voxedit

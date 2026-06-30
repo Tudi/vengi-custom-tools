@@ -31,6 +31,7 @@
 #include "voxedit-util/network/protocol/LuaScriptCreateMessage.h"
 #include "voxel/RawVolume.h"
 #include "voxel/Voxel.h"
+#include "voxelformat/FormatConfig.h"
 
 class ProtocolMessageFactoryTest : public app::AbstractTest {
 protected:
@@ -329,10 +330,7 @@ protected:
 public:
 	void SetUp() override {
 		app::AbstractTest::SetUp();
-		const core::VarDef voxformatRGBFlattenFactor(cfg::VoxformatRGBFlattenFactor, 0, "", "");
-		core::Var::registerVar(voxformatRGBFlattenFactor);
-		const core::VarDef voxformatEmptyPaletteIndex(cfg::VoxformatEmptyPaletteIndex, -1, "", "");
-		core::Var::registerVar(voxformatEmptyPaletteIndex);
+		voxelformat::FormatConfig::init();
 		const core::VarDef voxEditNetPassword(cfg::VoxEditNetPassword, "test", "", "");
 		core::Var::registerVar(voxEditNetPassword);
 	}

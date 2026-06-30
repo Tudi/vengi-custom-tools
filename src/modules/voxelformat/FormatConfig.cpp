@@ -234,6 +234,9 @@ bool FormatConfig::init() {
 	const core::VarDef voxformatMeshSimplify(cfg::VoxformatMeshSimplify, false, N_("Simplify"),
 											 N_("Simplify the mesh when voxelizing a mesh format"), core::CV_NOPERSIST);
 	core::registerVar(voxformatMeshSimplify);
+	const core::VarDef voxelSplitOnLoad(cfg::VoxelSplitOnLoad, 0, N_("Split on load"),
+										N_("Split volumes larger than this size on load (0 = disabled)"));
+	core::registerVar(voxelSplitOnLoad);
 	const core::VarDef voxformatMeshSimplifyRatio(
 		cfg::VoxformatMeshSimplifyRatio, 0.8f, 0.0f, 1.0f, N_("Mesh simplify ratio"),
 		N_("Target fraction of triangle indices to keep when applying mesh optimization (0 = disable simplification)"),

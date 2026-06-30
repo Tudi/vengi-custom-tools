@@ -66,6 +66,8 @@ constexpr const char *VoxelMeshMode = "voxel_meshmode";
 constexpr const char *VoxelMeshAlloc = "voxel_meshalloc";
 // Crop volumes to tight bounds on load (saves memory but limits editing)
 constexpr const char *VoxelCropOnLoad = "voxel_croponload";
+// Split volumes on load to this max dimension per axis (0 = disabled)
+constexpr const char *VoxelSplitOnLoad = "voxel_splitonload";
 
 constexpr const char *CoreMaxFPS = "core_maxfps";
 constexpr const char *CoreLogLevel = "core_loglevel";
@@ -118,6 +120,7 @@ constexpr const char *VoxformatPointCloudSize = "voxformat_pointcloudsize";
 constexpr const char *VoxformatTransform = "voxformat_transform_mesh";
 constexpr const char *VoxformatOptimize = "voxformat_optimize";
 constexpr const char *VoxformatMeshSimplify = "voxformat_mesh_simplify";
+constexpr const char *VoxformatStreamProcessOBJ = "voxformat_streamprocessobj";
 constexpr const char *VoxformatMeshSimplifyRatio = "voxformat_mesh_simplify_ratio";
 constexpr const char *VoxformatFillHollow = "voxformat_fillhollow";
 constexpr const char *VoxformatVoxelizeMode = "voxformat_voxelizemode";

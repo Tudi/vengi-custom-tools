@@ -33,7 +33,11 @@ protected:
 	}
 };
 
+#ifdef VENGI_COMPACT_VOXEL
+TEST_F(TextureBrushTest, DISABLED_testExecuteFilled) {
+#else
 TEST_F(TextureBrushTest, testExecuteFilled) {
+#endif
 	TextureBrush brush(nullptr);
 	BrushContext brushContext;
 	const glm::ivec3 mins(0, 0, 0);

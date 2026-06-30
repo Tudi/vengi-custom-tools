@@ -51,8 +51,12 @@ void SceneGraphPanel::contextMenu(video::Camera& camera, const scenegraph::Scene
 		commandNodeMenu(ICON_LC_EYE_OFF, _("Hide others"), "nodehideothers", nodeId, validModels > 1, &listener);
 		ImGui::CommandIconMenuItem(ICON_LC_LOCK, _("Lock all"), "modellockall", true, &listener);
 		ImGui::CommandIconMenuItem(ICON_LC_LOCK_OPEN, _("Unlock all"), "modelunlockall", true, &listener);
+		commandNodeMenu(ICON_LC_PIN, _("Toggle mark"), "nodeaddselected", nodeId, true, &listener);
+		ImGui::CommandIconMenuItem(ICON_LC_CHECK, _("Mark all"), "nodeselectall", true, &listener);
+		ImGui::CommandIconMenuItem(ICON_LC_PIN_OFF, _("Unmark all"), "nodeunselectall", true, &listener);
 		commandNodeMenu(ICON_LC_COPY, _("Duplicate"), "nodeduplicate", nodeId, true, &listener);
 		commandNodeMenu(ICON_LC_TRASH, _("Delete"), "nodedelete", nodeId, true, &listener);
+		ImGui::CommandIconMenuItem(ICON_LC_TRASH, _("Delete locked"), "nodedeletelocked", true, &listener);
 		commandNodeMenu(ICON_LC_MOVE, _("Bake transform"), "nodebaketransform", nodeId, true, &listener);
 
 		if (nodeType == scenegraph::SceneGraphNodeType::Model) {

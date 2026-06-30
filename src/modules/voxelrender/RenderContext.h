@@ -5,6 +5,7 @@
 #pragma once
 
 #include "core/NonCopyable.h"
+#include "core/collection/Set.h"
 #include "render/BloomRenderer.h"
 #include "scenegraph/SceneGraphAnimation.h"
 #include "video/FrameBuffer.h"
@@ -25,6 +26,7 @@ struct RenderContext : public core::NonCopyable {
 	video::FrameBuffer resolveFrameBuffer; // Resolve target for multisampled framebuffer
 	render::BloomRenderer bloomRenderer;
 	const scenegraph::SceneGraph *sceneGraph = nullptr;
+	const core::Set<int> *markedNodes = nullptr;
 	scenegraph::FrameIndex frame = 0;
 	bool hideInactive = false;
 	bool grayInactive = false;

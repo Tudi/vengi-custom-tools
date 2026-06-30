@@ -22,8 +22,11 @@ set(SRCS
 	modifier/brush/select/Connected.cpp modifier/brush/select/Connected.h
 	modifier/brush/select/FlatSurface.cpp modifier/brush/select/FlatSurface.h
 	modifier/brush/select/Box3D.cpp modifier/brush/select/Box3D.h
+	modifier/brush/select/Rectangle.cpp modifier/brush/select/Rectangle.h
+	modifier/brush/select/Line.cpp modifier/brush/select/Line.h
 	modifier/brush/select/Circle.cpp modifier/brush/select/Circle.h
 	modifier/brush/select/Lasso.cpp modifier/brush/select/Lasso.h
+	modifier/brush/select/PolygonLasso.cpp modifier/brush/select/PolygonLasso.h
 	modifier/brush/select/Paint.cpp modifier/brush/select/Paint.h
 	modifier/brush/select/Script.cpp modifier/brush/select/Script.h
 	modifier/brush/ExtrudeBrush.cpp modifier/brush/ExtrudeBrush.h
@@ -110,6 +113,12 @@ set(SRCS
 	Config.h
 	CommandCompleter.h
 
+	3dprint/FaceClassify.h 3dprint/FaceClassify.cpp
+	3dprint/FlatBase.h 3dprint/FlatBase.cpp
+	3dprint/PrintCommands.h 3dprint/PrintCommands.cpp
+	3dprint/Progress.h 3dprint/Progress.cpp
+	3dprint/Regrid.h 3dprint/Regrid.cpp
+
 	LUAApiListener.h LUAApiListener.cpp
 
 	ISceneRenderer.h
@@ -149,6 +158,7 @@ set(TEST_SRCS
 	tests/RulerBrushTest.cpp
 	tests/ProtocolMessageFactoryTest.cpp
 	tests/SceneManagerTest.cpp
+	tests/RegridTest.cpp
 	tests/SceneRendererTest.cpp
 	tests/SelectBrushTest.cpp
 	tests/SelectStrategyTest.cpp

@@ -39,7 +39,11 @@ protected:
 	}
 };
 
+#ifdef VENGI_COMPACT_VOXEL
+TEST_F(PaintBrushTest, DISABLED_testExecuteSingle) {
+#else
 TEST_F(PaintBrushTest, testExecuteSingle) {
+#endif
 	PaintBrush brush;
 	ASSERT_TRUE(brush.init());
 	brush.setStrokeMode();

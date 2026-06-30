@@ -18,6 +18,7 @@
 #include "modifier/IModifierRenderer.h"
 #include "modifier/Modifier.h"
 #include "modifier/SceneModifiedFlags.h"
+#include "core/collection/Set.h"
 #include "scenegraph/SceneGraphNodeValueCache.h"
 #include "scenegraph/SceneGraph.h"
 #include "voxedit-util/network/Client.h"
@@ -79,6 +80,7 @@ class SceneManager : public core::DeltaFrameSeconds {
 
 protected:
 	scenegraph::SceneGraph _sceneGraph;
+	core::Set<int> _markedNodes;
 	voxelrender::CameraMovement _camMovement;
 	memento::MementoHandler _mementoHandler;
 	voxel::ClipboardData _copy;
@@ -489,12 +491,16 @@ public:
 	 * @return The node ID of the newly created temporary node, or @c InvalidNodeId if no merge was performed.
 	 */
 	int mergeVisibleToTemp();
+	int mergeLockedToTemp(bool onlySelected = false);
 
 	void selectionInvert(int nodeId);
 	void selectionUnselect(int nodeId);
 	void selectionSelectAll(int nodeId);
 	void selectionSetBounds(int nodeId, const voxel::Region &region);
 	void selectionSetEllipse(int nodeId);
+	void selectionFinalizeLasso(int nodeId);
+	void selectionCancelLasso(int nodeId);
+	void selectionLassoUndoVertex(int nodeId);
 	bool hasSelection(int nodeId) const;
 	bool isSelected(int nodeId, const glm::ivec3 &pos) const;
 	voxel::Region selectionCalculateRegion(int nodeId) const;
@@ -569,6 +575,10 @@ public:
 	bool newScene(bool force, const core::String &name, voxel::RawVolume *v);
 	bool newScene(bool force, const core::String &name, const voxel::Region &region);
 	int moveNodeToSceneGraph(scenegraph::SceneGraphNode &node, int parent = 0);
+
+	// Called by Regrid after bulk add/remove operations that bypass moveNodeToSceneGraph
+	// and nodeRemove to avoid O(N^2) updateTransforms. Notifies the renderer and marks dirty.
+	void onRegridComplete(const core::DynamicArray<int> &newCellIds, const core::DynamicArray<int> &deletedSourceIds);
 
 	/**
 	 * @return @c true if the scene was modified and not saved yet
@@ -698,9 +708,15 @@ public:
 	bool nodeRemoveIKConstraint(int nodeId);
 	bool nodeRename(int nodeId, const core::String &name);
 	bool nodeRemove(int nodeId, bool recursive);
+	int nodeRemoveLocked();
 	bool nodeSetVisible(int nodeId, bool visible);
 	bool nodeSetLocked(int nodeId, bool locked);
 	bool nodeActivate(int nodeId);
+	void nodeToggleMarked(int nodeId);
+	void nodeMarkAll();
+	void nodeUnmarkAll();
+	bool isNodeMarked(int nodeId) const;
+	const core::Set<int> &markedNodes() const;
 	bool nodeUnreference(int nodeId);
 	void nodeGroupRemoveNormals();
 	bool nodeRemoveNormals(int nodeId);

@@ -8,6 +8,9 @@ namespace voxelutil {
 
 bool lassoContains(const core::DynamicArray<glm::ivec3> &path, int pu, int pv, int uAxis, int vAxis) {
 	const int n = (int)path.size();
+	// A point exactly on a polygon edge must count as inside. Ray-casting with strict
+	// inequalities drops such points, which would exclude the entire boundary row/column
+	// drawn by the user and break flood-fill seeding.
 	for (int i = 0, j = n - 1; i < n; j = i++) {
 		const int xi = path[i][uAxis];
 		const int yi = path[i][vAxis];

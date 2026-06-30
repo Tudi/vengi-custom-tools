@@ -507,6 +507,9 @@ void IMGUIApp::setColorTheme() {
 	const float mainScale = ImGui_ImplSDL2_GetContentScaleForDisplay(0);
 #endif
 	style.ScaleAllSizes(mainScale);
+	// ScaleAllSizes uses ImTrunc which truncates toward zero - on displays with scale < 1.0
+	// SeparatorSize (default 1.0f) becomes 0.0f, triggering IM_ASSERT(thickness > 0.0f)
+	style.SeparatorSize = ImMax(style.SeparatorSize, 1.0f);
 	style.FontScaleDpi = mainScale;
 }
 

@@ -90,6 +90,23 @@ static const int LassoRiserNeighbourV[LassoRiserNeighbourCount] = {0, 0, 1, -1, 
 
 /**
  * @brief Select the visible surface inside a lasso polygon, filling its whole interior.
+ *
+ * For every (u,v) cell inside the polygon (and along the drawn edges) the FRONT-most solid voxel
+ * along the face-normal axis is marked - the surface seen from the clicked face. To keep the
+ * projected selection gap-free across a steep step, a column also marks the riser face down to any
+ * adjacent in-polygon neighbour whose surface is more recessed (bounded by the step height). This
+ * is a per-column scan with an early-out at the first solid, so it allocates no per-voxel buffers
+ * and never enumerates the volume - it cannot freeze on a large model. A column over empty space
+ * is simply skipped, and a structure hidden behind the visible one is never the front-most, so it
+ * is ignored.
+ *
+ * @param path Polygon vertices (ordered).
+ * @param uAxis,vAxis Indices (0/1/2) of the polygon lateral axes.
+ * @param wAxis Index of the face-normal (depth) axis.
+ * @param positiveNormal True if the lasso face normal points in the +w direction.
+ * @param region Volume region used for bounds checks and the column scan.
+ * @param markFunc Callable(int x, int y, int z, const voxel::Voxel &) applied to each selected voxel.
+ * @param maxDeviation Currently unused; kept for call-site compatibility.
  */
 template<typename Volume, typename MarkFunc>
 void lassoFloodFillSurface(const Volume &volume, const core::DynamicArray<glm::ivec3> &path, int uAxis, int vAxis,
@@ -113,6 +130,12 @@ void lassoFloodFillSurface(const Volume &volume, const core::DynamicArray<glm::i
 		markFunc(q.x, q.y, q.z, vox);
 	};
 
+	// Mark a column's visible skin: its front-most solid, plus the riser faces down to any adjacent
+	// in-direction neighbour whose surface is more recessed - so the projection has no vertical gaps
+	// across steep steps. All 8 neighbours (incl. diagonals) are bridged so a step that drops
+	// diagonally does not leave an unfilled corner. Only the higher column fills a given wall, so the
+	// wall is filled once. Filling only toward in-polygon neighbours keeps the boundary from growing
+	// a tall wall that would project past the lasso outline.
 	auto markColumn = [&](int u, int v) {
 		int d;
 		if (!columnFront(u, v, d)) {
@@ -153,6 +176,7 @@ void lassoFloodFillSurface(const Volume &volume, const core::DynamicArray<glm::i
 		}
 	};
 
+	// Always cover the drawn edges (so a thin/degenerate polygon still yields a continuous line).
 	const int vertexCount = (int)path.size();
 	for (int i = 0; i < vertexCount; ++i) {
 		glm::ivec3 a2 = path[i];
@@ -176,6 +200,7 @@ void lassoFloodFillSurface(const Volume &volume, const core::DynamicArray<glm::i
 		minV = glm::min(minV, p[vAxis]);
 		maxV = glm::max(maxV, p[vAxis]);
 	}
+	// Fill the interior by point-in-polygon over the (u,v) bounding box.
 	for (int u = minU; u <= maxU; ++u) {
 		for (int v = minV; v <= maxV; ++v) {
 			if (inPolygon(u, v)) {
@@ -187,6 +212,7 @@ void lassoFloodFillSurface(const Volume &volume, const core::DynamicArray<glm::i
 
 /**
  * @brief Visit every integer cell on the 3D Bresenham line from @p a to @p b (inclusive).
+ * @param plot Callable(const glm::ivec3 &) invoked once per line cell.
  */
 template<typename PlotFunc>
 void bresenham3d(const glm::ivec3 &a, const glm::ivec3 &b, PlotFunc &&plot) {
@@ -257,7 +283,17 @@ void bresenham3d(const glm::ivec3 &a, const glm::ivec3 &b, PlotFunc &&plot) {
 }
 
 /**
- * @brief Rasterize the straight 3D line @p a -> @p b and mark every solid voxel within @p width of the line.
+ * @brief Rasterize the straight 3D line @p a -> @p b and mark every solid voxel within
+ *        @p width of the line.
+ *
+ * @p width is the full thickness in voxels (1 = just the centerline). A voxel is marked
+ * when its Chebyshev distance to a line cell is at most @c width/2. Air cells are skipped,
+ * so where the line passes through empty space nothing is selected. Each voxel is reported
+ * at most once even where the thickened cells of successive line steps overlap.
+ *
+ * @param volume Read-only volume with voxel(x,y,z) access.
+ * @param region Bounds for both the solidity test and thickness clipping.
+ * @param markFunc Callable(int x, int y, int z, const voxel::Voxel &) invoked for each hit.
  */
 template<typename Volume, typename MarkFunc>
 void lineMarkSolid(const Volume &volume, const glm::ivec3 &a, const glm::ivec3 &b, int width,
@@ -289,7 +325,22 @@ void lineMarkSolid(const Volume &volume, const glm::ivec3 &a, const glm::ivec3 &
 }
 
 /**
- * @brief Draw a line that drapes over the visible surface from @p a to @p b.
+ * @brief Draw a line that drapes over the VISIBLE surface from @p a to @p b and stays continuous.
+ *
+ * Walks the 2D line in the (u,v) face plane and, at every step, marks the front-most solid voxel
+ * of that column - the surface the eye actually sees from the clicked face. Between two consecutive
+ * steps whose surface depth differs (a terrace riser), it fills the taller column's vertical face
+ * down to the lower neighbour, so the step is visible and the marked line never breaks. Unlike a
+ * 3D skin walk (which can thread the hidden back of a riser and render as disjoint treads), every
+ * marked voxel here is on the visible front, so the drawn line looks continuous on stepped terrain.
+ *
+ * The mark callback is expected to be idempotent (it sets a flag), so this keeps no dedup buffer.
+ *
+ * @param uAxis,vAxis Indices (0/1/2) of the lateral face-plane axes.
+ * @param wAxis Index of the face-normal (depth) axis.
+ * @param positiveNormal True if the face normal points in the +w direction.
+ * @param width Full thickness in voxels of the marked line (1 = a single voxel chain).
+ * @param markFunc Callable(int x, int y, int z, const voxel::Voxel &) invoked for each marked voxel.
  */
 template<typename Volume, typename MarkFunc>
 void lineDrapeSurface(const Volume &volume, const glm::ivec3 &a, const glm::ivec3 &b, int uAxis, int vAxis, int wAxis,
@@ -302,6 +353,7 @@ void lineDrapeSurface(const Volume &volume, const glm::ivec3 &a, const glm::ivec
 		c[wAxis] = w;
 		return c;
 	};
+	// Mark a width ball of solid voxels around the centre (so thickness is uniform in 3D).
 	auto markBall = [&](const glm::ivec3 &center) {
 		for (int dz = -r; dz <= r; ++dz) {
 			for (int dy = -r; dy <= r; ++dy) {
@@ -330,11 +382,14 @@ void lineDrapeSurface(const Volume &volume, const glm::ivec3 &a, const glm::ivec
 		const int v = c[vAxis];
 		int d;
 		if (!columnFrontSurface(volume, u, v, uAxis, vAxis, wAxis, positiveNormal, region, d)) {
+			// No surface in this column (the line passes over empty space) - break continuity.
 			havePrev = false;
 			return;
 		}
 		markBall(axisPos(u, v, d));
 		if (havePrev && (u != prevU || v != prevV)) {
+			// Bridge the riser between the two columns by filling the taller one's vertical face,
+			// so the step is visible and the line stays connected across it.
 			const int lo = glm::min(d, prevW);
 			const int hi = glm::max(d, prevW);
 			const bool currentTaller = positiveNormal ? (d >= prevW) : (d <= prevW);
@@ -352,7 +407,15 @@ void lineDrapeSurface(const Volume &volume, const glm::ivec3 &a, const glm::ivec
 }
 
 /**
- * @brief In column (@p u, @p v), find the exposed surface voxel nearest to @p refW within @p tolerance.
+ * @brief In the column (@p u, @p v), find the exposed surface voxel whose depth is nearest to
+ *        @p refW (within @p tolerance) along the face-normal axis.
+ *
+ * A voxel qualifies only if it is solid AND its neighbour on the face side is air (or outside the
+ * region) - i.e. it is an actual surface voxel, not an interior one. The band is scanned nearest
+ * to @p refW first, so the surface closest to the reference depth wins.
+ *
+ * @param outW Receives the depth of the found surface voxel.
+ * @return true when an exposed surface voxel is found within @p tolerance of @p refW.
  */
 template<typename Volume>
 bool findSurfaceNear(const Volume &volume, int u, int v, int refW, int tolerance, int uAxis, int vAxis, int wAxis,
@@ -368,6 +431,7 @@ bool findSurfaceNear(const Volume &volume, int u, int v, int refW, int tolerance
 		if (voxel::isAir(volume.voxel(pos.x, pos.y, pos.z).getMaterial())) {
 			return false;
 		}
+		// The neighbour toward the face must be air (or out of bounds) for this to be a surface voxel.
 		glm::ivec3 np = pos;
 		np[wAxis] = positiveNormal ? w + 1 : w - 1;
 		if (!region.containsPoint(np)) {
